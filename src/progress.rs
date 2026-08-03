@@ -46,10 +46,25 @@ impl Progress {
             return;
         }
         let pct = (elapsed_ms as f64 / total_ms as f64).clamp(0.0, 1.0);
+        self.render(pct, total_ms as f64 / 1000.0);
+    }
+
+    /// 直接按百分比更新（用于 MIDI 模式基于 tick 计算）
+    pub fn update_pct(&mut self, pct: f64, total_ms: u64) {
+        if !self.enabled {
+            return;
+        }
+        if total_ms == 0 {
+            return;
+        }
+        let pct = pct.clamp(0.0, 1.0);
+        self.render(pct, total_ms as f64 / 1000.0);
+    }
+
+    fn render(&mut self, pct: f64, total_sec: f64) {
         let filled = (pct * self.width as f64) as usize;
         let filled = filled.min(self.width);
-        let elapsed_sec = elapsed_ms as f64 / 1000.0;
-        let total_sec = total_ms as f64 / 1000.0;
+        let elapsed_sec = total_sec * pct;
         let remaining_sec = (total_sec - elapsed_sec).max(0.0);
 
         let bar: String = format!(

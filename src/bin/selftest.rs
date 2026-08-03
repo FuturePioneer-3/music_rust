@@ -38,6 +38,10 @@ mod synth;
 mod log;
 #[path = "../progress.rs"]
 mod progress;
+#[path = "../input.rs"]
+mod input;
+#[path = "../parser.rs"]
+mod parser;
 
 fn main() {
     log::init(true);

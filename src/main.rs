@@ -32,7 +32,12 @@
 //!   -b, --bpm <n>        覆盖速度 (BPM)
 //!   -v, --volume <0-127> 音量
 //!   -h, --help           帮助
+//!
+//! 播放控制（类似 mpv）:
+//!   ←/→ 后退/快进5秒, ↑/↓ 快进/后退10秒, PageUp/PgDn 快进/后退1分钟
+//!   空格/P 暂停/继续, [ / ] 微调1秒, R 循环, 1-9 跳转10%-90%, Q 退出
 
+mod input;
 mod log;
 mod parser;
 mod progress;
@@ -64,6 +69,16 @@ fn print_usage() {
     println!("说明:");
     println!("  默认模式：播放简谱 TXT（自动识别新版多轨/旧版左右手格式）");
     println!("  使用 -m 或传入 .mid 文件：直接播放 MIDI（多轨与变速完全准确）");
+    println!();
+    println!("播放控制 (类似 mpv):");
+    println!("  ← / →         后退/快进 5 秒");
+    println!("  ↑ / ↓         快进/后退 10 秒");
+    println!("  PageUp/PgDn   快进/后退 1 分钟");
+    println!("  空格 / P       暂停 / 继续");
+    println!("  [ / ]         后退/快进 1 秒");
+    println!("  R             切换循环播放");
+    println!("  1-9           跳转到 10%-90%");
+    println!("  Q             退出");
     println!();
     println!("环境变量:");
     println!("  MUSIC_AUDIO_DRIVER   指定 fluidsynth 音频驱动 (如 alsa, pulse, pipewire)");
@@ -199,7 +214,8 @@ fn main() {
         }
 
         let start = std::time::Instant::now();
-        match player.play_midi(&file, bpm_override, true, total_ms) {
+        // 调试模式禁用进度条；交互控制始终启用（终端可用时）
+        match player.play_midi(&file, bpm_override, !args.debug, true, total_ms) {
             Ok(()) => {
                 info(format!("演奏完成，用时 {:.2}s", start.elapsed().as_secs_f64()));
             }
@@ -235,22 +251,27 @@ fn main() {
         }
     };
 
-    // 排程所有事件
-    info(format!("开始排程 {} 个音轨的事件 ...", score.tracks.len()));
-    let mut total_events = 0usize;
+    // 设置每个音轨的乐器（钢琴 GM Program 0）
     for track in &score.tracks {
         player.set_instrument(track.channel as i32, 0);
-        for ev in &track.events {
-            player.play_note(ev.channel, ev.key, ev.vel, ev.on, ev.at_ms);
-            total_events += 1;
-        }
     }
-    info(format!("已排程 {} 个 MIDI 事件", total_events));
 
-    // 等待播放结束
+    // 收集全部事件（已按 at_ms 排序）
+    let mut events: Vec<parser::ScheduledNote> = Vec::new();
+    for track in &score.tracks {
+        events.extend(track.events.iter().cloned());
+    }
+    events.sort_by(|a, b| {
+        a.at_ms
+            .cmp(&b.at_ms)
+            .then_with(|| a.on.cmp(&b.on))
+    });
+    info(format!("已收集 {} 个 MIDI 事件", events.len()));
+
+    // 开始交互式播放（调试模式禁用进度条）
     info(format!("开始演奏（总时长约 {}s）...", score.total_ms / 1000));
     let start = std::time::Instant::now();
-    player.wait_until(score.total_ms + 200, true);
+    player.play_events_interactive(&events, score.total_ms, !args.debug);
     let elapsed = start.elapsed();
     info(format!("演奏完成，用时 {:.2}s", elapsed.as_secs_f64()));
 

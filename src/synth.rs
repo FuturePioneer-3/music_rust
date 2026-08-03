@@ -21,6 +21,11 @@
 //! 直接通过 `extern "C"` 调用系统 libfluidsynth（libfluidsynth.so.x）。
 //! 支持大多数 Linux 发行版：只要安装了 fluidsynth 运行时库即可。
 //! SoundFont (.sf2/.sf3) 会依次尝试：用户指定路径 → 常见系统路径 → 用户目录。
+//!
+//! 注：本模块同时被 selftest 通过 `#[path]` 复用，因此部分方法在不同 crate
+//! 中可能被标记为 dead_code，这里统一允许。
+
+#![allow(dead_code)]
 
 use std::ffi::{c_char, c_int, c_short, c_uint, c_void, CString};
 use std::path::Path;
@@ -251,6 +256,7 @@ extern "C" {
         absolute: c_int,
     ) -> c_int;
     fn fluid_sequencer_send_now(seq: *mut fluid_sequencer_t, evt: *mut fluid_event_t);
+    fn fluid_sequencer_remove_events(seq: *mut fluid_sequencer_t, source: fluid_seq_id_t, dest: fluid_seq_id_t, ty: c_int);
 
     fn new_fluid_event() -> *mut fluid_event_t;
     fn delete_fluid_event(evt: *mut fluid_event_t);
@@ -272,6 +278,16 @@ extern "C" {
     fn fluid_player_get_status(player: *mut c_void) -> c_int;
     fn fluid_player_set_tempo(player: *mut c_void, tempo_type: c_int, tempo: f64) -> c_int;
     fn fluid_player_get_bpm(player: *mut c_void) -> c_int;
+    #[allow(dead_code)]
+    fn fluid_player_set_loop(player: *mut c_void, loop_times: c_int) -> c_int;
+    #[allow(dead_code)]
+    fn fluid_player_seek(player: *mut c_void, ticks: c_int) -> c_int;
+    #[allow(dead_code)]
+    fn fluid_player_get_current_tick(player: *mut c_void) -> c_int;
+    #[allow(dead_code)]
+    fn fluid_player_get_total_ticks(player: *mut c_void) -> c_int;
+    #[allow(dead_code)]
+    fn fluid_player_get_division(player: *mut c_void) -> c_int;
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +553,30 @@ impl SynthPlayer {
         unsafe { delete_fluid_event(evt) };
     }
 
+    /// 调度一个相对事件：`at_ms` 是相对"当前 tick"的偏移（absolute=0）。
+    /// 用于交互模式下动态重排（快进/后退/循环）。
+    fn schedule_note_relative(&self, channel: c_int, key: u8, vel: u8, at_ms: u32, on: bool) {
+        let evt = unsafe { new_fluid_event() };
+        unsafe {
+            fluid_event_set_source(evt, 0);
+            fluid_event_set_dest(evt, self.synth_client);
+            if on {
+                fluid_event_noteon(evt, channel, key as c_short, vel as c_short);
+            } else {
+                fluid_event_noteoff(evt, channel, key as c_short);
+            }
+        }
+        unsafe { fluid_sequencer_send_at(self.sequencer, evt, at_ms, 0) };
+        unsafe { delete_fluid_event(evt) };
+    }
+
+    /// 清除 sequencer 中所有已排程事件
+    pub fn clear_schedule(&self) {
+        unsafe {
+            fluid_sequencer_remove_events(self.sequencer, -1, -1, -1);
+        }
+    }
+
     /// 设置指定通道的乐器（GM Program）
     pub fn set_instrument(&self, channel: c_int, program: u8) {
         let evt = unsafe { new_fluid_event() };
@@ -570,8 +610,16 @@ impl SynthPlayer {
     /// 自动处理多轨同步与 tempo 变化，等待播放完成。
     /// `bpm_override`: Some(bpm) 时强制覆盖速度。
     /// `show_progress`: 显示动态进度条。
+    /// `interactive`: 启用键盘交互控制（快进/后退/暂停/循环/退出）。
     /// `total_ms`: 估算的总时长（毫秒），用于进度条；0 时仅显示经过时间。
-    pub fn play_midi(&mut self, midi_path: &str, bpm_override: Option<f64>, show_progress: bool, total_ms: u32) -> Result<(), String> {
+    pub fn play_midi(
+        &mut self,
+        midi_path: &str,
+        bpm_override: Option<f64>,
+        show_progress: bool,
+        interactive: bool,
+        total_ms: u32,
+    ) -> Result<(), String> {
         let path_c = CString::new(midi_path)
             .map_err(|_| "MIDI 路径包含非法字符".to_string())?;
 
@@ -601,34 +649,114 @@ impl SynthPlayer {
         info("开始播放 MIDI 文件 ...".to_string());
         debug(format!("估算总时长: {}ms", total_ms));
 
-        // 进度条：用真实经过时间（tick API 在此版本不可靠）
+        // 交互控制
+        let input = if interactive {
+            Some(crate::input::InputListener::start())
+        } else {
+            None
+        };
+
+        // 进度条
         let mut prog = crate::progress::Progress::new(show_progress);
-        let start = std::time::Instant::now();
         let mut last_bpm: i32 = 0;
+        let mut paused = false;
+        let mut looping = false;
+        let mut quit = false;
 
         // 等待播放完成（PLAYING=1 → DONE=3）
-        loop {
+        while !quit {
+            // 处理键盘指令
+            if let Some(il) = &input {
+                loop {
+                    let c = il.poll();
+                    match c {
+                        crate::input::Control::None => break,
+                        crate::input::Control::Quit => {
+                            quit = true;
+                            break;
+                        }
+                        crate::input::Control::Pause => {
+                            if !paused {
+                                unsafe { fluid_player_stop(player) };
+                                info("暂停".to_string());
+                                prog.finish();
+                                paused = true;
+                            } else {
+                                unsafe { fluid_player_play(player) };
+                                info("继续".to_string());
+                                paused = false;
+                            }
+                        }
+                        crate::input::Control::Loop => {
+                            looping = !looping;
+                            unsafe { fluid_player_set_loop(player, if looping { -1 } else { 0 }) };
+                            info(if looping {
+                                "循环播放：开".to_string()
+                            } else {
+                                "循环播放：关".to_string()
+                            });
+                        }
+                        crate::input::Control::SeekForward(s)
+                        | crate::input::Control::SeekBackward(s) => {
+                            let sign: i32 = if matches!(c, crate::input::Control::SeekForward(_)) {
+                                1
+                            } else {
+                                -1
+                            };
+                            let ticks = ticks_per_second(player) * s as i32 * sign;
+                            seek_relative(player, ticks);
+                            info(format!("跳转 {}s", sign as i32 * s as i32));
+                        }
+                        crate::input::Control::SeekPercent(p) => {
+                            seek_percent(player, p);
+                            info(format!("跳转到 {}%", (p * 100.0) as i32));
+                        }
+                    }
+                }
+            }
+
             let status = unsafe { fluid_player_get_status(player) };
             let bpm = unsafe { fluid_player_get_bpm(player) };
             if bpm != last_bpm {
                 debug(format!("当前速度: {} BPM", bpm));
                 last_bpm = bpm;
             }
-            // 更新进度条（真实经过时间）
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            if total_ms > 0 {
-                prog.update(elapsed_ms, total_ms as u64);
-            } else {
-                // 无总时长：仅显示经过时间
-                prog.update(elapsed_ms, elapsed_ms + 1);
+
+            // 进度显示（基于真实经过时间）
+            if show_progress {
+                let elapsed_ms = std::time::Instant::now();
+                // 用 tick 计算更准确（暂停时 tick 不前进）
+                let ct = unsafe { fluid_player_get_current_tick(player) };
+                let tt = unsafe { fluid_player_get_total_ticks(player) };
+                if tt > 0 {
+                    let pct = (ct as f64 / tt as f64).clamp(0.0, 1.0);
+                    prog.update_pct(pct, total_ms as u64);
+                } else if total_ms > 0 {
+                    let e = elapsed_ms.elapsed().as_millis() as u64;
+                    prog.update(e, total_ms as u64);
+                } else {
+                    let e = elapsed_ms.elapsed().as_millis() as u64;
+                    prog.update(e, e + 1);
+                }
             }
+
             if status == FLUID_PLAYER_DONE {
-                break;
-            }
-            if status != FLUID_PLAYER_PLAYING {
-                // READY/STOPPING：等待片刻
+                // 暂停时 stop() 也会触发 DONE，但此时 paused=true 不退出
+                if !paused {
+                    if looping {
+                        // set_loop 模式下 DONE 表示循环已结束？这里手动继续
+                        unsafe { fluid_player_play(player) };
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        if let Some(mut il) = input {
+            il.stop();
         }
         prog.finish();
 
@@ -650,6 +778,157 @@ impl SynthPlayer {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        prog.finish();
+    }
+
+    /// 交互式播放简谱事件列表（支持快进/后退/暂停/循环/退出）。
+    ///
+    /// 原理：不一次性把事件排入 sequencer，而是维护一个"播放头"（playhead），
+    /// 把当前 playhead 之后的事件按相对偏移动态排程。快进/后退/循环时：
+    ///   1. 清除所有已排事件（fluid_sequencer_remove_events）
+    ///   2. 更新 playhead
+    ///   3. 从新 playhead 重新排程剩余事件（相对时间）
+    /// 暂停时清除已排事件并停止排程，恢复时重新排程。
+    ///
+    /// `events` 必须已按 at_ms 升序排序。
+    pub fn play_events_interactive(
+        &mut self,
+        events: &[crate::parser::ScheduledNote],
+        total_ms: u32,
+        show_progress: bool,
+    ) {
+        let mut input = crate::input::InputListener::start();
+        let mut prog = crate::progress::Progress::new(show_progress);
+
+        let mut playhead: i64 = 0; // 当前播放位置（毫秒）
+        let mut paused = false;
+        let mut looping = false;
+        let mut quit = false;
+
+        // 排程从 playhead 开始的所有剩余事件。
+        // 注：sequencer 的 tick 单调递增且无法重置，因此这里以"当前 tick"为基准，
+        //     把 (at_ms - playhead) 的相对偏移换算成绝对 tick（base + rel）。
+        fn schedule_from(
+            player: &SynthPlayer,
+            events: &[crate::parser::ScheduledNote],
+            playhead: i64,
+        ) -> u32 {
+            player.clear_schedule();
+            let base = player.now_ms(); // 当前绝对 tick（毫秒）
+            for ev in events {
+                // 只排未来事件：at_ms >= playhead
+                if ev.at_ms as i64 >= playhead {
+                    let rel = (ev.at_ms as i64 - playhead).max(0) as u32;
+                    let abs = base.wrapping_add(rel);
+                    player.schedule_note(ev.channel as i32, ev.key, ev.vel, abs, ev.on);
+                }
+            }
+            base
+        }
+
+        // 最近一次排程时的 sequencer tick（基准），从 0 开始排程
+        let mut anchor_tick: u32 = schedule_from(self, events, 0);
+        loop {
+            // 处理键盘
+            loop {
+                let c = input.poll();
+                match c {
+                    crate::input::Control::None => break,
+                    crate::input::Control::Quit => {
+                        quit = true;
+                        break;
+                    }
+                    crate::input::Control::Pause => {
+                        paused = !paused;
+                        if paused {
+                            // 记录暂停时的位置
+                            let now = self.now_ms();
+                            playhead = playhead + now as i64 - anchor_tick as i64;
+                            anchor_tick = now;
+                            self.clear_schedule();
+                            info("暂停".to_string());
+                            prog.finish();
+                        } else {
+                            // 恢复：从记录的位置重排
+                            anchor_tick = schedule_from(self, events, playhead);
+                            info("继续".to_string());
+                        }
+                    }
+                    crate::input::Control::Loop => {
+                        looping = !looping;
+                        info(if looping {
+                            "循环播放：开".to_string()
+                        } else {
+                            "循环播放：关".to_string()
+                        });
+                    }
+                    crate::input::Control::SeekForward(s)
+                    | crate::input::Control::SeekBackward(s) => {
+                        let sign: i64 = if matches!(c, crate::input::Control::SeekForward(_)) {
+                            1
+                        } else {
+                            -1
+                        };
+                        let delta = (s * 1000.0) as i64 * sign;
+                        // 从当前播放位置计算新 playhead
+                        let cur = if paused {
+                            playhead
+                        } else {
+                            playhead + self.now_ms() as i64 - anchor_tick as i64
+                        };
+                        let target = (cur + delta).clamp(0, total_ms as i64);
+                        playhead = target;
+                        anchor_tick = schedule_from(self, events, playhead);
+                        info(format!("跳转至 {:.1}s", playhead as f64 / 1000.0));
+                        prog.finish();
+                    }
+                    crate::input::Control::SeekPercent(p) => {
+                        let target = ((total_ms as f64 * p.clamp(0.0, 1.0)).round() as i64)
+                            .clamp(0, total_ms as i64);
+                        playhead = target;
+                        anchor_tick = schedule_from(self, events, playhead);
+                        info(format!("跳转至 {}%", (p * 100.0) as i32));
+                        prog.finish();
+                    }
+                }
+            }
+
+            if quit {
+                break;
+            }
+
+            // 暂停时：等待恢复/退出
+            if paused {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+
+            let now = self.now_ms();
+            // 实际播放位置 = playhead（锚点）+ 相对流逝时间
+            let cur = (playhead + now as i64 - anchor_tick as i64).min(total_ms as i64);
+
+            // 进度显示
+            if show_progress {
+                prog.update(cur as u64, total_ms as u64);
+            }
+
+            // 播放结束判定
+            if cur >= total_ms as i64 {
+                if looping {
+                    playhead = 0;
+                    anchor_tick = schedule_from(self, events, 0);
+                    info("循环播放：从头开始".to_string());
+                    prog.finish();
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        input.stop();
         prog.finish();
     }
 
@@ -716,4 +995,35 @@ pub fn fluid_synth_noteon_direct(synth: *mut fluid_synth_t, chan: i32, key: i32,
 #[allow(dead_code)]
 pub fn fluid_synth_noteoff_direct(synth: *mut fluid_synth_t, chan: i32, key: i32) {
     unsafe { fluid_synth_noteoff(synth, chan, key) };
+}
+
+// ---------------------------------------------------------------------------
+// MIDI 播放器交互辅助函数
+// ---------------------------------------------------------------------------
+
+/// 每秒对应的 tick 数（默认按 500ms/四分音符、PPQ=480 估算）。
+/// 用于把秒换算成 tick 进行 seek。实际 tempo 变化时仅近似，够用于快进/后退。
+fn ticks_per_second(player: *mut c_void) -> i32 {
+    let div = unsafe { fluid_player_get_division(player) };
+    if div > 0 {
+        // 默认 120 BPM（500ms/四分音符）→ 每秒 2 个四分音符
+        div * 2
+    } else {
+        960
+    }
+}
+
+/// 相对当前位置 seek（单位 tick），自动钳制在 [0, total]
+fn seek_relative(player: *mut c_void, delta_ticks: i32) {
+    let cur = unsafe { fluid_player_get_current_tick(player) };
+    let total = unsafe { fluid_player_get_total_ticks(player) };
+    let target = (cur + delta_ticks).clamp(0, total);
+    unsafe { fluid_player_seek(player, target) };
+}
+
+/// seek 到百分比位置
+fn seek_percent(player: *mut c_void, pct: f64) {
+    let total = unsafe { fluid_player_get_total_ticks(player) };
+    let target = ((total as f64 * pct.clamp(0.0, 1.0)).round() as i32).clamp(0, total);
+    unsafe { fluid_player_seek(player, target) };
 }
