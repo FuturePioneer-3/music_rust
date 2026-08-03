@@ -307,7 +307,7 @@ T 伴奏 | 5 6 7 1
 
 **Copyright © 2026 FuturePioneer-3**
 
-- 项目主页：<https://github.com/FuturePioneer-3>
+- 项目主页：<https://github.com/FuturePioneer-3/music_rust/>
 - 完整许可文本见 [LICENSE](./LICENSE)
 
 本程序是自由软件：您可以在自由软件基金会发布的
