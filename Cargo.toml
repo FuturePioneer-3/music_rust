@@ -1,0 +1,23 @@
+[package]
+name = "music_rust"
+version = "0.1.0"
+edition = "2021"
+description = "music_rust —— 跨平台(主要Linux) MIDI 简谱钢琴演奏器"
+license = "GPL-3.0-or-later"
+authors = ["FuturePioneer-3"]
+repository = "https://github.com/FuturePioneer-3"
+
+[[bin]]
+name = "music"
+path = "src/main.rs"
+
+[[bin]]
+name = "selftest"
+path = "src/bin/selftest.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+opt-level = 3
