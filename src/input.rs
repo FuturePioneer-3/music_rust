@@ -30,6 +30,8 @@
 //!   R              切换循环播放
 //!   Q              退出
 //!   数字 1-9        快进到 10%..90% 进度
+//!   9               降低音量
+//!   0               增加音量
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +50,10 @@ pub enum Control {
     SeekPercent(f64),
     /// 切换循环播放
     Loop,
+    /// 降低音量
+    VolumeDown,
+    /// 增加音量
+    VolumeUp,
     /// 退出
     Quit,
     /// 无输入
@@ -223,7 +229,9 @@ fn parse_key(pending: &[u8]) -> (Option<Control>, Vec<u8>) {
             b'q' | b'Q' => Control::Quit,
             b'[' => Control::SeekBackward(1.0),
             b']' => Control::SeekForward(1.0),
-            b'1'..=b'9' => Control::SeekPercent((c - b'0') as f64 / 10.0),
+            b'1'..=b'8' => Control::SeekPercent((c - b'0') as f64 / 10.0),
+            b'9' => Control::VolumeDown,
+            b'0' => Control::VolumeUp,
             _ => Control::None,
         };
         return (Some(ctrl), pending[1..].to_vec());

@@ -137,7 +137,8 @@ During playback you can control the player directly with the keyboard (mpv-like)
 | `空格` / `P` | 暂停 / 继续 / pause / resume |
 | `[` / `]` | 后退 / 快进 1 秒 / rewind / fast-forward 1s |
 | `R` | 切换循环播放 / toggle loop playback |
-| `1` – `9` | 跳转到 10% – 90% 进度 / seek to 10% – 90% |
+| `1` – `8` | 跳转到 10% – 80% 进度 / seek to 10% – 80% |
+| `9` / `0` | 降低 / 增加音量 / decrease / increase volume |
 | `Q` | 退出 / quit |
 
 > **TXT 模式**（简谱）基于事件动态重排，快进/后退/循环/暂停都精确到毫秒；
