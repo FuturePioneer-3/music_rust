@@ -1,6 +1,6 @@
 [package]
 name = "music_rust"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2021"
 description = "music_rust —— 跨平台(主要Linux) MIDI 简谱钢琴演奏器"
 license = "GPL-3.0-or-later"

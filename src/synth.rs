@@ -432,6 +432,8 @@ pub struct SynthPlayer {
     pub soundfont: String,
     #[allow(dead_code)]
     tempo_ms: u32,
+    /// 当前合成器增益（音量），默认 1.0
+    gain: f32,
     freed: bool,
 }
 
@@ -586,8 +588,31 @@ impl SynthPlayer {
             sfont_id: inner.sfont_id,
             soundfont: inner.soundfont,
             tempo_ms,
+            gain: 1.0,
             freed: false,
         })
+    }
+
+    /// 调整音量（合成器增益），步进 ±0.1，范围 [0.1, 3.0]，限制在 [0, 1.6]。
+    /// 返回调整后的音量值（0.0-1.6 区间，用于日志显示）。
+    pub fn adjust_volume(&mut self, delta: f32) -> f32 {
+        let mut g = self.gain + delta;
+        if g < 0.1 {
+            g = 0.1;
+        }
+        if g > 3.0 {
+            g = 3.0;
+        }
+        self.gain = g;
+        unsafe { fluid_synth_set_gain(self.synth, g) };
+        debug(format!("音量: {:.0}%", g * 100.0));
+        g
+    }
+
+    /// 当前音量百分比
+    #[allow(dead_code)]
+    pub fn volume(&self) -> u32 {
+        (self.gain * 100.0) as u32
     }
 
     /// 调度一个音符事件到绝对时间点（毫秒）。
@@ -768,6 +793,12 @@ impl SynthPlayer {
                             seek_percent(player, p);
                             info(format!("跳转到 {}%", (p * 100.0) as i32));
                         }
+                        crate::input::Control::VolumeDown => {
+                            self.adjust_volume(-0.1);
+                        }
+                        crate::input::Control::VolumeUp => {
+                            self.adjust_volume(0.1);
+                        }
                     }
                 }
             }
@@ -946,6 +977,12 @@ impl SynthPlayer {
                         anchor_tick = schedule_from(self, events, playhead);
                         info(format!("跳转至 {}%", (p * 100.0) as i32));
                         prog.finish();
+                    }
+                    crate::input::Control::VolumeDown => {
+                        self.adjust_volume(-0.1);
+                    }
+                    crate::input::Control::VolumeUp => {
+                        self.adjust_volume(0.1);
                     }
                 }
             }
