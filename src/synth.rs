@@ -165,6 +165,31 @@ fn db_to_lin(db: f32) -> f32 {
     (10.0_f32).powf(db / 20.0)
 }
 
+/// 在闭包执行期间将 stderr 重定向到 /dev/null，执行完后恢复。
+/// 用于静默 fluidsynth 库初始化时对 ALSA/SDL 等后端的探测噪音，
+/// 这些消息由 C 库直接写 stderr，无法通过回调过滤。
+fn silence_stderr<T>(f: impl FnOnce() -> T) -> T {
+    let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+    if saved < 0 {
+        return f();
+    }
+    let devnull = unsafe {
+        libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_WRONLY)
+    };
+    if devnull >= 0 {
+        unsafe {
+            libc::dup2(devnull, libc::STDERR_FILENO);
+            libc::close(devnull);
+        }
+    }
+    let r = f();
+    unsafe {
+        libc::dup2(saved, libc::STDERR_FILENO);
+        libc::close(saved);
+    }
+    r
+}
+
 /// 全局限制器实例与合成器指针（音频回调使用）
 static mut LIMITER: LimiterState = LimiterState {
     target: 0.891,       // -1 dBFS
@@ -410,14 +435,31 @@ pub struct SynthPlayer {
     freed: bool,
 }
 
+/// 初始化阶段（stderr 静默期内）的临时结果，完成后字段搬运到 SynthPlayer。
+struct SynthPlayerInner {
+    settings: *mut fluid_settings_t,
+    synth: *mut fluid_synth_t,
+    audio_driver: *mut c_void,
+    sequencer: *mut fluid_sequencer_t,
+    synth_client: fluid_seq_id_t,
+    #[allow(dead_code)]
+    sfont_id: c_int,
+    #[allow(dead_code)]
+    soundfont: String,
+}
+
 impl SynthPlayer {
     pub fn new(soundfont_path: Option<&str>, tempo_ms: u32, verbose: bool, limit_db: f32) -> Result<Self, String> {
         info("正在初始化 fluidsynth ...".to_string());
 
-        let settings = unsafe { new_fluid_settings() };
-        if settings.is_null() {
-            return Err("new_fluid_settings 失败".into());
-        }
+        // fluidsynth 初始化期间，C 库会对 ALSA/SDL 等音频后端做探测并直接写 stderr，
+        // 产生大量与本机环境相关的噪音（Unknown PCM、unable to open slave、SDL3 未初始化等）。
+        // 这些消息与播放成败无关，在初始化阶段静默它们。
+        let init = silence_stderr(|| -> Result<SynthPlayerInner, String> {
+            let settings = unsafe { new_fluid_settings() };
+            if settings.is_null() {
+                return Err("new_fluid_settings 失败".into());
+            }
 
         // 音频驱动：优先探测 PipeWire / PulseAudio（大多数 Linux 桌面环境），
         // 其次回退 ALSA。用户可通过 MUSIC_AUDIO_DRIVER 环境变量强制指定。
@@ -520,7 +562,7 @@ impl SynthPlayer {
         let synth_client = unsafe { fluid_sequencer_register_fluidsynth(sequencer, synth) };
         info(format!("sequencer 客户端注册成功 (id={})", synth_client));
 
-        Ok(SynthPlayer {
+        Ok(SynthPlayerInner {
             settings,
             synth,
             audio_driver,
@@ -528,6 +570,21 @@ impl SynthPlayer {
             synth_client,
             sfont_id,
             soundfont: sf,
+        })
+        });
+        let inner = match init {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+
+        Ok(SynthPlayer {
+            settings: inner.settings,
+            synth: inner.synth,
+            audio_driver: inner.audio_driver,
+            sequencer: inner.sequencer,
+            synth_client: inner.synth_client,
+            sfont_id: inner.sfont_id,
+            soundfont: inner.soundfont,
             tempo_ms,
             freed: false,
         })
