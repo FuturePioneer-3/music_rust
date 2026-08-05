@@ -29,6 +29,9 @@ pub struct Progress {
 
 impl Progress {
     pub fn new(enabled: bool) -> Self {
+        if enabled {
+            crate::log::set_progress_active(true);
+        }
         Progress {
             width: 40,
             last_printed: false,
@@ -76,6 +79,13 @@ impl Progress {
             total_sec,
             remaining_sec,
         );
+        if crate::log::consume_log_pending() {
+            // 渲染后日志插过一行：log.rs 已清掉进度条行并换行，
+            // 光标位于新行行首，直接绘制即可（bar 自带 \r）
+        } else {
+            // 正常刷新：清空当前行再覆盖，避免缩短时尾部残留
+            print!("\r\x1b[2K");
+        }
         print!("{}", bar);
         let _ = io::stdout().flush();
         self.last_printed = true;
@@ -87,6 +97,13 @@ impl Progress {
             println!();
         }
         self.last_printed = false;
+        crate::log::set_progress_active(false);
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        crate::log::set_progress_active(false);
     }
 }
 
