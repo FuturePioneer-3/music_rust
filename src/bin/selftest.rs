@@ -42,6 +42,8 @@ mod progress;
 mod input;
 #[path = "../parser.rs"]
 mod parser;
+#[path = "../tui.rs"]
+mod tui;
 
 fn main() {
     log::init(true);

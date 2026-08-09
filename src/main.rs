@@ -43,6 +43,7 @@ mod log;
 mod parser;
 mod progress;
 mod synth;
+mod tui;
 
 use std::process::exit;
 
