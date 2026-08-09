@@ -1,0 +1,20 @@
+# music_rust —— Arch Linux package
+# Copyright (C) 2026 FuturePioneer-3
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+pkgname=music_rust
+pkgver=2.1.0
+pkgrel=1
+pkgdesc='Cross-platform MIDI and numbered-notation piano player'
+arch=('x86_64')
+url='https://github.com/FuturePioneer-3/music_rust'
+license=('GPL-3.0-or-later')
+depends=('fluidsynth' 'soundfont-fluid')
+source=('music')
+sha256sums=('SKIP')
+
+package() {
+    install -Dm755 "$srcdir/music" "$pkgdir/usr/bin/music"
+    install -Dm644 "$startdir/../README.md" "$pkgdir/usr/share/doc/music_rust/README.md"
+    install -Dm644 "$startdir/../LICENSE" "$pkgdir/usr/share/licenses/music_rust/LICENSE"
+}

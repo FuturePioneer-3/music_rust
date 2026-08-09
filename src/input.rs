@@ -54,6 +54,8 @@ pub enum Control {
     VolumeDown,
     /// 增加音量
     VolumeUp,
+    /// 终端鼠标左键点击位置（从 1 开始的列、行）
+    Mouse(u16, u16),
     /// 退出
     Quit,
     /// 无输入
@@ -246,6 +248,23 @@ fn parse_key(pending: &[u8]) -> (Option<Control>, Vec<u8>) {
         if pending.len() < 3 {
             return (None, pending.to_vec());
         }
+        if pending[2] == b'<' {
+            // SGR 鼠标格式：ESC [ < button;x;y M（按下）或 m（释放）。
+            let end = match pending.iter().position(|b| *b == b'M' || *b == b'm') {
+                Some(v) => v,
+                None => return (None, pending.to_vec()),
+            };
+            let fields = std::str::from_utf8(&pending[3..end]).ok()
+                .and_then(|v| {
+                    let mut values = v.split(';').filter_map(|part| part.parse::<u16>().ok());
+                    Some((values.next()?, values.next()?, values.next()?))
+                });
+            let ctrl = match (fields, pending[end]) {
+                (Some((0, x, y)), b'M') => Control::Mouse(x, y),
+                _ => Control::None,
+            };
+            return (Some(ctrl), pending[end + 1..].to_vec());
+        }
         let cmd = pending[2];
         let ctrl = match cmd {
             b'A' => Control::SeekForward(10.0),
@@ -285,4 +304,16 @@ fn parse_key(pending: &[u8]) -> (Option<Control>, Vec<u8>) {
 
     // 其它 ESC 序列：暂不识别，跳过
     (Some(Control::None), pending[1..].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_key, Control};
+
+    #[test]
+    fn parses_sgr_left_mouse_press() {
+        let (control, rest) = parse_key(b"\x1b[<0;17;6Mnext");
+        assert_eq!(control, Some(Control::Mouse(17, 6)));
+        assert_eq!(rest, b"next");
+    }
 }

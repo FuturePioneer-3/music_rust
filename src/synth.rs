@@ -739,7 +739,8 @@ impl SynthPlayer {
         };
 
         // 进度条
-        let mut prog = crate::progress::Progress::new(show_progress);
+        let mut tui = crate::tui::Tui::start(midi_path, "MIDI", show_progress);
+        let mut prog = crate::progress::Progress::new(show_progress && tui.is_none());
         let mut last_bpm: i32 = 0;
         let mut paused = false;
         let mut looping = false;
@@ -799,6 +800,23 @@ impl SynthPlayer {
                         crate::input::Control::VolumeUp => {
                             self.adjust_volume(0.1);
                         }
+                        crate::input::Control::Mouse(x, y) => {
+                            if let Some(ui) = &tui {
+                                let mouse = ui.mouse_control(x, y);
+                                match mouse {
+                                    crate::input::Control::Pause if !paused => {
+                                        unsafe { fluid_player_stop(player) };
+                                        paused = true;
+                                    }
+                                    crate::input::Control::Pause => {
+                                        unsafe { fluid_player_play(player) };
+                                        paused = false;
+                                    }
+                                    crate::input::Control::SeekPercent(p) => seek_percent(player, p),
+                                    _ => {}
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -827,6 +845,11 @@ impl SynthPlayer {
                     prog.update(e, e + 1);
                 }
             }
+            if let Some(ui) = &mut tui {
+                let ct = unsafe { fluid_player_get_current_tick(player) }.max(0) as u64;
+                let tt = unsafe { fluid_player_get_total_ticks(player) }.max(1) as u64;
+                ui.draw(total_ms as u64 * ct / tt, total_ms as u64, self.volume(), paused, looping);
+            }
 
             if status == FLUID_PLAYER_DONE {
                 // 暂停时 stop() 也会触发 DONE，但此时 paused=true 不退出
@@ -847,6 +870,7 @@ impl SynthPlayer {
             il.stop();
         }
         prog.finish();
+        drop(tui);
 
         unsafe { delete_fluid_player(player) };
         info("MIDI 播放完成".to_string());
@@ -886,7 +910,8 @@ impl SynthPlayer {
         show_progress: bool,
     ) {
         let mut input = crate::input::InputListener::start();
-        let mut prog = crate::progress::Progress::new(show_progress);
+        let mut tui = crate::tui::Tui::start("简谱演奏", "SCORE", show_progress);
+        let mut prog = crate::progress::Progress::new(show_progress && tui.is_none());
 
         let mut playhead: i64 = 0; // 当前播放位置（毫秒）
         let mut paused = false;
@@ -984,6 +1009,28 @@ impl SynthPlayer {
                     crate::input::Control::VolumeUp => {
                         self.adjust_volume(0.1);
                     }
+                    crate::input::Control::Mouse(x, y) => {
+                        if let Some(ui) = &tui {
+                            match ui.mouse_control(x, y) {
+                                crate::input::Control::Pause => {
+                                    paused = !paused;
+                                    if paused {
+                                        let now = self.now_ms();
+                                        playhead += now as i64 - anchor_tick as i64;
+                                        anchor_tick = now;
+                                        self.clear_schedule();
+                                    } else {
+                                        anchor_tick = schedule_from(self, events, playhead);
+                                    }
+                                }
+                                crate::input::Control::SeekPercent(p) => {
+                                    playhead = (total_ms as f64 * p).round() as i64;
+                                    anchor_tick = schedule_from(self, events, playhead);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
             }
 
@@ -993,6 +1040,9 @@ impl SynthPlayer {
 
             // 暂停时：等待恢复/退出
             if paused {
+                if let Some(ui) = &mut tui {
+                    ui.draw(playhead as u64, total_ms as u64, self.volume(), true, looping);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
@@ -1004,6 +1054,9 @@ impl SynthPlayer {
             // 进度显示
             if show_progress {
                 prog.update(cur as u64, total_ms as u64);
+            }
+            if let Some(ui) = &mut tui {
+                ui.draw(cur as u64, total_ms as u64, self.volume(), paused, looping);
             }
 
             // 播放结束判定
@@ -1024,6 +1077,7 @@ impl SynthPlayer {
 
         input.stop();
         prog.finish();
+        drop(tui);
     }
 
     /// 发出 note 调度（对外接口）
