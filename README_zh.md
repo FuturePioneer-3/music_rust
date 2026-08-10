@@ -22,7 +22,7 @@
 
 </div>
 
-music_rust 是一个**钢琴演奏器**：通过系统 **libfluidsynth** 合成器，用钢琴音色（GM Program 0）演奏自定义简谱 TXT 文件，也可直接播放标准 MIDI 文件。
+music_rust 是一个**音乐播放器**：简谱 TXT 和 MIDI 使用系统 **libfluidsynth** 钢琴合成器；WAV、MP3、FLAC、OGG、Opus、AAC、M4A 等音频文件使用 C/FFmpeg 解码并通过 ALSA 输出。
 
 原项目 `music_release/` 基于 Windows API (`winmm.lib`) 开发，仅支持 Windows。本项目完全用 **Rust** 重写，通过 FFI 直连系统 `libfluidsynth` 合成器，支持绝大多数 Linux 发行版。
 
@@ -35,7 +35,7 @@ music_rust 是一个**钢琴演奏器**：通过系统 **libfluidsynth** 合成�
 5. 📜 完全兼容原版 v1/v2 格式（左右手双轨、空行分组）。
 6. ⏱️ `fluid_sequencer` 毫秒级精确事件调度。
 7. 📊 **动态进度条**：实时显示进度百分比、已播/总时长、剩余时间。
-8. 🎮 **交互控制（类似 mpv）**：方向键快进/后退、空格暂停、R 循环、Q 退出，以及 **`9`/`0` 音量调节**。
+8. 🎮 **交互控制（类似 mpv）**：方向键快进/后退、空格暂停、Enter/P 播放、R 循环、Q 退出，以及 **`9`/`0` 音量调节**。
 9. 🖥️ **终端播放界面**：普通终端自动显示歌曲、进度、音量与循环状态；可点击进度条跳转、点击状态行暂停/继续。
 10. 🔇 **峰值限制器（默认 -1dBFS）**：自动防止多音符叠加削波/电流声。
 11. 🛠️ 调试模式：详细输出解析日志与每个 MIDI 事件。
@@ -72,7 +72,7 @@ cargo build --release
 ./target/release/music 乐曲.txt
 ```
 
-**依赖（运行时）**：`libfluidsynth.so` + 任意 SoundFont 文件。
+**依赖（运行时）**：MIDI/TXT 需要 `libfluidsynth.so`；WAV/MP3 等音频文件需要 FFmpeg 运行库与 ALSA（`libavformat`、`libavcodec`、`libavutil`、`libswresample`、`libasound`）。AppImage 内置 SoundFont，但音频解码库仍使用系统库。
 
 | 发行版 | 安装命令 |
 | ------ | -------- |
@@ -149,6 +149,12 @@ cargo build --release
 | `Q` | 退出 |
 
 普通交互终端会自动启用全屏播放界面，并支持鼠标：点击进度条可跳转，点击状态行可暂停或继续。`-d` 调试模式保持原有详细日志输出，不启用播放界面。
+
+### 音频文件播放
+
+传入 `.wav`、`.mp3`、`.flac`、`.ogg`、`.opus`、`.aac`、`.m4a` 或 `.wma` 文件时，程序自动进入**音乐文件模式**；`.mid`/`.midi` 仍进入 **MIDI 模式**，其它文本文件进入**简谱模式**。TUI 标题会明确显示当前模式。
+
+音频文件模式默认音量为 **80%**，可调范围为 **80%-500%**。`9` 降低 10%，`0` 增加 10%；`Space` 暂停/继续，`Enter` 或 `P` 播放，方向键和鼠标进度条跳转。
 
 > **TXT 模式**（简谱）基于事件动态重排，快进/后退/循环/暂停都精确到毫秒；
 > **MIDI 模式**使用 fluidsynth 原生播放器（`fluid_player_seek` / `set_loop`），同样支持上述按键。

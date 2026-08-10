@@ -588,20 +588,19 @@ impl SynthPlayer {
             sfont_id: inner.sfont_id,
             soundfont: inner.soundfont,
             tempo_ms,
-            gain: 1.0,
+            gain: 0.8,
             freed: false,
         })
     }
 
-    /// 调整音量（合成器增益），步进 ±0.1，范围 [0.1, 3.0]，限制在 [0, 1.6]。
-    /// 返回调整后的音量值（0.0-1.6 区间，用于日志显示）。
+    /// 调整音量（合成器增益），步进 ±0.1，范围 80%-500%。
     pub fn adjust_volume(&mut self, delta: f32) -> f32 {
         let mut g = self.gain + delta;
-        if g < 0.1 {
-            g = 0.1;
+        if g < 0.8 {
+            g = 0.8;
         }
-        if g > 3.0 {
-            g = 3.0;
+        if g > 5.0 {
+            g = 5.0;
         }
         self.gain = g;
         unsafe { fluid_synth_set_gain(self.synth, g) };
@@ -613,6 +612,12 @@ impl SynthPlayer {
     #[allow(dead_code)]
     pub fn volume(&self) -> u32 {
         (self.gain * 100.0) as u32
+    }
+
+    /// 设置绝对音量百分比，范围 80%-500%。
+    pub fn set_volume_percent(&mut self, percent: u32) {
+        self.gain = percent.clamp(80, 500) as f32 / 100.0;
+        unsafe { fluid_synth_set_gain(self.synth, self.gain) };
     }
 
     /// 调度一个音符事件到绝对时间点（毫秒）。
@@ -739,7 +744,7 @@ impl SynthPlayer {
         };
 
         // 进度条
-        let mut tui = crate::tui::Tui::start(midi_path, "MIDI", show_progress);
+        let mut tui = crate::tui::Tui::start(midi_path, "MIDI 音乐", show_progress);
         let mut prog = crate::progress::Progress::new(show_progress && tui.is_none());
         let mut last_bpm: i32 = 0;
         let mut paused = false;
@@ -767,6 +772,13 @@ impl SynthPlayer {
                             } else {
                                 unsafe { fluid_player_play(player) };
                                 info("继续".to_string());
+                                paused = false;
+                            }
+                        }
+                        crate::input::Control::Play => {
+                            if paused {
+                                unsafe { fluid_player_play(player) };
+                                info("播放".to_string());
                                 paused = false;
                             }
                         }
@@ -802,7 +814,7 @@ impl SynthPlayer {
                         }
                         crate::input::Control::Mouse(x, y) => {
                             if let Some(ui) = &tui {
-                                let mouse = ui.mouse_control(x, y);
+                                let mouse = ui.mouse_control(x, y, paused);
                                 match mouse {
                                     crate::input::Control::Pause if !paused => {
                                         unsafe { fluid_player_stop(player) };
@@ -910,7 +922,7 @@ impl SynthPlayer {
         show_progress: bool,
     ) {
         let mut input = crate::input::InputListener::start();
-        let mut tui = crate::tui::Tui::start("简谱演奏", "SCORE", show_progress);
+        let mut tui = crate::tui::Tui::start("简谱演奏", "简谱", show_progress);
         let mut prog = crate::progress::Progress::new(show_progress && tui.is_none());
 
         let mut playhead: i64 = 0; // 当前播放位置（毫秒）
@@ -967,6 +979,13 @@ impl SynthPlayer {
                             info("继续".to_string());
                         }
                     }
+                    crate::input::Control::Play => {
+                        if paused {
+                            paused = false;
+                            anchor_tick = schedule_from(self, events, playhead);
+                            info("播放".to_string());
+                        }
+                    }
                     crate::input::Control::Loop => {
                         looping = !looping;
                         info(if looping {
@@ -1011,7 +1030,7 @@ impl SynthPlayer {
                     }
                     crate::input::Control::Mouse(x, y) => {
                         if let Some(ui) = &tui {
-                            match ui.mouse_control(x, y) {
+                            match ui.mouse_control(x, y, paused) {
                                 crate::input::Control::Pause => {
                                     paused = !paused;
                                     if paused {
@@ -1025,6 +1044,10 @@ impl SynthPlayer {
                                 }
                                 crate::input::Control::SeekPercent(p) => {
                                     playhead = (total_ms as f64 * p).round() as i64;
+                                    anchor_tick = schedule_from(self, events, playhead);
+                                }
+                                crate::input::Control::Play => {
+                                    paused = false;
                                     anchor_tick = schedule_from(self, events, playhead);
                                 }
                                 _ => {}

@@ -27,6 +27,23 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
+    println!("cargo:rerun-if-changed=src/audio_file.c");
+    println!("cargo:rerun-if-changed=src/audio_file.h");
+
+    cc::Build::new()
+        .file("src/audio_file.c")
+        .include("src")
+        .warnings(true)
+        .compile("music_audio_file");
+
+    for lib in ["libavformat", "libavcodec", "libavutil", "libswresample", "alsa"] {
+        let status = Command::new("pkg-config").args(["--exists", lib]).status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            println!("cargo:warning=未找到 pkg-config 库 {}, 将尝试直接链接", lib);
+        }
+        let link_name = if lib == "alsa" { "asound" } else { lib.trim_start_matches("lib") };
+        println!("cargo:rustc-link-lib=dylib={}", link_name);
+    }
 
     let has_pkgconfig = Command::new("pkg-config")
         .args(["--exists", "fluidsynth"])

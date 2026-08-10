@@ -58,12 +58,12 @@ impl Tui {
         let pct = if total_ms == 0 { 0.0 } else { (elapsed_ms as f64 / total_ms as f64).clamp(0.0, 1.0) };
         let bar_width = self.width.saturating_sub(8).clamp(20, 72);
         let filled = (pct * bar_width as f64).round() as usize;
-        let state = if paused { "PAUSED" } else { "PLAYING" };
-        let loop_state = if looping { "ON" } else { "OFF" };
+        let state = if paused { "已暂停" } else { "正在播放" };
+        let loop_state = if looping { "开启" } else { "关闭" };
         let title = clip(&self.title, self.width.saturating_sub(4));
 
         print!("\x1b[H\x1b[2J");
-        println!("\x1b[1;36m  MUSIC RUST\x1b[0m  \x1b[2mPiano Player\x1b[0m");
+        println!("\x1b[1;36m  MUSIC RUST\x1b[0m  \x1b[2m音乐播放器\x1b[0m");
         println!("\x1b[2m  {}\x1b[0m", "─".repeat(self.width.saturating_sub(4)));
         println!("  \x1b[1m{}\x1b[0m", title);
         println!("  \x1b[2m{}  |  {}\x1b[0m", self.mode, state);
@@ -71,22 +71,26 @@ impl Tui {
         println!("  \x1b[36m[{}{}]\x1b[0m  \x1b[1m{:>5.1}%\x1b[0m", "█".repeat(filled), "░".repeat(bar_width - filled), pct * 100.0);
         println!("  \x1b[2m{} / {}\x1b[0m", format_time(elapsed_ms), format_time(total_ms));
         println!();
-        println!("  \x1b[33mVolume\x1b[0m  {:>3}%    \x1b[35mLoop\x1b[0m  {}", volume, loop_state);
+        println!("  \x1b[33m音量\x1b[0m {:>3}% / 500%    \x1b[35m循环\x1b[0m {}", volume, loop_state);
         println!();
-        println!("  \x1b[7m Space \x1b[0m pause    \x1b[7m ← / → \x1b[0m seek    \x1b[7m R \x1b[0m loop    \x1b[7m 9 / 0 \x1b[0m volume    \x1b[7m Q \x1b[0m quit");
-        println!("  \x1b[2mClick the progress bar to seek; click the status line to toggle playback.\x1b[0m");
+        let action = if paused { "播放" } else { "暂停" };
+        println!("  \x1b[7m 播放 \x1b[0m  \x1b[7m 暂停 \x1b[0m    Enter/P 播放    Space {}    ← / → 快退/快进    9 / 0 音量    Q 退出", action);
+        println!("  \x1b[2m鼠标：点击进度条跳转，点击状态栏切换播放\x1b[0m");
         let _ = io::stdout().flush();
     }
 
-    pub fn mouse_control(&self, x: u16, y: u16) -> Control {
+    pub fn mouse_control(&self, x: u16, y: u16, paused: bool) -> Control {
         // The bar is rendered on terminal row 6, with its first cell at column 3.
         if y == 6 {
             let bar_width = self.width.saturating_sub(8).clamp(20, 72);
             let offset = usize::from(x).saturating_sub(3).min(bar_width);
             return Control::SeekPercent(offset as f64 / bar_width as f64);
         }
-        if y == 9 {
-            return Control::Pause;
+        if y == 4 {
+            return if paused { Control::Play } else { Control::Pause };
+        }
+        if y == 11 {
+            return if x < 14 { Control::Play } else { Control::Pause };
         }
         Control::None
     }

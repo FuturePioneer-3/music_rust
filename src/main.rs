@@ -39,6 +39,7 @@
 //!   9/0 降低/增加音量
 
 mod input;
+mod audio_file;
 mod log;
 mod parser;
 mod progress;
@@ -64,7 +65,7 @@ fn print_usage() {
     println!("  -m, --midi <file>     直接播放 MIDI 文件（fluidsynth 原生多轨+变速）");
     println!("  -t, --tempo <ms>      覆盖速度 (ms/四分音符)");
     println!("  -b, --bpm <n>         覆盖速度 (BPM)");
-    println!("  -v, --volume <0-127>  音量");
+    println!("  -v, --volume <80-500> 音量（默认 80%，最大 500%）");
     println!("  -l, --limit <dB>      峰值限制电平 (默认 -1.0 dBFS，防止削波)");
     println!("  -h, --help            帮助");
     println!();
@@ -92,7 +93,7 @@ struct Args {
     debug: bool,
     soundfont: Option<String>,
     tempo: Option<u32>,
-    volume: u8,
+    volume: u32,
     limit_db: f32,
     midi: bool,
 }
@@ -104,7 +105,7 @@ fn parse_args() -> Result<Args, String> {
         debug: false,
         soundfont: None,
         tempo: None,
-        volume: 96,
+        volume: 80,
         limit_db: -1.0,
         midi: false,
     };
@@ -142,10 +143,10 @@ fn parse_args() -> Result<Args, String> {
             "-v" | "--volume" => {
                 let v = args.next().ok_or("--volume 需要一个参数")?;
                 let vol: u32 = v.parse().map_err(|_| "音量需为 0-127 整数")?;
-                if vol > 127 {
-                    return Err("音量超出范围 (0-127)".into());
+                if !(80..=500).contains(&vol) {
+                    return Err("音量超出范围 (80-500%)".into());
                 }
-                out.volume = vol as u8;
+                out.volume = vol;
             }
             "-l" | "--limit" => {
                 let v = args.next().ok_or("--limit 需要一个参数 (dBFS, 如 -1.0)")?;
@@ -193,6 +194,14 @@ fn main() {
     info(format!("music_rust —— 钢琴演奏器 v{}", VERSION));
     info(format!("乐曲文件: {}", file));
 
+    if !args.midi && is_audio_file(&file) {
+        if let Err(e) = play_audio_file(&file, args.volume, !args.debug) {
+            error(format!("音频播放失败: {}", e));
+            exit(1);
+        }
+        return;
+    }
+
     // 判断是否为 MIDI 文件（-m 参数或 .mid/.midi 扩展名）
     let is_midi = args.midi || is_midi_file(&file);
 
@@ -206,6 +215,7 @@ fn main() {
                 exit(1);
             }
         };
+        player.set_volume_percent(args.volume);
 
         // 覆盖速度：-b/-t 参数 → BPM
         let bpm_override = args.tempo.map(|ms| 60_000.0 / ms as f64);
@@ -253,6 +263,7 @@ fn main() {
             exit(1);
         }
     };
+    player.set_volume_percent(args.volume);
 
     // 设置每个音轨的乐器（钢琴 GM Program 0）
     for track in &score.tracks {
@@ -286,6 +297,67 @@ fn main() {
 fn is_midi_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.ends_with(".mid") || lower.ends_with(".midi")
+}
+
+fn is_audio_file(path: &str) -> bool {
+    matches!(path.rsplit('.').next().map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("wav" | "mp3" | "flac" | "ogg" | "opus" | "aac" | "m4a" | "wma"))
+}
+
+fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String> {
+    let mut player = audio_file::AudioFilePlayer::open(path)?;
+    player.set_volume_percent(volume);
+    player.play();
+    let mut input = input::InputListener::start();
+    let mut tui = tui::Tui::start(path, "音乐文件", show_tui);
+    let mut paused = false;
+    loop {
+        loop {
+            match input.poll() {
+                input::Control::None => break,
+                input::Control::Quit => { input.stop(); return Ok(()); }
+                input::Control::Pause => { paused = !paused; if paused { player.pause(); } else { player.play(); } }
+                input::Control::Play => { paused = false; player.play(); }
+                input::Control::VolumeDown => player.set_volume_percent(player.volume_percent().saturating_sub(10)),
+                input::Control::VolumeUp => player.set_volume_percent((player.volume_percent() + 10).min(500)),
+                input::Control::SeekForward(s) => player.seek(player.position_ms() as i64 + (s * 1000.0) as i64),
+                input::Control::SeekBackward(s) => player.seek(player.position_ms() as i64 - (s * 1000.0) as i64),
+                input::Control::SeekPercent(p) => player.seek((player.duration_ms() as f64 * p) as i64),
+                input::Control::Mouse(x, y) => {
+                    if let Some(ui) = &tui {
+                        match ui.mouse_control(x, y, paused) {
+                            input::Control::Pause => { paused = true; player.pause(); }
+                            input::Control::Play => { paused = false; player.play(); }
+                            input::Control::SeekPercent(p) => player.seek((player.duration_ms() as f64 * p) as i64),
+                            _ => {}
+                        }
+                    }
+                }
+                input::Control::Loop => {}
+            }
+        }
+        let position = player.position_ms();
+        let duration = player.duration_ms();
+        if let Some(ui) = &mut tui { ui.draw(position, duration, player.volume_percent(), paused, false); }
+        if player.finished() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    input.stop();
+    drop(tui);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_audio_file;
+
+    #[test]
+    fn recognizes_ffmpeg_audio_extensions() {
+        assert!(is_audio_file("song.MP3"));
+        assert!(is_audio_file("voice.flac"));
+        assert!(!is_audio_file("score.txt"));
+        assert!(!is_audio_file("song.mid"));
+    }
 }
 
 /// 轻量解析 MIDI 文件，估算总时长（毫秒）。
