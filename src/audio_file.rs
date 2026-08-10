@@ -5,7 +5,6 @@
 use std::ffi::{c_char, CString};
 
 #[repr(C)]
-#[repr(C)]
 struct RawAudio { _private: [u8; 0] }
 
 extern "C" {
@@ -18,6 +17,7 @@ extern "C" {
     fn music_audio_finished(player: *mut RawAudio) -> i32;
     fn music_audio_set_volume(player: *mut RawAudio, volume: f32);
     fn music_audio_volume(player: *mut RawAudio) -> f32;
+    fn music_audio_frequency_hz(player: *mut RawAudio) -> f32;
     fn music_audio_close(player: *mut RawAudio);
 }
 
@@ -38,8 +38,9 @@ impl AudioFilePlayer {
     pub fn position_ms(&self) -> u64 { unsafe { music_audio_position_ms(self.raw).max(0) as u64 } }
     pub fn duration_ms(&self) -> u64 { unsafe { music_audio_duration_ms(self.raw).max(0) as u64 } }
     pub fn finished(&self) -> bool { unsafe { music_audio_finished(self.raw) != 0 } }
-    pub fn set_volume_percent(&mut self, percent: u32) { unsafe { music_audio_set_volume(self.raw, percent.clamp(80, 500) as f32 / 100.0); } }
+    pub fn set_volume_percent(&mut self, percent: u32) { unsafe { music_audio_set_volume(self.raw, percent.clamp(0, 500) as f32 / 100.0); } }
     pub fn volume_percent(&self) -> u32 { unsafe { (music_audio_volume(self.raw) * 100.0).round() as u32 } }
+    pub fn frequency_hz(&self) -> f32 { unsafe { music_audio_frequency_hz(self.raw) } }
 }
 
 impl Drop for AudioFilePlayer { fn drop(&mut self) { unsafe { music_audio_close(self.raw); } } }
