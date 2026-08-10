@@ -74,9 +74,9 @@ impl Tui {
         println!("  \x1b[2m{} / {}\x1b[0m", format_time(elapsed_ms), format_time(total_ms));
         println!();
         println!("  \x1b[33m音量\x1b[0m {:>3}% / 500%    \x1b[35m循环\x1b[0m {}", volume, loop_state);
-        println!("  \x1b[36m动态 EQ\x1b[0m  20Hz   50   100   200   400   800  1.6k  3.2k  6.4k  10k");
+        println!("  \x1b[36m动态 EQ\x1b[0m  20  30  46  70 105 160 240 360 550 830 1.2k 1.9k 2.9k 4.4k 6.6k 10k");
         for row in (1..=7).rev() {
-            let bars: String = spectrum.iter().map(|level| if *level >= row { '█' } else { ' ' }).collect();
+            let bars: String = spectrum.iter().map(|level| if *level >= row { " █  " } else { "    " }).collect();
             println!("           \x1b[36m{}\x1b[0m", bars);
         }
         self.detail_lines = details.len();
