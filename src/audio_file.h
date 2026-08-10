@@ -18,6 +18,7 @@ int64_t music_audio_duration_ms(music_audio *player);
 int music_audio_finished(music_audio *player);
 void music_audio_set_volume(music_audio *player, float volume);
 float music_audio_volume(music_audio *player);
+float music_audio_frequency_hz(music_audio *player);
 void music_audio_close(music_audio *player);
 
 #endif

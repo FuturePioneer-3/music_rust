@@ -59,7 +59,7 @@ The bundled SoundFont is loaded automatically. To use another font: `--soundfont
 ### Arch Linux (pkg.tar.zst)
 
 ```bash
-sudo pacman -U music_rust-2.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-2.2.0-1-x86_64.pkg.tar.zst
 # pulls in fluidsynth + soundfont-fluid automatically
 music 乐曲.txt
 ```
@@ -123,7 +123,7 @@ cargo build --release
 | `-m, --midi <file>` | direct MIDI playback (native multitrack + tempo) |
 | `-t, --tempo <ms>` | override tempo (ms per quarter note) |
 | `-b, --bpm <n>` | override tempo (BPM) |
-| `-v, --volume <0-127>` | volume |
+| `-v, --volume <0-500>` | volume (default 80%; 0% is mute) |
 | `-l, --limit <dB>` | peak limiter level (default `-1.0` dBFS, prevents clipping) |
 | `-h, --help` | help |
 

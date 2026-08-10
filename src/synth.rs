@@ -28,6 +28,7 @@
 #![allow(dead_code)]
 
 use std::ffi::{c_char, c_int, c_short, c_uint, c_void, CString};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::log::{debug, info, warn};
@@ -593,11 +594,11 @@ impl SynthPlayer {
         })
     }
 
-    /// 调整音量（合成器增益），步进 ±0.1，范围 80%-500%。
+    /// 调整音量（合成器增益），步进 ±0.1，范围 0%-500%。
     pub fn adjust_volume(&mut self, delta: f32) -> f32 {
         let mut g = self.gain + delta;
-        if g < 0.8 {
-            g = 0.8;
+        if g < 0.0 {
+            g = 0.0;
         }
         if g > 5.0 {
             g = 5.0;
@@ -614,9 +615,9 @@ impl SynthPlayer {
         (self.gain * 100.0) as u32
     }
 
-    /// 设置绝对音量百分比，范围 80%-500%。
+    /// 设置绝对音量百分比，范围 0%-500%。
     pub fn set_volume_percent(&mut self, percent: u32) {
-        self.gain = percent.clamp(80, 500) as f32 / 100.0;
+        self.gain = percent.clamp(0, 500) as f32 / 100.0;
         unsafe { fluid_synth_set_gain(self.synth, self.gain) };
     }
 
@@ -709,6 +710,7 @@ impl SynthPlayer {
     ) -> Result<(), String> {
         let path_c = CString::new(midi_path)
             .map_err(|_| "MIDI 路径包含非法字符".to_string())?;
+        let display_events = midi_display_events(midi_path);
 
         let player = unsafe { new_fluid_player(self.synth) };
         if player.is_null() {
@@ -860,7 +862,7 @@ impl SynthPlayer {
             if let Some(ui) = &mut tui {
                 let ct = unsafe { fluid_player_get_current_tick(player) }.max(0) as u64;
                 let tt = unsafe { fluid_player_get_total_ticks(player) }.max(1) as u64;
-                ui.draw(total_ms as u64 * ct / tt, total_ms as u64, self.volume(), paused, looping);
+                ui.draw(total_ms as u64 * ct / tt, total_ms as u64, self.volume(), paused, looping, &active_midi_notes_text(&display_events, ct));
             }
 
             if status == FLUID_PLAYER_DONE {
@@ -1064,7 +1066,7 @@ impl SynthPlayer {
             // 暂停时：等待恢复/退出
             if paused {
                 if let Some(ui) = &mut tui {
-                    ui.draw(playhead as u64, total_ms as u64, self.volume(), true, looping);
+                    ui.draw(playhead as u64, total_ms as u64, self.volume(), true, looping, &active_notes_text(events, playhead));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
@@ -1079,7 +1081,7 @@ impl SynthPlayer {
                 prog.update(cur as u64, total_ms as u64);
             }
             if let Some(ui) = &mut tui {
-                ui.draw(cur as u64, total_ms as u64, self.volume(), paused, looping);
+                ui.draw(cur as u64, total_ms as u64, self.volume(), paused, looping, &active_notes_text(events, cur));
             }
 
             // 播放结束判定
@@ -1142,6 +1144,137 @@ impl SynthPlayer {
         self.freed = true;
         info("音频引擎已关闭".to_string());
     }
+}
+
+fn midi_note_name(key: u8) -> String {
+    const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    format!("{}{}", NAMES[(key % 12) as usize], key as i16 / 12 - 1)
+}
+
+fn active_notes_text(events: &[crate::parser::ScheduledNote], at_ms: i64) -> String {
+    let mut active: BTreeMap<u8, BTreeSet<u8>> = BTreeMap::new();
+    for event in events.iter().take_while(|event| event.at_ms as i64 <= at_ms) {
+        let notes = active.entry(event.channel).or_default();
+        if event.on {
+            notes.insert(event.key);
+        } else {
+            notes.remove(&event.key);
+        }
+    }
+    let tracks: Vec<String> = active
+        .iter()
+        .filter(|(_, notes)| !notes.is_empty())
+        .map(|(channel, notes)| format!("轨道 {}: {}", channel + 1, notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" ")))
+        .collect();
+    if tracks.is_empty() { "音符: -".to_string() } else { format!("音符  {}", tracks.join(" | ")) }
+}
+
+#[derive(Clone, Copy)]
+struct MidiDisplayEvent {
+    tick: u64,
+    track: usize,
+    key: u8,
+    on: bool,
+}
+
+fn midi_display_events(path: &str) -> Vec<MidiDisplayEvent> {
+    use std::io::Read;
+
+    fn read_varlen(data: &[u8], pos: &mut usize, end: usize) -> Option<u64> {
+        let mut value = 0;
+        for _ in 0..4 {
+            if *pos >= end { return None; }
+            let byte = data[*pos];
+            *pos += 1;
+            value = (value << 7) | u64::from(byte & 0x7f);
+            if byte & 0x80 == 0 { return Some(value); }
+        }
+        None
+    }
+
+    let mut data = Vec::new();
+    if std::fs::File::open(path).and_then(|mut file| file.read_to_end(&mut data)).is_err() || data.len() < 14 || &data[..4] != b"MThd" {
+        return Vec::new();
+    }
+    let header_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let mut pos = 8usize.saturating_add(header_len);
+    let mut result = Vec::new();
+    let mut track = 0usize;
+    while pos + 8 <= data.len() && &data[pos..pos + 4] == b"MTrk" {
+        let length = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]) as usize;
+        pos += 8;
+        let end = pos.saturating_add(length).min(data.len());
+        let mut tick = 0u64;
+        let mut running = 0u8;
+        while pos < end {
+            let Some(delta) = read_varlen(&data, &mut pos, end) else { break; };
+            tick += delta;
+            if pos >= end { break; }
+            let first = data[pos];
+            let (status, data1) = if first < 0x80 {
+                if running == 0 { break; }
+                pos += 1;
+                (running, Some(first))
+            } else {
+                pos += 1;
+                if first < 0xf0 { running = first; }
+                (first, None)
+            };
+            match status {
+                0xff => {
+                    if pos >= end { break; }
+                    pos += 1;
+                    let Some(length) = read_varlen(&data, &mut pos, end) else { break; };
+                    pos = pos.saturating_add(length as usize).min(end);
+                }
+                0xf0 | 0xf7 => {
+                    let Some(length) = read_varlen(&data, &mut pos, end) else { break; };
+                    pos = pos.saturating_add(length as usize).min(end);
+                }
+                _ => {
+                    let kind = status & 0xf0;
+                    let needed = if kind == 0xc0 || kind == 0xd0 { 1 } else { 2 };
+                    let first_data = match data1 {
+                        Some(value) => value,
+                        None => {
+                            if pos >= end { break; }
+                            let value = data[pos];
+                            pos += 1;
+                            value
+                        }
+                    };
+                    let second_data = if needed == 2 {
+                        if pos >= end { break; }
+                        let value = data[pos];
+                        pos += 1;
+                        Some(value)
+                    } else { None };
+                    if kind == 0x80 || kind == 0x90 {
+                        if let Some(velocity) = second_data {
+                            result.push(MidiDisplayEvent { tick, track, key: first_data, on: kind == 0x90 && velocity != 0 });
+                        }
+                    }
+                }
+            }
+        }
+        pos = end;
+        track += 1;
+    }
+    result
+}
+
+fn active_midi_notes_text(events: &[MidiDisplayEvent], tick: u64) -> String {
+    let mut active: BTreeMap<usize, BTreeSet<u8>> = BTreeMap::new();
+    for event in events.iter().take_while(|event| event.tick <= tick) {
+        let notes = active.entry(event.track).or_default();
+        if event.on { notes.insert(event.key); } else { notes.remove(&event.key); }
+    }
+    let tracks: Vec<String> = active
+        .iter()
+        .filter(|(_, notes)| !notes.is_empty())
+        .map(|(track, notes)| format!("轨道 {}: {}", track + 1, notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" ")))
+        .collect();
+    if tracks.is_empty() { "音符: -".to_string() } else { format!("音符  {}", tracks.join(" | ")) }
 }
 
 impl Drop for SynthPlayer {

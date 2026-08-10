@@ -2,7 +2,7 @@
 
 # 🎹 music_rust
 
-**MIDI 简谱钢琴演奏器 —— 跨平台（主要 Linux），纯 Rust**
+**MIDI 简谱钢琴演奏器 —— 跨平台（主要 Linux），Rust 主体 + C 音频层**
 
 <div>
 
@@ -58,7 +58,7 @@ chmod +x music_rust-x86_64.AppImage
 ### Arch Linux（pkg.tar.zst）
 
 ```bash
-sudo pacman -U music_rust-2.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-2.2.0-1-x86_64.pkg.tar.zst
 # 自动安装依赖 fluidsynth + soundfont-fluid
 music 乐曲.txt
 ```
@@ -122,7 +122,7 @@ cargo build --release
 | `-m, --midi <file>` | 直接播放 MIDI 文件（fluidsynth 原生多轨+变速） |
 | `-t, --tempo <ms>` | 覆盖速度（毫秒/四分音符） |
 | `-b, --bpm <n>` | 覆盖速度（BPM） |
-| `-v, --volume <0-127>` | 音量 |
+| `-v, --volume <0-500>` | 音量（默认 80%，0% 静音） |
 | `-l, --limit <dB>` | 峰值限制电平（默认 `-1.0` dBFS，防止削波） |
 | `-h, --help` | 帮助 |
 
@@ -154,7 +154,7 @@ cargo build --release
 
 传入 `.wav`、`.mp3`、`.flac`、`.ogg`、`.opus`、`.aac`、`.m4a` 或 `.wma` 文件时，程序自动进入**音乐文件模式**；`.mid`/`.midi` 仍进入 **MIDI 模式**，其它文本文件进入**简谱模式**。TUI 标题会明确显示当前模式。
 
-音频文件模式默认音量为 **80%**，可调范围为 **80%-500%**。`9` 降低 10%，`0` 增加 10%；`Space` 暂停/继续，`Enter` 或 `P` 播放，方向键和鼠标进度条跳转。
+音频文件模式默认音量为 **80%**，可调范围为 **0%-500%**（0% 静音）。`9` 降低 10%，`0` 增加 10%；`Space` 暂停/继续，`Enter` 或 `P` 播放，方向键和鼠标进度条跳转。音频模式在 TUI 中显示实时动态频率估算值；MIDI 与简谱模式显示各音轨当前按下的音名，例如 `C4`、`C#4`、`D4`。
 
 > **TXT 模式**（简谱）基于事件动态重排，快进/后退/循环/暂停都精确到毫秒；
 > **MIDI 模式**使用 fluidsynth 原生播放器（`fluid_player_seek` / `set_loop`），同样支持上述按键。

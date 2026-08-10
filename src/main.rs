@@ -30,7 +30,7 @@
 //!   -m, --midi <file>    直接播放 MIDI 文件（fluidsynth 原生多轨+变速）
 //!   -t, --tempo <ms>     覆盖速度 (ms/四分音符)
 //!   -b, --bpm <n>        覆盖速度 (BPM)
-//!   -v, --volume <0-127> 音量
+//!   -v, --volume <0-500> 音量（默认 80%）
 //!   -h, --help           帮助
 //!
 //! 播放控制（类似 mpv）:
@@ -65,7 +65,7 @@ fn print_usage() {
     println!("  -m, --midi <file>     直接播放 MIDI 文件（fluidsynth 原生多轨+变速）");
     println!("  -t, --tempo <ms>      覆盖速度 (ms/四分音符)");
     println!("  -b, --bpm <n>         覆盖速度 (BPM)");
-    println!("  -v, --volume <80-500> 音量（默认 80%，最大 500%）");
+    println!("  -v, --volume <0-500>  音量（默认 80%，最大 500%）");
     println!("  -l, --limit <dB>      峰值限制电平 (默认 -1.0 dBFS，防止削波)");
     println!("  -h, --help            帮助");
     println!();
@@ -142,9 +142,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "-v" | "--volume" => {
                 let v = args.next().ok_or("--volume 需要一个参数")?;
-                let vol: u32 = v.parse().map_err(|_| "音量需为 0-127 整数")?;
-                if !(80..=500).contains(&vol) {
-                    return Err("音量超出范围 (80-500%)".into());
+                let vol: u32 = v.parse().map_err(|_| "音量需为 0-500 整数")?;
+                if !(0..=500).contains(&vol) {
+                    return Err("音量超出范围 (0-500%)".into());
                 }
                 out.volume = vol;
             }
@@ -311,6 +311,7 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
     let mut input = input::InputListener::start();
     let mut tui = tui::Tui::start(path, "音乐文件", show_tui);
     let mut paused = false;
+    let mut looping = false;
     loop {
         loop {
             match input.poll() {
@@ -319,7 +320,7 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
                 input::Control::Pause => { paused = !paused; if paused { player.pause(); } else { player.play(); } }
                 input::Control::Play => { paused = false; player.play(); }
                 input::Control::VolumeDown => player.set_volume_percent(player.volume_percent().saturating_sub(10)),
-                input::Control::VolumeUp => player.set_volume_percent((player.volume_percent() + 10).min(500)),
+                input::Control::VolumeUp => player.set_volume_percent(player.volume_percent().saturating_add(10).min(500)),
                 input::Control::SeekForward(s) => player.seek(player.position_ms() as i64 + (s * 1000.0) as i64),
                 input::Control::SeekBackward(s) => player.seek(player.position_ms() as i64 - (s * 1000.0) as i64),
                 input::Control::SeekPercent(p) => player.seek((player.duration_ms() as f64 * p) as i64),
@@ -333,13 +334,23 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
                         }
                     }
                 }
-                input::Control::Loop => {}
+                input::Control::Loop => looping = !looping,
             }
         }
         let position = player.position_ms();
         let duration = player.duration_ms();
-        if let Some(ui) = &mut tui { ui.draw(position, duration, player.volume_percent(), paused, false); }
-        if player.finished() { break; }
+        if let Some(ui) = &mut tui {
+            ui.draw(position, duration, player.volume_percent(), paused, looping, &format!("动态频率  {:.0} Hz", player.frequency_hz()));
+        }
+        if player.finished() {
+            if looping {
+                player.seek(0);
+                player.play();
+                paused = false;
+            } else {
+                break;
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     input.stop();

@@ -46,11 +46,11 @@ impl Tui {
         print!("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H");
         let _ = io::stdout().flush();
         let mut tui = tui;
-        tui.draw(0, 0, 100, false, false);
+        tui.draw(0, 0, 80, false, false, "");
         Some(tui)
     }
 
-    pub fn draw(&mut self, elapsed_ms: u64, total_ms: u64, volume: u32, paused: bool, looping: bool) {
+    pub fn draw(&mut self, elapsed_ms: u64, total_ms: u64, volume: u32, paused: bool, looping: bool, detail: &str) {
         if !self.active {
             return;
         }
@@ -72,6 +72,9 @@ impl Tui {
         println!("  \x1b[2m{} / {}\x1b[0m", format_time(elapsed_ms), format_time(total_ms));
         println!();
         println!("  \x1b[33m音量\x1b[0m {:>3}% / 500%    \x1b[35m循环\x1b[0m {}", volume, loop_state);
+        if !detail.is_empty() {
+            println!("  \x1b[2m{}\x1b[0m", clip(detail, self.width.saturating_sub(4)));
+        }
         println!();
         let action = if paused { "播放" } else { "暂停" };
         println!("  \x1b[7m 播放 \x1b[0m  \x1b[7m 暂停 \x1b[0m    Enter/P 播放    Space {}    ← / → 快退/快进    9 / 0 音量    Q 退出", action);
@@ -89,7 +92,7 @@ impl Tui {
         if y == 4 {
             return if paused { Control::Play } else { Control::Pause };
         }
-        if y == 11 {
+        if y == 12 {
             return if x < 14 { Control::Play } else { Control::Pause };
         }
         Control::None
