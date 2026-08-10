@@ -710,7 +710,7 @@ impl SynthPlayer {
     ) -> Result<(), String> {
         let path_c = CString::new(midi_path)
             .map_err(|_| "MIDI 路径包含非法字符".to_string())?;
-        let display_events = midi_display_events(midi_path);
+        let display = midi_display_events(midi_path);
 
         let player = unsafe { new_fluid_player(self.synth) };
         if player.is_null() {
@@ -862,7 +862,16 @@ impl SynthPlayer {
             if let Some(ui) = &mut tui {
                 let ct = unsafe { fluid_player_get_current_tick(player) }.max(0) as u64;
                 let tt = unsafe { fluid_player_get_total_ticks(player) }.max(1) as u64;
-                ui.draw(total_ms as u64 * ct / tt, total_ms as u64, self.volume(), paused, looping, &active_midi_notes_text(&display_events, ct));
+                let notes = active_midi_notes(&display.events, ct);
+                ui.draw(
+                    total_ms as u64 * ct / tt,
+                    total_ms as u64,
+                    self.volume(),
+                    paused,
+                    looping,
+                    &midi_tracks_text(&notes, display.main_track),
+                    &midi_spectrum(&notes),
+                );
             }
 
             if status == FLUID_PLAYER_DONE {
@@ -1066,7 +1075,8 @@ impl SynthPlayer {
             // 暂停时：等待恢复/退出
             if paused {
                 if let Some(ui) = &mut tui {
-                    ui.draw(playhead as u64, total_ms as u64, self.volume(), true, looping, &active_notes_text(events, playhead));
+                    let notes = active_score_notes(events, playhead);
+                    ui.draw(playhead as u64, total_ms as u64, self.volume(), true, looping, &score_tracks_text(&notes), &midi_spectrum(&notes));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
@@ -1081,7 +1091,8 @@ impl SynthPlayer {
                 prog.update(cur as u64, total_ms as u64);
             }
             if let Some(ui) = &mut tui {
-                ui.draw(cur as u64, total_ms as u64, self.volume(), paused, looping, &active_notes_text(events, cur));
+                let notes = active_score_notes(events, cur);
+                ui.draw(cur as u64, total_ms as u64, self.volume(), paused, looping, &score_tracks_text(&notes), &midi_spectrum(&notes));
             }
 
             // 播放结束判定
@@ -1151,7 +1162,7 @@ fn midi_note_name(key: u8) -> String {
     format!("{}{}", NAMES[(key % 12) as usize], key as i16 / 12 - 1)
 }
 
-fn active_notes_text(events: &[crate::parser::ScheduledNote], at_ms: i64) -> String {
+fn active_score_notes(events: &[crate::parser::ScheduledNote], at_ms: i64) -> BTreeMap<usize, BTreeSet<u8>> {
     let mut active: BTreeMap<u8, BTreeSet<u8>> = BTreeMap::new();
     for event in events.iter().take_while(|event| event.at_ms as i64 <= at_ms) {
         let notes = active.entry(event.channel).or_default();
@@ -1161,12 +1172,15 @@ fn active_notes_text(events: &[crate::parser::ScheduledNote], at_ms: i64) -> Str
             notes.remove(&event.key);
         }
     }
-    let tracks: Vec<String> = active
+    active.into_iter().map(|(channel, notes)| (channel as usize, notes)).collect()
+}
+
+fn score_tracks_text(active: &BTreeMap<usize, BTreeSet<u8>>) -> Vec<String> {
+    active
         .iter()
         .filter(|(_, notes)| !notes.is_empty())
         .map(|(channel, notes)| format!("轨道 {}: {}", channel + 1, notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" ")))
-        .collect();
-    if tracks.is_empty() { "音符: -".to_string() } else { format!("音符  {}", tracks.join(" | ")) }
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -1177,7 +1191,12 @@ struct MidiDisplayEvent {
     on: bool,
 }
 
-fn midi_display_events(path: &str) -> Vec<MidiDisplayEvent> {
+struct MidiDisplay {
+    events: Vec<MidiDisplayEvent>,
+    main_track: Option<usize>,
+}
+
+fn midi_display_events(path: &str) -> MidiDisplay {
     use std::io::Read;
 
     fn read_varlen(data: &[u8], pos: &mut usize, end: usize) -> Option<u64> {
@@ -1194,7 +1213,7 @@ fn midi_display_events(path: &str) -> Vec<MidiDisplayEvent> {
 
     let mut data = Vec::new();
     if std::fs::File::open(path).and_then(|mut file| file.read_to_end(&mut data)).is_err() || data.len() < 14 || &data[..4] != b"MThd" {
-        return Vec::new();
+        return MidiDisplay { events: Vec::new(), main_track: None };
     }
     let header_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let mut pos = 8usize.saturating_add(header_len);
@@ -1260,21 +1279,57 @@ fn midi_display_events(path: &str) -> Vec<MidiDisplayEvent> {
         pos = end;
         track += 1;
     }
-    result
+    let mut stats: BTreeMap<usize, (u32, u64, u32, BTreeSet<u8>)> = BTreeMap::new();
+    for event in &result {
+        let entry = stats.entry(event.track).or_default();
+        if event.on {
+            entry.0 += 1;
+            entry.1 += u64::from(event.key);
+            entry.3.insert(event.key);
+            entry.2 = entry.2.max(entry.3.len() as u32);
+        } else {
+            entry.3.remove(&event.key);
+        }
+    }
+    // 主旋律通常位于较高音区，且同一时间的音符更少；跳过仅元数据的轨道。
+    let main_track = stats.into_iter().filter(|(_, stat)| stat.0 >= 4).max_by(|(_, a), (_, b)| {
+        let score = |stat: &(u32, u64, u32, BTreeSet<u8>)| {
+            stat.1 as f64 / stat.0 as f64 + 24.0 / stat.2.max(1) as f64 + (stat.0.min(512) as f64).sqrt()
+        };
+        score(a).partial_cmp(&score(b)).unwrap_or(std::cmp::Ordering::Equal)
+    }).map(|(track, _)| track);
+    MidiDisplay { events: result, main_track }
 }
 
-fn active_midi_notes_text(events: &[MidiDisplayEvent], tick: u64) -> String {
+fn active_midi_notes(events: &[MidiDisplayEvent], tick: u64) -> BTreeMap<usize, BTreeSet<u8>> {
     let mut active: BTreeMap<usize, BTreeSet<u8>> = BTreeMap::new();
     for event in events.iter().take_while(|event| event.tick <= tick) {
         let notes = active.entry(event.track).or_default();
         if event.on { notes.insert(event.key); } else { notes.remove(&event.key); }
     }
-    let tracks: Vec<String> = active
+    active
+}
+
+fn midi_tracks_text(active: &BTreeMap<usize, BTreeSet<u8>>, main_track: Option<usize>) -> Vec<String> {
+    active
         .iter()
         .filter(|(_, notes)| !notes.is_empty())
-        .map(|(track, notes)| format!("轨道 {}: {}", track + 1, notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" ")))
-        .collect();
-    if tracks.is_empty() { "音符: -".to_string() } else { format!("音符  {}", tracks.join(" | ")) }
+        .map(|(track, notes)| {
+            let label = if Some(*track) == main_track { "主旋律" } else { "轨道" };
+            format!("{} {}: {}", label, track + 1, notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" "))
+        })
+        .collect()
+}
+
+fn midi_spectrum(active: &BTreeMap<usize, BTreeSet<u8>>) -> [u8; 16] {
+    let mut levels: [u8; 16] = [0; 16];
+    for key in active.values().flat_map(|notes| notes.iter()) {
+        let band = ((*key as usize).saturating_sub(21) * 16 / 88).min(15);
+        levels[band] = levels[band].saturating_add(3).min(7);
+        if band > 0 { levels[band - 1] = levels[band - 1].saturating_add(1).min(7); }
+        if band < 15 { levels[band + 1] = levels[band + 1].saturating_add(1).min(7); }
+    }
+    levels
 }
 
 impl Drop for SynthPlayer {

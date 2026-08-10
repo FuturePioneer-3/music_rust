@@ -29,6 +29,7 @@ pub struct Tui {
     mode: &'static str,
     width: usize,
     active: bool,
+    detail_lines: usize,
 }
 
 impl Tui {
@@ -42,15 +43,16 @@ impl Tui {
             mode,
             width: terminal_width(),
             active: true,
+            detail_lines: 0,
         };
         print!("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H");
         let _ = io::stdout().flush();
         let mut tui = tui;
-        tui.draw(0, 0, 80, false, false, "");
+        tui.draw(0, 0, 80, false, false, &[], &[0; 16]);
         Some(tui)
     }
 
-    pub fn draw(&mut self, elapsed_ms: u64, total_ms: u64, volume: u32, paused: bool, looping: bool, detail: &str) {
+    pub fn draw(&mut self, elapsed_ms: u64, total_ms: u64, volume: u32, paused: bool, looping: bool, details: &[String], spectrum: &[u8; 16]) {
         if !self.active {
             return;
         }
@@ -72,7 +74,13 @@ impl Tui {
         println!("  \x1b[2m{} / {}\x1b[0m", format_time(elapsed_ms), format_time(total_ms));
         println!();
         println!("  \x1b[33m音量\x1b[0m {:>3}% / 500%    \x1b[35m循环\x1b[0m {}", volume, loop_state);
-        if !detail.is_empty() {
+        println!("  \x1b[36m动态 EQ\x1b[0m  20Hz   50   100   200   400   800  1.6k  3.2k  6.4k  10k");
+        for row in (1..=7).rev() {
+            let bars: String = spectrum.iter().map(|level| if *level >= row { '█' } else { ' ' }).collect();
+            println!("           \x1b[36m{}\x1b[0m", bars);
+        }
+        self.detail_lines = details.len();
+        for detail in details {
             println!("  \x1b[2m{}\x1b[0m", clip(detail, self.width.saturating_sub(4)));
         }
         println!();
@@ -92,12 +100,13 @@ impl Tui {
         if y == 4 {
             return if paused { Control::Play } else { Control::Pause };
         }
-        if y == 12 {
+        if y == 19 + self.detail_lines as u16 {
             return if x < 14 { Control::Play } else { Control::Pause };
         }
         Control::None
     }
 }
+
 
 impl Drop for Tui {
     fn drop(&mut self) {

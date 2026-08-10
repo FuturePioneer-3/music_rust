@@ -44,6 +44,7 @@ fn main() {
         let link_name = if lib == "alsa" { "asound" } else { lib.trim_start_matches("lib") };
         println!("cargo:rustc-link-lib=dylib={}", link_name);
     }
+    println!("cargo:rustc-link-lib=dylib=m");
 
     let has_pkgconfig = Command::new("pkg-config")
         .args(["--exists", "fluidsynth"])
@@ -70,6 +71,5 @@ fn main() {
     } else {
         // 无 pkg-config 的发行版：直接链接
         println!("cargo:rustc-link-lib=dylib=fluidsynth");
-        println!("cargo:rustc-link-lib=dylib=m");
     }
 }
