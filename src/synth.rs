@@ -869,7 +869,7 @@ impl SynthPlayer {
                     self.volume(),
                     paused,
                     looping,
-                    &midi_tracks_text(&notes, display.main_track),
+                    &midi_tracks_text(&notes, &display.tracks, display.main_track),
                     &midi_spectrum(&notes),
                 );
             }
@@ -1193,6 +1193,7 @@ struct MidiDisplayEvent {
 
 struct MidiDisplay {
     events: Vec<MidiDisplayEvent>,
+    tracks: Vec<usize>,
     main_track: Option<usize>,
 }
 
@@ -1213,7 +1214,7 @@ fn midi_display_events(path: &str) -> MidiDisplay {
 
     let mut data = Vec::new();
     if std::fs::File::open(path).and_then(|mut file| file.read_to_end(&mut data)).is_err() || data.len() < 14 || &data[..4] != b"MThd" {
-        return MidiDisplay { events: Vec::new(), main_track: None };
+        return MidiDisplay { events: Vec::new(), tracks: Vec::new(), main_track: None };
     }
     let header_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let mut pos = 8usize.saturating_add(header_len);
@@ -1279,6 +1280,9 @@ fn midi_display_events(path: &str) -> MidiDisplay {
         pos = end;
         track += 1;
     }
+    // MIDI 文件按轨道存储事件；播放状态按时间查询前必须合并为 tick 顺序。
+    result.sort_by_key(|event| event.tick);
+
     let mut stats: BTreeMap<usize, (u32, u64, u32, BTreeSet<u8>)> = BTreeMap::new();
     for event in &result {
         let entry = stats.entry(event.track).or_default();
@@ -1292,13 +1296,14 @@ fn midi_display_events(path: &str) -> MidiDisplay {
         }
     }
     // 主旋律通常位于较高音区，且同一时间的音符更少；跳过仅元数据的轨道。
-    let main_track = stats.into_iter().filter(|(_, stat)| stat.0 >= 4).max_by(|(_, a), (_, b)| {
+    let main_track = stats.iter().filter(|(_, stat)| stat.0 >= 4).max_by(|(_, a), (_, b)| {
         let score = |stat: &(u32, u64, u32, BTreeSet<u8>)| {
             stat.1 as f64 / stat.0 as f64 + 24.0 / stat.2.max(1) as f64 + (stat.0.min(512) as f64).sqrt()
         };
         score(a).partial_cmp(&score(b)).unwrap_or(std::cmp::Ordering::Equal)
-    }).map(|(track, _)| track);
-    MidiDisplay { events: result, main_track }
+    }).map(|(track, _)| *track);
+    let tracks = stats.keys().copied().collect();
+    MidiDisplay { events: result, tracks, main_track }
 }
 
 fn active_midi_notes(events: &[MidiDisplayEvent], tick: u64) -> BTreeMap<usize, BTreeSet<u8>> {
@@ -1310,13 +1315,14 @@ fn active_midi_notes(events: &[MidiDisplayEvent], tick: u64) -> BTreeMap<usize, 
     active
 }
 
-fn midi_tracks_text(active: &BTreeMap<usize, BTreeSet<u8>>, main_track: Option<usize>) -> Vec<String> {
-    active
+fn midi_tracks_text(active: &BTreeMap<usize, BTreeSet<u8>>, tracks: &[usize], main_track: Option<usize>) -> Vec<String> {
+    tracks
         .iter()
-        .filter(|(_, notes)| !notes.is_empty())
-        .map(|(track, notes)| {
+        .enumerate()
+        .map(|(display_index, track)| {
             let label = if Some(*track) == main_track { "主旋律" } else { "轨道" };
-            format!("{} {}: {}", label, track + 1, notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" "))
+            let notes = active.get(track).map(|notes| notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "-".to_string());
+            format!("{} {}: {}", label, display_index + 1, notes)
         })
         .collect()
 }
@@ -1324,7 +1330,8 @@ fn midi_tracks_text(active: &BTreeMap<usize, BTreeSet<u8>>, main_track: Option<u
 fn midi_spectrum(active: &BTreeMap<usize, BTreeSet<u8>>) -> [u8; 16] {
     let mut levels: [u8; 16] = [0; 16];
     for key in active.values().flat_map(|notes| notes.iter()) {
-        let band = ((*key as usize).saturating_sub(21) * 16 / 88).min(15);
+        let frequency = 440.0_f32 * 2.0_f32.powf((*key as f32 - 69.0) / 12.0);
+        let band = ((frequency / 20.0).ln() / 500.0_f32.ln() * 15.0).round().clamp(0.0, 15.0) as usize;
         levels[band] = levels[band].saturating_add(3).min(7);
         if band > 0 { levels[band - 1] = levels[band - 1].saturating_add(1).min(7); }
         if band < 15 { levels[band + 1] = levels[band + 1].saturating_add(1).min(7); }

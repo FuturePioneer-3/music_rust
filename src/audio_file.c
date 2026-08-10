@@ -150,7 +150,8 @@ void music_audio_spectrum(music_audio *p, uint8_t levels[16]) {
     if (count > 1024) count = 1024;
     if (count < 32) { pthread_mutex_unlock(&p->lock); return; }
     for (int band = 0; band < 16; band++) {
-        float frequency = 40.0f * powf(2.0f, (float)band * 8.0f / 15.0f);
+        // 16 个对数中心频率严格覆盖 20Hz 到 10kHz。
+        float frequency = 20.0f * powf(500.0f, (float)band / 15.0f);
         float coeff = 2.0f * cosf(2.0f * 3.14159265f * frequency / p->sample_rate);
         float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f;
         for (int64_t i = 0; i < count; i++) {
@@ -160,7 +161,7 @@ void music_audio_spectrum(music_audio *p, uint8_t levels[16]) {
             q1 = q0;
         }
         float magnitude = sqrtf(q1 * q1 + q2 * q2 - coeff * q1 * q2) / count;
-        int level = (int)(log10f(1.0f + magnitude * 300.0f) * 5.0f);
+        int level = (int)(log10f(1.0f + magnitude * 550.0f) * 4.0f);
         levels[band] = (uint8_t)(level > 7 ? 7 : level);
     }
     pthread_mutex_unlock(&p->lock);
