@@ -17,7 +17,7 @@ extern "C" {
     fn music_audio_finished(player: *mut RawAudio) -> i32;
     fn music_audio_set_volume(player: *mut RawAudio, volume: f32);
     fn music_audio_volume(player: *mut RawAudio) -> f32;
-    fn music_audio_frequency_hz(player: *mut RawAudio) -> f32;
+    fn music_audio_spectrum(player: *mut RawAudio, levels: *mut u8);
     fn music_audio_close(player: *mut RawAudio);
 }
 
@@ -40,7 +40,11 @@ impl AudioFilePlayer {
     pub fn finished(&self) -> bool { unsafe { music_audio_finished(self.raw) != 0 } }
     pub fn set_volume_percent(&mut self, percent: u32) { unsafe { music_audio_set_volume(self.raw, percent.clamp(0, 500) as f32 / 100.0); } }
     pub fn volume_percent(&self) -> u32 { unsafe { (music_audio_volume(self.raw) * 100.0).round() as u32 } }
-    pub fn frequency_hz(&self) -> f32 { unsafe { music_audio_frequency_hz(self.raw) } }
+    pub fn spectrum(&self) -> [u8; 16] {
+        let mut levels = [0; 16];
+        unsafe { music_audio_spectrum(self.raw, levels.as_mut_ptr()); }
+        levels
+    }
 }
 
 impl Drop for AudioFilePlayer { fn drop(&mut self) { unsafe { music_audio_close(self.raw); } } }

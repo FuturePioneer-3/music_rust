@@ -340,7 +340,7 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
         let position = player.position_ms();
         let duration = player.duration_ms();
         if let Some(ui) = &mut tui {
-            ui.draw(position, duration, player.volume_percent(), paused, looping, &format!("动态频率  {:.0} Hz", player.frequency_hz()));
+            ui.draw(position, duration, player.volume_percent(), paused, looping, &["动态频率图（20 Hz - 10 kHz）".to_string()], &player.spectrum());
         }
         if player.finished() {
             if looping {

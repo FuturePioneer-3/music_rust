@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 struct music_audio {
     int16_t *pcm;
@@ -139,20 +140,29 @@ int64_t music_audio_duration_ms(music_audio *p) { return p ? p->frames * 1000 / 
 int music_audio_finished(music_audio *p) { if (!p) return 1; pthread_mutex_lock(&p->lock); int v = p->finished; pthread_mutex_unlock(&p->lock); return v; }
 void music_audio_set_volume(music_audio *p, float v) { if (!p) return; pthread_mutex_lock(&p->lock); p->volume = v < 0.0f ? 0.0f : (v > 5.0f ? 5.0f : v); pthread_mutex_unlock(&p->lock); }
 float music_audio_volume(music_audio *p) { if (!p) return 0.8f; pthread_mutex_lock(&p->lock); float v = p->volume; pthread_mutex_unlock(&p->lock); return v; }
-float music_audio_frequency_hz(music_audio *p) {
-    if (!p) return 0.0f;
+void music_audio_spectrum(music_audio *p, uint8_t levels[16]) {
+    if (!levels) return;
+    memset(levels, 0, 16);
+    if (!p) return;
     pthread_mutex_lock(&p->lock);
     int64_t start = p->cursor;
     int64_t count = p->frames - start;
-    if (count > 2048) count = 2048;
-    int crossings = 0;
-    int previous = 0;
-    for (int64_t i = 0; i < count; i++) {
-        int sample = p->pcm[(start + i) * p->channels];
-        if ((sample >= 0 && previous < 0) || (sample < 0 && previous >= 0)) crossings++;
-        previous = sample;
+    if (count > 1024) count = 1024;
+    if (count < 32) { pthread_mutex_unlock(&p->lock); return; }
+    for (int band = 0; band < 16; band++) {
+        float frequency = 40.0f * powf(2.0f, (float)band * 8.0f / 15.0f);
+        float coeff = 2.0f * cosf(2.0f * 3.14159265f * frequency / p->sample_rate);
+        float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f;
+        for (int64_t i = 0; i < count; i++) {
+            float sample = (float)p->pcm[(start + i) * p->channels] / 32768.0f;
+            q0 = coeff * q1 - q2 + sample;
+            q2 = q1;
+            q1 = q0;
+        }
+        float magnitude = sqrtf(q1 * q1 + q2 * q2 - coeff * q1 * q2) / count;
+        int level = (int)(log10f(1.0f + magnitude * 300.0f) * 5.0f);
+        levels[band] = (uint8_t)(level > 7 ? 7 : level);
     }
     pthread_mutex_unlock(&p->lock);
-    return count > 1 ? (float)crossings * p->sample_rate / ((float)count * 2.0f) : 0.0f;
 }
 void music_audio_close(music_audio *p) { if (!p) return; if (p->thread_started) { pthread_mutex_lock(&p->lock); p->stop = 1; p->playing = 1; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); pthread_join(p->thread, NULL); } free(p->pcm); pthread_cond_destroy(&p->wake); pthread_mutex_destroy(&p->lock); free(p); }
