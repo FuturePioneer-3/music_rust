@@ -42,6 +42,8 @@ use std::sync::{Arc, Mutex};
 pub enum Control {
     /// 暂停 / 继续
     Pause,
+    /// 开始 / 继续播放
+    Play,
     /// 快进 n 秒（n > 0）
     SeekForward(f64),
     /// 后退 n 秒（n > 0）
@@ -226,7 +228,8 @@ fn parse_key(pending: &[u8]) -> (Option<Control>, Vec<u8>) {
     if pending[0] != 0x1b {
         let c = pending[0];
         let ctrl = match c {
-            b' ' | b'p' | b'P' => Control::Pause,
+            b' ' | b'p' => Control::Pause,
+            b'P' | b'\r' | b'\n' => Control::Play,
             b'r' | b'R' => Control::Loop,
             b'q' | b'Q' => Control::Quit,
             b'[' => Control::SeekBackward(1.0),

@@ -1,6 +1,6 @@
 [package]
 name = "music_rust"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 description = "music_rust —— 跨平台(主要Linux) MIDI 简谱钢琴演奏器"
 license = "GPL-3.0-or-later"
@@ -17,6 +17,9 @@ path = "src/bin/selftest.rs"
 
 [dependencies]
 libc = "0.2"
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 lto = true

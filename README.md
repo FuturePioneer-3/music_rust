@@ -22,7 +22,9 @@
 
 </div>
 
-music_rust is a **piano player** that renders your custom jianpu (numbered musical notation) TXT files, and plays standard MIDI files directly, using the system **libfluidsynth** synthesizer with a piano timbre (GM Program 0).
+music_rust is a **music player**: numbered-notation TXT and MIDI use the system **libfluidsynth** piano synthesizer; WAV, MP3, FLAC, OGG, Opus, AAC, and M4A files use the C/FFmpeg decoder and ALSA output path.
+
+Audio files enter **Music File mode** and are distinct from **MIDI mode** and **Score mode** in the terminal title. Audio file mode defaults to **80%** volume and supports **80%-500%**; `Space` pauses/resumes, `Enter` or `P` plays, and arrow keys or the mouse progress bar seek.
 
 The original `music_release/` project was built on the Windows API (`winmm.lib`) and Windows-only. This project is fully rewritten in **pure Rust** and talks directly to the system `libfluidsynth` via FFI, supporting most Linux distributions.
 

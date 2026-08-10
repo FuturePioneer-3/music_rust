@@ -3,13 +3,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 pkgname=music_rust
-pkgver=2.1.0
+pkgver=2.2.0
 pkgrel=1
 pkgdesc='Cross-platform MIDI and numbered-notation piano player'
 arch=('x86_64')
 url='https://github.com/FuturePioneer-3/music_rust'
 license=('GPL-3.0-or-later')
-depends=('fluidsynth' 'soundfont-fluid')
+depends=('ffmpeg' 'alsa-lib' 'fluidsynth' 'soundfont-fluid')
 source=('music')
 sha256sums=('SKIP')
 
