@@ -58,7 +58,7 @@ chmod +x music_rust-x86_64.AppImage
 ### Arch Linux（pkg.tar.zst）
 
 ```bash
-sudo pacman -U music_rust-2.2.0-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-2.3.0-1-x86_64.pkg.tar.zst
 # 自动安装依赖 fluidsynth + soundfont-fluid
 music 乐曲.txt
 ```

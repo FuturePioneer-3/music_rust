@@ -59,7 +59,7 @@ The bundled SoundFont is loaded automatically. To use another font: `--soundfont
 ### Arch Linux (pkg.tar.zst)
 
 ```bash
-sudo pacman -U music_rust-2.2.0-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-2.3.0-1-x86_64.pkg.tar.zst
 # pulls in fluidsynth + soundfont-fluid automatically
 music 乐曲.txt
 ```
