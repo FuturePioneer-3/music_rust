@@ -21,4 +21,12 @@ float music_audio_volume(music_audio *player);
 void music_audio_spectrum(music_audio *player, uint8_t levels[16]);
 void music_audio_close(music_audio *player);
 
+// ---- 2.4.0：元数据与封面 ----
+// 返回内部缓冲区指针（调用方不得释放）；字段不存在返回 NULL。
+// key 取值：title / artist / album / composer / date / genre
+const char *music_audio_metadata(music_audio *player, const char *key);
+// 内嵌封面（MP3 APIC / FLAC PICTURE / M4A covr），已解码为 RGBA8 并缩放到 ≤96px。
+// 存在返回 1 并回填 data/width/height，否则返回 0。
+int music_audio_art(music_audio *player, const unsigned char **data, int *width, int *height);
+
 #endif

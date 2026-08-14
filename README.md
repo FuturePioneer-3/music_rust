@@ -24,7 +24,7 @@
 
 music_rust is a **music player**: numbered-notation TXT and MIDI use the system **libfluidsynth** piano synthesizer; WAV, MP3, FLAC, OGG, Opus, AAC, and M4A files use the C/FFmpeg decoder and ALSA output path.
 
-Audio files enter **Music File mode** and are distinct from **MIDI mode** and **Score mode** in the terminal title. Audio file mode defaults to **80%** volume and supports **80%-500%**; `Space` pauses/resumes, `Enter` or `P` plays, and arrow keys or the mouse progress bar seek.
+Audio files enter **Music File mode** and are distinct from **MIDI mode** and **Score mode** in the terminal title. Audio file mode defaults to **80%** volume and supports **80%-500%**; `Space` pauses/resumes, `Enter` or `P` plays, and arrow keys or the mouse progress bar seek. The TUI also renders any embedded **album cover** and **composer/artist/album metadata** below the playback area (2.4.0).
 
 The original `music_release/` project was built on the Windows API (`winmm.lib`) and Windows-only. This project is fully rewritten in **pure Rust** and talks directly to the system `libfluidsynth` via FFI, supporting most Linux distributions.
 
@@ -38,9 +38,12 @@ The original `music_release/` project was built on the Windows API (`winmm.lib`)
 6. ⏱️ `fluid_sequencer` millisecond-precise event scheduling.
 7. 📊 **Dynamic progress bar**: real-time percentage, elapsed/total time, remaining time.
 8. 🎮 **Interactive controls (mpv-like)**: arrow-key seek, space pause, R loop, Q quit — and **`9`/`0` volume adjustment**.
-9. 🔇 **Peak limiter (default -1dBFS)**: prevents clipping/buzz from overlapping notes.
-10. 🛠️ Debug mode: detailed parse log + every MIDI event.
-11. 🐍 Companion Python script: `MIDI → jianpu TXT` converter.
+9. 🖥️ **Redesigned terminal UI (2.4.0)**: rounded border + truecolor palette, smooth 1/8-block progress bar, gradient dynamic-EQ spectrum, colored volume bar and status indicators; click the progress bar to seek, click the status row to pause/resume.
+10. 🖼️ **Album art + composer parsing (2.4.0)**: embedded covers (ID3 APIC / FLAC PICTURE / M4A covr) are decoded via FFmpeg and rendered below the playback info with half-block characters (▀) in truecolor, alongside **composer**, artist, album and date/genre metadata when present. The artwork adapts to the terminal size (≤ 46 cols / 45 % height on large screens, ≥ 6 rows minimum on small ones, secondary panels auto-hidden on tiny terminals) and never overlaps the content above it.
+11. ⚡ **AT&T-syntax assembly acceleration (2.4.0, non-inline)**: the audio thread's saturated volume scaling (SSE2, 8 samples/iter + packssdw saturation), the 16-band Goertzel spectrum resonators (4 lanes in parallel per pass) and the peak-limiter hot loop (vector peak scan + minps/maxps hard clamp) are implemented as standalone routines in `music_asm.S`, using only the x86-64 baseline SSE2 instruction set.
+12. 🔇 **Peak limiter (default -1dBFS)**: prevents clipping/buzz from overlapping notes.
+13. 🛠️ Debug mode: detailed parse log + every MIDI event.
+14. 🐍 Companion Python script: `MIDI → jianpu TXT` converter.
 
 ## Quick Start
 
@@ -176,7 +179,7 @@ The synth output passes through a **real-time peak limiter** (default `-1dBFS`),
 - distortion/buzz when volume is raised
 - distortion above full-scale (0dBFS)
 
-Limiter features:
+Limiter features (hot loops rewritten in assembly since 2.4.0):
 - **compress-only, never boosts**: normal segments keep original dynamics, only peaks above the target are pulled down
 - **smooth gain envelope** (fast attack / slow release): no pop on compression, no pumping on recovery
 - **hard-clamp fallback**: samples never exceed the target level

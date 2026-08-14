@@ -21,8 +21,14 @@
 //! 跨平台(主要 Linux) MIDI 简谱播放器。
 //! 读取自定义简谱 TXT（支持多音轨），通过系统 libfluidsynth + SoundFont 演奏钢琴音色。
 //!
+//! 2.4.0：
+//!   - TUI 全面重绘（圆角边框/真彩色/平滑进度条/渐变 EQ）
+//!   - 音频文件模式解析内嵌专辑封面与作曲家等元数据，渲染在播放区下方
+//!   - 音量缩放、频谱 Goertzel 谐振器、峰值限制器热循环改为独立
+//!     AT&T 语法汇编（src/music_asm.S，非内联，SSE2）
+//!
 //! 用法:
-//!   music <乐曲.txt> [选项]
+//!   music <乐曲.txt|音频文件> [选项]
 //!
 //! 选项:
 //!   -d, --debug          详细调试输出
@@ -72,6 +78,8 @@ fn print_usage() {
     println!("说明:");
     println!("  默认模式：播放简谱 TXT（自动识别新版多轨/旧版左右手格式）");
     println!("  使用 -m 或传入 .mid 文件：直接播放 MIDI（多轨与变速完全准确）");
+    println!("  传入音频文件（wav/mp3/flac/ogg/opus/aac/m4a/wma）：直接播放，");
+    println!("  TUI 解析并显示内嵌专辑封面与作曲家等元数据（若有）");
     println!();
     println!("播放控制 (类似 mpv):");
     println!("  ← / →         后退/快进 5 秒");
@@ -309,7 +317,23 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
     player.set_volume_percent(volume);
     player.play();
     let mut input = input::InputListener::start();
-    let mut tui = tui::Tui::start(path, "音乐文件", show_tui);
+
+    // 2.4.0：提取元数据（标题/作曲家等）与内嵌封面（MP3 APIC / FLAC PICTURE / M4A covr）
+    let art = player.art();
+    let mut meta = tui::MetaInfo::default();
+    for (key, slot) in [
+        ("title", &mut meta.title),
+        ("artist", &mut meta.artist),
+        ("album", &mut meta.album),
+        ("composer", &mut meta.composer),
+        ("date", &mut meta.date),
+        ("genre", &mut meta.genre),
+    ] {
+        *slot = player.metadata(key);
+    }
+    let display_title = meta.title.clone().unwrap_or_else(|| path.to_string());
+    let mut tui = tui::Tui::start_full(&display_title, "音乐文件", show_tui, art, meta);
+
     let mut paused = false;
     let mut looping = false;
     loop {
@@ -340,7 +364,7 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
         let position = player.position_ms();
         let duration = player.duration_ms();
         if let Some(ui) = &mut tui {
-            ui.draw(position, duration, player.volume_percent(), paused, looping, &["动态频率图（20 Hz - 10 kHz）".to_string()], &player.spectrum());
+            ui.draw(position, duration, player.volume_percent(), paused, looping, &[], &player.spectrum());
         }
         if player.finished() {
             if looping {
