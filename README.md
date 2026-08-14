@@ -30,6 +30,8 @@ The original `music_release/` project was built on the Windows API (`winmm.lib`)
 
 ## Key Features
 
+> **v2.4.1**: native **real-tty support** — detects pty vs real Linux console/serial and, on a real tty, initializes a basic CJK environment (`ESC % G` UTF-8 mode + best-effort `setfont` with a CJK font), probes the console font via kernel ioctls (KDFONTOP/GIO_UNIMAP) and degrades gracefully: 16-color SGR (no truecolor), ASCII borders/progress/arrows, English labels, luminance-char artwork; plus **incremental redraws** (only changed lines) to eliminate garbling and flicker on slow consoles.
+
 1. 💯 **Pure Rust**, no Windows dependencies.
 2. 🎹 Plays custom jianpu TXT files with a piano timbre via the system SoundFont.
 3. 🎼 **Direct MIDI playback** (`-m` or `.mid` extension): fluidsynth-native multitrack sync + tempo changes, most accurate.

@@ -16,7 +16,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! 播放时使用的轻量终端界面（2.4.0 全面重绘）。
+//! 播放时使用的轻量终端界面（2.4.0 全面重绘；2.4.1 支持真实 tty 降级）。
 //!
 //! 不依赖第三方终端库，避免增加运行时依赖；仅在 stdout 为终端时启用。
 //!
@@ -24,11 +24,21 @@
 //!   顶框 → 标题 → 状态行 → 进度条 → 时间 → 音量 → 动态 EQ（可选）
 //!   → 音符详情（可选）→ 专辑封面 + 作曲家等元数据（可选）→ 按键提示 → 底框
 //!
-//! 封面图使用半块字符（▀）＋真彩色渲染，宽高按终端尺寸自适应：
-//! 大屏不超过 45% 高度 / 46 列，小屏最小保底 6 行，绝不与上方内容重叠。
+//! ## pty vs 真实 tty（2.4.1）
+//! pty（终端模拟器）：真彩色 + 半块封面 + 每帧整屏重绘（与 2.4.0 完全一致）。
+//! 真实 tty（Linux 控制台/串口）：
+//!   - 初始化基础中文环境：`ESC % G` 切 UTF-8，尽力 setfont 加载 CJK 字体
+//!   - 用 KDFONTOP/GIO_UNIMAP 探测字体字形（CJK/圆角框/方块/箭头…），
+//!     按能力降级：16 色 SGR、ASCII 边框与字符、英文标签、亮度字符封面
+//!   - 增量重绘（仅刷新变化的行 + 光标定位），避免整屏清屏闪烁
+//!
+//! 测试钩子（内部）：MUSIC_FORCE_TTY=1 强制走 tty 路径；
+//! MUSIC_FORCE_TTY_CJK=1 在强制 tty 下模拟 CJK 字体齐全的控制台。
 
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
+use crate::console::{self, Caps, OutputKind};
 use crate::input::Control;
 
 /// 内嵌封面：RGBA8 像素（宽 × 高），由 C 侧解码并缩放到 ≤96px。
@@ -42,32 +52,46 @@ pub struct ArtImage {
 }
 
 // ---------------------------------------------------------------------------
-// 调色板（真彩色；支持鼠标的现代终端均支持）
+// 调色板：pty 用真彩色，真实 tty 用 16 色（内核控制台不支持 38;2）
 // ---------------------------------------------------------------------------
-const CYAN: (u8, u8, u8) = (0, 215, 255);
-const CYAN_DEEP: (u8, u8, u8) = (0, 170, 230);
-const MAGENTA: (u8, u8, u8) = (255, 95, 215);
-const GREEN: (u8, u8, u8) = (110, 255, 170);
-const GREEN_DIM: (u8, u8, u8) = (80, 200, 120);
-const YELLOW: (u8, u8, u8) = (255, 215, 0);
-const RED: (u8, u8, u8) = (255, 95, 95);
-const GRAY: (u8, u8, u8) = (140, 140, 150);
-const GRAY_DIM: (u8, u8, u8) = (90, 90, 100);
-const ART_BG: (u8, u8, u8) = (14, 14, 22); // 封面透明像素的衬底
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NamedColor {
+    Cyan, CyanDeep, Magenta, Green, GreenDim, Yellow, Red, Gray, GrayDim,
+}
 
-/// EQ 柱状图颜色（自下而上 level 1..7）
-const EQ_COLORS: [(u8, u8, u8); 7] = [
-    (70, 100, 160),   // 1  深蓝
-    (90, 130, 200),   // 2
-    (0, 170, 230),    // 3  青
-    (0, 215, 255),    // 4  亮青
-    (110, 255, 170),  // 5  绿
-    (255, 215, 0),    // 6  黄
-    (255, 95, 95),    // 7  红
+const T_CYAN: &str = "\x1b[38;2;0;215;255m";
+const T_CYAN_DEEP: &str = "\x1b[38;2;0;170;230m";
+const T_MAGENTA: &str = "\x1b[38;2;255;95;215m";
+const T_GREEN: &str = "\x1b[38;2;110;255;170m";
+const T_GREEN_DIM: &str = "\x1b[38;2;80;200;120m";
+const T_YELLOW: &str = "\x1b[38;2;255;215;0m";
+const T_RED: &str = "\x1b[38;2;255;95;95m";
+const T_GRAY: &str = "\x1b[38;2;140;140;150m";
+const T_GRAY_DIM: &str = "\x1b[38;2;90;90;100m";
+
+const C_CYAN: &str = "\x1b[96m";
+const C_CYAN_DEEP: &str = "\x1b[36m";
+const C_MAGENTA: &str = "\x1b[95m";
+const C_GREEN: &str = "\x1b[92m";
+const C_GREEN_DIM: &str = "\x1b[32m";
+const C_YELLOW: &str = "\x1b[93m";
+const C_RED: &str = "\x1b[91m";
+const C_GRAY: &str = "\x1b[37m";
+const C_GRAY_DIM: &str = "\x1b[90m";
+
+/// EQ 柱颜色（自下而上 level 1..7）
+const T_EQ: [&str; 7] = [
+    "\x1b[38;2;70;100;160m",  // 1 深蓝
+    "\x1b[38;2;90;130;200m",  // 2
+    "\x1b[38;2;0;170;230m",   // 3 青
+    "\x1b[38;2;0;215;255m",   // 4 亮青
+    "\x1b[38;2;110;255;170m", // 5 绿
+    "\x1b[38;2;255;215;0m",   // 6 黄
+    "\x1b[38;2;255;95;95m",   // 7 红
 ];
-
-/// 进度条 1/8 精度分块字符
-const PARTIAL_BLOCKS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+const C_EQ: [&str; 7] = [
+    "\x1b[94m", "\x1b[36m", "\x1b[96m", "\x1b[96m", "\x1b[92m", "\x1b[93m", "\x1b[91m",
+];
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -102,6 +126,154 @@ fn freq_bar_cols() -> [usize; 16] {
         c += l.len() + usize::from(i < 15);
     }
     cols
+}
+
+/// 进度条 1/8 精度分块字符（仅 pty 或字形齐全的控制台）
+const PARTIAL_BLOCKS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+
+// ---------------------------------------------------------------------------
+// 渲染风格：字形 + 调色板 + 语言
+// ---------------------------------------------------------------------------
+
+struct BoxChars {
+    tl: &'static str,
+    tr: &'static str,
+    bl: &'static str,
+    br: &'static str,
+    h: &'static str,
+    v: &'static str,
+}
+
+impl BoxChars {
+    const ROUNDED: BoxChars = BoxChars { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│" };
+    const ASCII: BoxChars = BoxChars { tl: "+", tr: "+", bl: "+", br: "+", h: "-", v: "|" };
+}
+
+struct Palette {
+    sgr: [&'static str; 9],
+    eq: [&'static str; 7],
+}
+
+impl Palette {
+    fn full() -> Palette {
+        Palette {
+            sgr: [T_CYAN, T_CYAN_DEEP, T_MAGENTA, T_GREEN, T_GREEN_DIM, T_YELLOW, T_RED, T_GRAY, T_GRAY_DIM],
+            eq: T_EQ,
+        }
+    }
+    fn basic() -> Palette {
+        Palette {
+            sgr: [C_CYAN, C_CYAN_DEEP, C_MAGENTA, C_GREEN, C_GREEN_DIM, C_YELLOW, C_RED, C_GRAY, C_GRAY_DIM],
+            eq: C_EQ,
+        }
+    }
+    fn col(&self, c: NamedColor) -> &'static str {
+        self.sgr[c as usize]
+    }
+}
+
+/// 一套完整的界面风格（字形/颜色/语言/渲染方式）
+struct Style {
+    p: Palette,
+    box_: BoxChars,
+    /// 是否使用中文界面（真实 tty 字体无 CJK 字形时降级英文）
+    cjk: bool,
+    /// pty 真彩色半块封面 vs tty 亮度字符封面
+    truecolor: bool,
+    /// 是否可用方块/块元素字形（█░▀▏…）
+    block: bool,
+    prog_full: char,
+    prog_empty: char,
+    marker: char,
+    dot: char,
+    music: char,
+    middot: char,
+    ellipsis: &'static str,
+    arrow_l: &'static str,
+    arrow_r: &'static str,
+    bar_fill: char,
+    bar_empty: char,
+    /// 数值区间分隔符（如 20Hz–10kHz）：pty 用 en-dash，tty 用 ASCII '-'
+    range: &'static str,
+}
+
+impl Style {
+    /// pty：完整特性（与 2.4.0 渲染完全一致）
+    fn full() -> Style {
+        Style {
+            p: Palette::full(),
+            box_: BoxChars::ROUNDED,
+            cjk: true,
+            truecolor: true,
+            block: true,
+            prog_full: '█',
+            prog_empty: '░',
+            marker: '▸',
+            dot: '●',
+            music: '♪',
+            middot: '·',
+            ellipsis: "…",
+            arrow_l: "←",
+            arrow_r: "→",
+            bar_fill: '▓',
+            bar_empty: '░',
+            range: "–",
+        }
+    }
+
+    /// 真实 tty：按字体能力降级
+    fn console(caps: Caps) -> Style {
+        let block = caps.has_block;
+        Style {
+            p: Palette::basic(),
+            box_: if caps.has_box { BoxChars::ROUNDED } else { BoxChars::ASCII },
+            cjk: caps.has_cjk,
+            truecolor: false,
+            block,
+            prog_full: if block { '█' } else { '#' },
+            prog_empty: if block { '░' } else { '.' },
+            marker: '>',
+            dot: if caps.has_dot { '●' } else { '*' },
+            music: if caps.has_music { '♪' } else { '>' },
+            middot: if caps.has_middot { '·' } else { '|' },
+            ellipsis: if caps.has_ellipsis { "…" } else { "..." },
+            arrow_l: if caps.has_arrow_l { "←" } else { "<-" },
+            arrow_r: if caps.has_arrow_r { "→" } else { "->" },
+            bar_fill: if block { '█' } else { '#' },
+            bar_empty: if block { '░' } else { '.' },
+            range: "-",
+        }
+    }
+
+    /// 中英标签：tty 无 CJK 字形时用英文，避免乱码
+    fn tr<'a>(&self, zh: &'a str, en: &'static str) -> &'a str {
+        if self.cjk { zh } else { en }
+    }
+
+    /// 模式名翻译（来自 main/synth 的固定字符串）
+    fn tr_mode(&self, mode: &'static str) -> &'static str {
+        if self.cjk {
+            mode
+        } else {
+            match mode {
+                "音乐文件" => "Music File",
+                "MIDI 音乐" => "MIDI Music",
+                "简谱" => "Score",
+                _ => mode,
+            }
+        }
+    }
+
+    /// 不可变文本净化：无 CJK 字形时把非 ASCII 字符替换为 '?'，防止乱码
+    fn safe(&self, s: &str) -> String {
+        if self.cjk {
+            s.to_string()
+        } else {
+            s.chars()
+                .map(|c| if c.is_ascii() { c } else { '?' })
+                .collect()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,10 +320,17 @@ pub struct Tui {
     active: bool,
     art: Option<ArtImage>,
     meta: MetaInfo,
+    kind: OutputKind,
+    style: Style,
     /// 1-based 行号（鼠标 SGR 坐标）：点击状态行切换播放/暂停
     status_row: u16,
     /// 1-based 行号：点击进度条跳转
     bar_row: u16,
+    /// 增量重绘：上一帧各行（仅 tty 使用）
+    prev_lines: Vec<String>,
+    /// 渲染节流（tty 100ms 一帧，慢速控制台防闪烁；pty 不限）
+    throttle: Duration,
+    last_emit: Instant,
 }
 
 impl Tui {
@@ -170,6 +349,38 @@ impl Tui {
         if !enabled || !stdout_is_terminal() {
             return None;
         }
+        // 2.4.1：区分 pty 与真实 tty；tty 初始化中文环境并按字体能力降级
+        let mut kind = console::output_kind();
+        let mut caps = Caps::default();
+        let forced = std::env::var("MUSIC_FORCE_TTY").is_ok();
+        if forced {
+            kind = OutputKind::Tty;
+            if std::env::var("MUSIC_FORCE_TTY_CJK").is_ok() {
+                caps = Caps {
+                    charcount: 1024,
+                    has_cjk: true,
+                    has_box: true,
+                    has_block: true,
+                    has_upper_half: true,
+                    has_dot: true,
+                    has_music: true,
+                    has_arrow_l: true,
+                    has_arrow_r: true,
+                    has_middot: true,
+                    has_ellipsis: true,
+                };
+            }
+        }
+        let (style, throttle) = match kind {
+            OutputKind::Pty => (Style::full(), Duration::ZERO),
+            OutputKind::Tty => {
+                if !forced {
+                    console::init_tty_environment();
+                    caps = console::probe_caps();
+                }
+                (Style::console(caps), Duration::from_millis(100))
+            }
+        };
         let mut tui = Self {
             title: title.to_string(),
             mode,
@@ -178,10 +389,24 @@ impl Tui {
             active: true,
             art,
             meta,
+            kind,
+            style,
             status_row: 3, // 状态行 = 0-based 第 2 行
             bar_row: 4,    // 进度条 = 0-based 第 3 行
+            prev_lines: Vec::new(),
+            throttle,
+            // 初始化为过去的时间点，保证第一帧不被节流跳过
+            last_emit: Instant::now() - throttle - Duration::from_millis(1),
         };
-        print!("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H");
+        // 屏幕初始化：pty 用备用屏 + 鼠标；tty 不支持，仅清屏 + 隐藏光标
+        match kind {
+            OutputKind::Pty => {
+                print!("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H");
+            }
+            OutputKind::Tty => {
+                print!("\x1b[2J\x1b[H\x1b[?25l");
+            }
+        }
         let _ = io::stdout().flush();
         tui.draw(0, 0, 80, false, false, &[], &[0; 16]);
         Some(tui)
@@ -197,6 +422,7 @@ impl Tui {
         let h = self.height;
         let inner = w.saturating_sub(4); // "│ " 与 " │" 之间的内容宽度
         let pct = if total_ms == 0 { 0.0 } else { (elapsed_ms as f64 / total_ms as f64).clamp(0.0, 1.0) };
+        let st = &self.style;
 
         // ---- 自适应布局 ----
         let need_details = details.len().min(4);
@@ -241,83 +467,98 @@ impl Tui {
         let det_rows = if left.saturating_sub(eq_rows) >= need_details { need_details } else { 0 };
 
         // ---- 渲染 ----
-        let mut out = String::with_capacity((w + 8) * h * 2 + 8192);
+        let mut frame: Vec<String> = Vec::with_capacity(h);
 
         // 顶框
-        let head = "╭─ ♪ MUSIC RUST · 音乐播放器 ";
-        let fill = w.saturating_sub(disp_width(head) + 1);
-        out.push_str(&format!("{}╭─ ♪ MUSIC RUST · 音乐播放器 {}{}╮\n",
-            fg(CYAN), "─".repeat(fill), RESET));
+        let header = format!(
+            "{} {} {} {}",
+            st.music, "MUSIC RUST", st.middot, st.tr("音乐播放器", "Music Player"));
+        let head_prefix = format!("{}{} {} ", st.box_.tl, st.box_.h, header);
+        let fill = w.saturating_sub(disp_width(&head_prefix) + 1);
+        frame.push(format!(
+            "{}{}{}{}{}",
+            st.p.col(NamedColor::Cyan), head_prefix, st.box_.h.repeat(fill), st.box_.tr, RESET));
 
         // 标题行
-        let title_disp = clip_w(&self.title, inner - 2);
-        line(&mut out, inner, &format!(
-            "{}♪{} {}《{}》{}", fg(MAGENTA), RESET, BOLD, title_disp, RESET));
+        let title_disp = clip_w(&st.safe(&self.title), inner - 2, st.ellipsis);
+        let (b_l, b_r) = if st.cjk { ("《", "》") } else { ("", "") };
+        frame.push(line(inner, st, &format!(
+            "{}{}{} {}{}{}{}{}",
+            st.p.col(NamedColor::Magenta), st.music, RESET, BOLD, b_l, title_disp, b_r, RESET)));
 
         // 状态行（鼠标点击切换播放/暂停）
         let (dot_color, dot, state_color, state_text) = if paused {
-            (RED, "●", YELLOW, "已暂停")
+            (NamedColor::Red, st.dot, NamedColor::Yellow, st.tr("已暂停", "Paused"))
         } else {
-            (GREEN, "●", GREEN, "正在播放")
+            (NamedColor::Green, st.dot, NamedColor::Green, st.tr("正在播放", "Playing"))
         };
-        let loop_text = if looping { "开" } else { "关" };
-        let loop_color = if looping { GREEN } else { GRAY_DIM };
-        let mode_part = format!("{}{}{}", fg(CYAN_DEEP), self.mode, RESET);
-        let dot_part = format!("{}{}{}", fg(dot_color), dot, RESET);
-        let state_part = format!("{}{}{}", fg(state_color), state_text, RESET);
-        let loop_part = format!("{}{}循环 {}{}{}", fg(GRAY_DIM), RESET, fg(loop_color), loop_text, RESET);
-        line(&mut out, inner, &format!("{}  {}   {}{}", mode_part, dot_part, state_part, loop_part));
+        let loop_text = if looping { st.tr("开", "ON") } else { st.tr("关", "OFF") };
+        let loop_color = if looping { NamedColor::Green } else { NamedColor::GrayDim };
+        let mode_part = format!("{}{}{}", st.p.col(NamedColor::CyanDeep), st.tr_mode(self.mode), RESET);
+        let dot_part = format!("{}{}{}", st.p.col(dot_color), dot, RESET);
+        let state_part = format!("{}{}{}", st.p.col(state_color), state_text, RESET);
+        let loop_part = format!(
+            "{}{}{} {}{}{}",
+            st.p.col(NamedColor::GrayDim), RESET, st.tr("循环", "Loop"),
+            st.p.col(loop_color), loop_text, RESET);
+        frame.push(line(inner, st, &format!("{}  {}   {}{}", mode_part, dot_part, state_part, loop_part)));
 
         // 进度条（鼠标点击跳转）
         let bar_w = (inner.saturating_sub(12)).clamp(8, 72);
         let filled = pct * bar_w as f64;
         let whole = filled.floor() as usize;
         let frac = filled - whole as f64;
-        let partial = if frac > 0.0 {
+        let partial = if frac > 0.0 && st.block {
             PARTIAL_BLOCKS[((frac * 8.0).round() as usize).min(7)].to_string()
-        } else { String::new() };
-        let filled_part = format!("{}{}", "█".repeat(whole), partial);
-        let empty_part = "░".repeat(bar_w.saturating_sub(whole + partial.chars().count()));
-        let bar = format!("{}{}{}{}{}", fg(CYAN), filled_part, RESET, fg(GRAY_DIM), empty_part);
-        line(&mut out, inner, &format!(
-            "{} ▸ {} {}{:>5.1}%{}", fg(GRAY), RESET, bar, pct * 100.0, RESET));
+        } else if frac > 0.0 {
+            st.prog_full.to_string()
+        } else {
+            String::new()
+        };
+        let filled_part = format!("{}{}", st.prog_full.to_string().repeat(whole), partial);
+        let empty_part = st.prog_empty.to_string().repeat(bar_w.saturating_sub(whole + partial.chars().count()));
+        let bar = format!(
+            "{}{}{}{}{}",
+            st.p.col(NamedColor::Cyan), filled_part, RESET,
+            st.p.col(NamedColor::GrayDim), empty_part);
+        frame.push(line(inner, st, &format!(
+            "{} {} {}{}{:>5.1}%{}",
+            st.p.col(NamedColor::Gray), st.marker, RESET, bar, pct * 100.0, RESET)));
 
         // 时间行
         let remaining = total_ms.saturating_sub(elapsed_ms);
-        line(&mut out, inner, &format!(
-            "{}{}{} / {}{}{}    {}剩余 {}{}",
+        frame.push(line(inner, st, &format!(
+            "{}{}{} / {}{}{}    {}{} {}{}",
             BOLD, format_time(elapsed_ms), RESET,
             DIM, format_time(total_ms), RESET,
-            DIM, format_time(remaining), RESET));
+            DIM, st.tr("剩余", "left"), format_time(remaining), RESET)));
 
         // 音量行
         let vol_filled = ((volume as f64 / 500.0) * 10.0).round() as usize;
         let vol_bar = format!(
             "{}{}{}{}",
-            fg(YELLOW), "▓".repeat(vol_filled),
-            fg(GRAY_DIM), "░".repeat(10 - vol_filled));
-        line(&mut out, inner, &format!(
-            "{}音量{} {} {}{:>3}%{}",
-            fg(YELLOW), RESET, vol_bar, BOLD, volume, RESET));
+            st.p.col(NamedColor::Yellow), st.bar_fill.to_string().repeat(vol_filled),
+            st.p.col(NamedColor::GrayDim), st.bar_empty.to_string().repeat(10 - vol_filled));
+        frame.push(line(inner, st, &format!(
+            "{}{}{} {} {}{:>3}%{}",
+            st.p.col(NamedColor::Yellow), st.tr("音量", "Volume"), RESET, vol_bar, BOLD, volume, RESET)));
 
         // 动态 EQ
         if eq_rows > 0 {
-            // 标签行与柱状行严格对齐：柱状行从内容第 EQ_LABEL_PAD 列起，
-            // 柱状行与标签行精确对齐：每根柱直接放在对应标签的起始列。
-            // 标签为 ASCII 且自然单空格分隔，按实际宽度逐项累计（"1.2k" 等
-            // 4 字符标签占 5 列），不能假设均匀槽位——否则越靠右偏差越大
-            // （"1.2k" 之后每根偏 1 列，"10k" 累计偏 5 列）。
             let bar_cols = freq_bar_cols();
             if inner >= 74 {
                 let label_line = FREQ_LABELS.join(" ");
-                line(&mut out, inner, &format!(
-                    "{}动态 EQ{}  {}", fg(CYAN), RESET, label_line));
+                frame.push(line(inner, st, &format!(
+                    "{}{}{}  {}",
+                    st.p.col(NamedColor::Cyan), st.tr("动态 EQ", "Dynamic EQ"), RESET, label_line)));
             } else {
-                line(&mut out, inner, &format!(
-                    "{}动态 EQ{}  ·  20Hz – 10kHz", fg(CYAN), RESET));
+                frame.push(line(inner, st, &format!(
+                    "{}{}{}  {}  {}Hz {} {}kHz",
+                    st.p.col(NamedColor::Cyan), st.tr("动态 EQ", "Dynamic EQ"), RESET,
+                    st.middot, "20", st.range, "10")));
             }
             for row in (1..=7).rev() {
-                let color = EQ_COLORS[row - 1];
+                let color = st.p.eq[row - 1];
                 let mut s = String::with_capacity(inner);
                 s.push_str(&" ".repeat(EQ_LABEL_PAD));
                 if inner >= 74 {
@@ -327,9 +568,9 @@ impl Tui {
                         s.push_str(&" ".repeat(bar_cols[band].saturating_sub(cur)));
                         cur = bar_cols[band] + 1;
                         if spectrum[band] >= row as u8 {
-                            s.push_str(&format!("{}█{}", fg(color), RESET));
+                            s.push_str(&format!("{}{}{}", color, st.prog_full, RESET));
                         } else {
-                            s.push_str(&format!("{}░{}", fg(GRAY_DIM), RESET));
+                            s.push_str(&format!("{}{}{}", st.p.col(NamedColor::GrayDim), st.prog_empty, RESET));
                         }
                     }
                 } else {
@@ -337,61 +578,111 @@ impl Tui {
                     let spacing = ((inner.saturating_sub(EQ_LABEL_PAD + 16)) / 15).clamp(0, 3);
                     for band in 0..16 {
                         if spectrum[band] >= row as u8 {
-                            s.push_str(&format!("{}█{}", fg(color), RESET));
+                            s.push_str(&format!("{}{}{}", color, st.prog_full, RESET));
                         } else {
-                            s.push_str(&format!("{}░{}", fg(GRAY_DIM), RESET));
+                            s.push_str(&format!("{}{}{}", st.p.col(NamedColor::GrayDim), st.prog_empty, RESET));
                         }
                         if band < 15 {
                             s.push_str(&" ".repeat(spacing));
                         }
                     }
                 }
-                line(&mut out, inner, &s);
+                frame.push(line(inner, st, &s));
             }
         }
 
         // 音符详情
         for d in details.iter().take(det_rows) {
-            line(&mut out, inner, &format!("{}{}{}", DIM, clip_w(d, inner - 2), RESET));
+            frame.push(line(inner, st, &format!("{}{}{}", DIM, clip_w(&st.safe(d), inner - 2, st.ellipsis), RESET)));
         }
 
         // 封面 + 元数据区
         if let Some((aw, ah)) = art_disp {
-            self.render_art_section(&mut out, inner, aw, ah, art_side, &meta);
+            self.render_art_section(&mut frame, inner, aw, ah, art_side, &meta);
         } else if !meta.is_empty() {
             for (label, value) in meta.iter().take(4) {
-                line(&mut out, inner, &format!("{}", meta_text(label, value, inner - 2)));
+                frame.push(line(inner, st, &format!("{}", meta_text(label, value, inner - 2, st))));
             }
         }
+
         // 按键提示
-        line(&mut out, inner, &format!(
-            "{}空格 暂停 · ←/→ 快退/快进 · ↑/↓ 10s · R 循环 · 9/0 音量 · Q 退出{}",
-            DIM, RESET));
+        let hints = if st.cjk {
+            format!(
+                "{} {} {} {} {} {} {} {} {} {} {} {} {}",
+                DIM, "空格 暂停", st.middot, "←/→ 快退/快进", st.middot,
+                "↑/↓ 10s", st.middot, "R 循环", st.middot,
+                "9/0 音量", st.middot, "Q 退出", RESET)
+        } else {
+            format!(
+                "{} {} {} {}/{} {} {} {} {} {} {} {} {}",
+                DIM, "Space Pause", st.middot, st.arrow_l, st.arrow_r, "seek", st.middot,
+                "Up/Down 10s", st.middot, "R Loop", st.middot, "9/0 Vol", RESET)
+        };
+        frame.push(line(inner, st, &hints));
         if footer_rows == 2 {
-            line(&mut out, inner, &format!(
-                "{}鼠标：点击进度条跳转 · 点击状态行播放/暂停{}", DIM, RESET));
+            let mouse_hint = if st.cjk {
+                "鼠标：点击进度条跳转 · 点击状态行播放/暂停"
+            } else {
+                "Mouse: click bar to seek, click status row to play/pause"
+            };
+            frame.push(line(inner, st, &format!("{}{}{}", DIM, mouse_hint, RESET)));
         }
 
         // 底框
-        out.push_str(&format!("{}{}{}{}\n", fg(CYAN), "╰", "─".repeat(w.saturating_sub(2)), "╯"));
-        if w > 0 {
-            out.push_str(RESET);
-        }
+        frame.push(format!(
+            "{}{}{}{}",
+            st.p.col(NamedColor::Cyan), st.box_.bl, st.box_.h.repeat(w.saturating_sub(2)), st.box_.br));
 
-        print!("\x1b[H\x1b[2J{}", out);
+        self.emit(&frame);
+    }
+
+    /// 输出一帧：pty 整屏重绘（与 2.4.0 一致）；tty 仅刷新变化的行，防闪烁。
+    fn emit(&mut self, frame: &[String]) {
+        let now = Instant::now();
+        if !self.throttle.is_zero() && now.duration_since(self.last_emit) < self.throttle {
+            return;
+        }
+        let mut out = String::with_capacity((self.width + 8) * frame.len() + 4096);
+        match self.kind {
+            OutputKind::Pty => {
+                out.push_str("\x1b[H\x1b[2J");
+                for l in frame {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+            }
+            OutputKind::Tty => {
+                if self.prev_lines.is_empty() {
+                    out.push_str("\x1b[2J\x1b[H");
+                }
+                for (i, l) in frame.iter().enumerate() {
+                    if self.prev_lines.get(i) != Some(l) {
+                        out.push_str(&format!("\x1b[{};1H{}", i + 1, l));
+                        out.push_str("\x1b[K");
+                    }
+                }
+                for i in frame.len()..self.prev_lines.len() {
+                    out.push_str(&format!("\x1b[{};1H\x1b[K", i + 1));
+                }
+                self.prev_lines = frame.to_vec();
+            }
+        }
+        print!("{}", out);
         let _ = io::stdout().flush();
+        self.last_emit = now;
     }
 
     /// 封面区：封面框（左侧）+ 元数据（右侧并排 / 下方）。
     fn render_art_section(
         &self,
-        out: &mut String,
+        frame: &mut Vec<String>,
         inner: usize,
         aw: usize,
         ah: usize,
         side: bool,
         meta: &[(&'static str, String)],
     ) {
+        let st = &self.style;
         let img = match &self.art { Some(i) => i, None => return };
         let box_rows = ah + 2;
         let meta_cols = inner.saturating_sub(aw + 4);
@@ -404,18 +695,32 @@ impl Tui {
         let mut art_lines: Vec<String> = Vec::with_capacity(box_rows);
 
         // 封面框顶边（宽度足够时内嵌标题）
+        let title = st.tr("封面", "Cover");
         let top = if aw >= 10 {
-            format!("{}{}┌─ 封面 {}{}┐", indent, fg(GRAY), RESET, "─".repeat(aw - 7))
+            // 与柱体行同宽（aw+2）：tl + h + " " + 标题 + " " + h*(aw-7) + tr
+            format!(
+                "{}{}{}{} {} {}{}",
+                indent, st.p.col(NamedColor::Gray), st.box_.tl, st.box_.h, title,
+                st.box_.h.repeat(aw.saturating_sub(7)), st.box_.tr)
         } else {
-            format!("{}{}┌{}┐{}", indent, fg(GRAY), "─".repeat(aw), RESET)
+            format!("{}{}{}{}{}", indent, st.p.col(NamedColor::Gray), st.box_.tl, st.box_.h.repeat(aw), st.box_.tr)
         };
-        art_lines.push(top);
+        art_lines.push(format!("{}{}", top, RESET));
 
-        // 半块字符渲染
+        // 封面本体：pty 半块真彩色；tty 亮度字符（无真彩色可用）
         for row in 0..ah {
-            art_lines.push(format!("{}{}│{}│{}", indent, fg(GRAY), render_art_row(img, row, aw, ah), RESET));
+            let body = if st.truecolor {
+                render_art_row(img, row, aw, ah)
+            } else {
+                render_art_row_ascii(img, row, aw, ah)
+            };
+            art_lines.push(format!(
+                "{}{}{}{}{}{}",
+                indent, st.p.col(NamedColor::Gray), st.box_.v, body, st.box_.v, RESET));
         }
-        art_lines.push(format!("{}{}└{}┘{}", indent, fg(GRAY), "─".repeat(aw), RESET));
+        art_lines.push(format!(
+            "{}{}{}{}{}{}",
+            indent, st.p.col(NamedColor::Gray), st.box_.bl, st.box_.h.repeat(aw), st.box_.br, RESET));
 
         if side {
             // 元数据垂直居中于封面框右侧
@@ -426,18 +731,18 @@ impl Tui {
                 if i >= pad_top {
                     if let Some((label, value)) = meta_iter.next() {
                         let avail = meta_cols.saturating_sub(2).max(4);
-                        s.push_str(&format!("  {}", meta_text(label, value, avail)));
+                        s.push_str(&format!("  {}", meta_text(label, value, avail, st)));
                     }
                 }
-                line(out, inner, &s);
+                frame.push(line(inner, st, &s));
             }
         } else {
             for box_line in &art_lines {
-                line(out, inner, box_line);
+                frame.push(line(inner, st, box_line));
             }
             // 窄屏：元数据下置（最多 2 行）
             for (label, value) in meta.iter().take(2) {
-                line(out, inner, &format!("  {}", meta_text(label, value, inner - 4)));
+                frame.push(line(inner, st, &format!("  {}", meta_text(label, value, inner - 4, st))));
             }
         }
     }
@@ -465,7 +770,15 @@ impl Tui {
 impl Drop for Tui {
     fn drop(&mut self) {
         if self.active {
-            print!("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+            match self.kind {
+                OutputKind::Pty => {
+                    print!("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+                }
+                OutputKind::Tty => {
+                    // 无备用屏：退出时清屏恢复
+                    print!("\x1b[?25h\x1b[2J\x1b[H");
+                }
+            }
             let _ = io::stdout().flush();
             self.active = false;
         }
@@ -476,29 +789,34 @@ impl Drop for Tui {
 // 渲染辅助
 // ---------------------------------------------------------------------------
 
-fn fg(c: (u8, u8, u8)) -> String {
-    format!("\x1b[38;2;{};{};{}m", c.0, c.1, c.2)
-}
-
 /// 输出一行内容：带左右边框、按显示宽度右对齐填充到内容宽度。
-/// 注意：pad 只追加空格（pad_to 会返回内容本身 + 空格，不能直接拼接）。
-fn line(out: &mut String, inner: usize, content: &str) {
+/// 注意：pad 只追加空格。
+fn line(inner: usize, st: &Style, content: &str) -> String {
     let pad = " ".repeat(inner.saturating_sub(disp_width(content)));
-    out.push_str(&format!("{}│ {}{} │{}\n", fg(GRAY), content, pad, RESET));
+    format!(
+        "{}{} {}{} {}{}",
+        st.p.col(NamedColor::Gray), st.box_.v, content, pad, st.box_.v, RESET)
 }
 
 /// 元数据行：彩色标签 + 内容。
-fn meta_text(label: &str, value: &str, max: usize) -> String {
+fn meta_text(label: &str, value: &str, max: usize, st: &Style) -> String {
     let color = match label {
-        "作曲家" => MAGENTA,
-        "艺术家" => CYAN,
-        "专辑" => GREEN_DIM,
-        _ => GRAY,
+        "作曲家" => NamedColor::Magenta,
+        "艺术家" => NamedColor::Cyan,
+        "专辑" => NamedColor::GreenDim,
+        _ => NamedColor::Gray,
     };
+    let label = st.tr(label, match label {
+        "作曲家" => "Composer",
+        "艺术家" => "Artist",
+        "专辑" => "Album",
+        _ => "Date/Genre",
+    });
+    let value = st.safe(value);
     format!(
         "{}{} {}{}{}",
-        fg(color), label, RESET, clip_w(value, max.saturating_sub(disp_width(label) + 1)), RESET
-    )
+        st.p.col(color), label, RESET,
+        clip_w(&value, max.saturating_sub(disp_width(label) + 1), st.ellipsis), RESET)
 }
 
 /// 计算显示宽度（CJK 全角按 2 列，忽略 ANSI 转义序列）。
@@ -536,8 +854,8 @@ fn is_wide(c: char) -> bool {
         || (0xffe0..=0xffe6).contains(&cp)
 }
 
-/// 按显示宽度截断，超长时追加省略号。
-fn clip_w(s: &str, max: usize) -> String {
+/// 按显示宽度截断，超长时追加省略号（tty 无 … 字形时用 "..."）。
+fn clip_w(s: &str, max: usize, ellipsis: &str) -> String {
     if max == 0 { return String::new(); }
     if disp_width(s) <= max {
         return s.to_string();
@@ -546,11 +864,11 @@ fn clip_w(s: &str, max: usize) -> String {
     let mut w = 0usize;
     for c in s.chars() {
         let cw = if is_wide(c) { 2 } else { 1 };
-        if w + cw > max.saturating_sub(1) { break; }
+        if w + cw > max.saturating_sub(disp_width(ellipsis)) { break; }
         out.push(c);
         w += cw;
     }
-    out.push('…');
+    out.push_str(ellipsis);
     out
 }
 
@@ -566,7 +884,7 @@ fn art_size(img: &ArtImage, max_w: usize, max_h_rows: usize) -> (usize, usize) {
     (w, h)
 }
 
-/// 渲染封面的一行（半块字符 + 真彩色前景/背景 = 上下两个像素）。
+/// 渲染封面的一行（半块字符 + 真彩色前景/背景 = 上下两个像素）。仅 pty。
 fn render_art_row(img: &ArtImage, row: usize, disp_w: usize, disp_h: usize) -> String {
     let mut s = String::with_capacity(disp_w * 24);
     let total_px_h = disp_h * 2;
@@ -587,6 +905,40 @@ fn render_art_row(img: &ArtImage, row: usize, disp_w: usize, disp_h: usize) -> S
         ));
     }
     s.push_str(RESET);
+    s
+}
+
+/// 亮度字符封面（真实 tty：无真彩色、可能无 ▀ 字形）。
+/// 每行对应 2 像素高的条带，取平均亮度映射到 ASCII 渐变字符。
+fn render_art_row_ascii(img: &ArtImage, row: usize, disp_w: usize, disp_h: usize) -> String {
+    const RAMP: [char; 10] = [' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
+    let total_px_h = disp_h * 2;
+    let mut s = String::with_capacity(disp_w);
+    for col in 0..disp_w {
+        let x = (col as f64 + 0.5) * img.width as f64 / disp_w as f64;
+        let mut lum = 0.0f64;
+        for sub in 0..2 {
+            let y = (row as f64 * 2.0 + sub as f64 + 0.5) * img.height as f64 / total_px_h as f64;
+            let y = y.clamp(0.0, img.height as f64 - 1.0);
+            let xi = (x.floor() as usize).min(img.width - 1);
+            let yi = (y.floor() as usize).min(img.height - 1);
+            let i = (yi * img.width + xi) * 4;
+            let (r, g, b, a) = (
+                img.data[i] as f64 / 255.0,
+                img.data[i + 1] as f64 / 255.0,
+                img.data[i + 2] as f64 / 255.0,
+                img.data[i + 3] as f64 / 255.0,
+            );
+            // 预乘 alpha 合成到黑底后取亮度
+            let r = r * a;
+            let g = g * a;
+            let b = b * a;
+            lum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        }
+        lum /= 2.0;
+        let idx = ((lum * (RAMP.len() - 1) as f64).round() as usize).min(RAMP.len() - 1);
+        s.push(RAMP[idx]);
+    }
     s
 }
 
@@ -627,6 +979,7 @@ fn sample_px(img: &ArtImage, x: f64, y: f64) -> (u8, u8, u8) {
     let pb = blend(b00 * a00, b10 * a10, b01 * a01, b11 * a11);
     let pa = blend(a00, a10, a01, a11);
     // 合成到衬底
+    const ART_BG: (u8, u8, u8) = (14, 14, 22);
     let (br, bg_, bb) = ART_BG;
     let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     (
@@ -686,8 +1039,9 @@ mod tests {
     fn clip_and_pad_respect_cjk_width() {
         assert_eq!(disp_width("音乐"), 4);
         assert_eq!(disp_width("♪"), 1);
-        assert_eq!(clip_w("中文标题很长的歌曲名字", 8), "中文标…"); // 7 列 + 省略号 = 8 列
-        assert_eq!(clip_w("abcd", 8), "abcd");
+        assert_eq!(clip_w("中文标题很长的歌曲名字", 8, "…"), "中文标…"); // 7 列 + 省略号 = 8 列
+        assert_eq!(clip_w("abcdefghijk", 6, "..."), "abc...");
+        assert_eq!(clip_w("abcd", 8, "…"), "abcd");
         // 显示宽度计算忽略 ANSI 转义
         assert_eq!(disp_width("\x1b[38;2;1;2;3m音\x1b[0m"), 2);
         let t = format_time(3723_000);
@@ -718,8 +1072,13 @@ mod tests {
             active: false,
             art: None,
             meta: MetaInfo::default(),
+            kind: OutputKind::Pty,
+            style: Style::full(),
             status_row: 3,
             bar_row: 4,
+            prev_lines: Vec::new(),
+            throttle: Duration::ZERO,
+            last_emit: Instant::now(),
         }
     }
 
@@ -780,5 +1139,48 @@ mod tests {
         // 标签行总宽（含缩进）须能放入宽屏阈值 inner=74
         assert_eq!(c, 64);
         assert!(EQ_LABEL_PAD + c <= 74);
+    }
+
+    /// tty 降级风格：无 CJK/无方块字形时用英文 + ASCII 字符，且不产生乱码字符
+    #[test]
+    fn console_style_degrades_gracefully() {
+        let caps = Caps::default(); // 保守：256 字形、无扩展字符
+        let st = Style::console(caps);
+        assert_eq!(st.tr("循环", "Loop"), "Loop");
+        assert_eq!(st.tr_mode("音乐文件"), "Music File");
+        assert_eq!(st.tr_mode("MIDI 音乐"), "MIDI Music");
+        assert_eq!(st.tr_mode("简谱"), "Score");
+        assert_eq!(st.box_.tl, "+");
+        assert_eq!(st.box_.v, "|");
+        assert_eq!(st.prog_full, '#');
+        assert_eq!(st.marker, '>');
+        assert_eq!(st.safe("贝多芬"), "???");
+        assert_eq!(st.safe("Beethoven"), "Beethoven");
+        // 16 色：不含 38;2
+        assert!(!st.p.col(NamedColor::Cyan).contains("38;2"));
+        // CJK 齐全的控制台：保持中文与圆角框
+        let caps2 = Caps {
+            charcount: 1024, has_cjk: true, has_box: true, has_block: true,
+            has_upper_half: true, has_dot: true, has_music: true,
+            has_arrow_l: true, has_arrow_r: true, has_middot: true, has_ellipsis: true,
+        };
+        let st2 = Style::console(caps2);
+        assert_eq!(st2.tr("循环", "Loop"), "循环");
+        assert_eq!(st2.box_.tl, "╭");
+        assert_eq!(st2.prog_full, '█');
+    }
+
+    /// 亮度字符封面：输出全部为 ASCII 安全字符
+    #[test]
+    fn ascii_art_uses_safe_chars() {
+        let img = ArtImage {
+            data: vec![255u8; 64 * 64 * 4], // 全白不透明
+            width: 64,
+            height: 64,
+        };
+        let s = render_art_row_ascii(&img, 0, 16, 8);
+        assert!(!s.is_empty());
+        assert!(s.chars().all(|c| c.is_ascii() && c.is_ascii_graphic() || c == ' '));
+        assert!(s.chars().all(|c| c != '▀'));
     }
 }

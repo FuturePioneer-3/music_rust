@@ -44,6 +44,7 @@
 //!   空格/P 暂停/继续, [ / ] 微调1秒, R 循环, 1-8 跳转10%-80%, Q 退出
 //!   9/0 降低/增加音量
 
+mod console;
 mod input;
 mod audio_file;
 mod log;

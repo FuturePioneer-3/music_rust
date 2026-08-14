@@ -44,6 +44,8 @@ mod input;
 mod parser;
 #[path = "../tui.rs"]
 mod tui;
+#[path = "../console.rs"]
+mod console;
 
 fn main() {
     log::init(true);

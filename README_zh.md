@@ -28,6 +28,8 @@ music_rust 是一个**音乐播放器**：简谱 TXT 和 MIDI 使用系统 **lib
 
 ## 特性
 
+> **v2.4.1**：新增 **真实 tty 支持** —— 自动区分 pty（终端模拟器）与真实 Linux 控制台/串口；在真实 tty 上初始化基础中文环境（`ESC % G` 切换 UTF-8 + 尽力 `setfont` 加载 CJK 字体），并通过内核 ioctl（KDFONTOP/GIO_UNIMAP）探测字体字形能力自动降级：16 色 SGR（无真彩色）、ASCII 边框/进度/箭头、英文标签、亮度字符封面；同时改为**增量重绘**（仅刷新变化的行），彻底消除慢速控制台的乱码与闪烁。
+
 1. 💯 **纯 Rust** 实现，无任何 Windows 依赖。
 2. 🎹 通过系统 SoundFont 用钢琴音色演奏自定义简谱 TXT。
 3. 🎼 **直接播放 MIDI 文件**（`-m` 或 `.mid` 扩展名）：fluidsynth 原生多轨同步 + tempo 变速，最准确。
