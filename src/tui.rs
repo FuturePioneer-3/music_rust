@@ -73,6 +73,16 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 
+/// 进度条行的内容布局（见 draw()）："│ " + " ▸ " + 进度条 + " 45.2%" + " │"。
+/// "│ " 前缀 2 列 + " ▸ " 3 列 → 进度条首个字符位于 1-based 第 6 列。
+/// SGR 鼠标坐标（ESC[<0;x;yM）的 x 同样为 1-based，点击映射必须以该列为基准，
+/// 否则会产生数列的系统性偏移（旧版从第 3 列起算，误差约 5~12%）。
+const BAR_X0: u16 = 6;
+
+/// EQ 柱状行相对内容区左缘的缩进：disp_width("动态 EQ") = 7 + 2 空格 = 9，
+/// 使第一根柱（20Hz）与标签行的 "20" 对齐。
+const EQ_LABEL_PAD: usize = 9;
+
 // ---------------------------------------------------------------------------
 // 元数据
 // ---------------------------------------------------------------------------
@@ -271,18 +281,27 @@ impl Tui {
 
         // 动态 EQ
         if eq_rows > 0 {
-            if inner >= 66 {
+            // 标签行与柱状行严格对齐：柱状行从内容第 EQ_LABEL_PAD 列起，
+            // 每个频段占 4 列槽位（1 柱 + 3 空格）；标签同样按 4 列槽位左对齐
+            // （2 字符标签补到 3 字符再留 1 空格），因此第一根柱（20Hz）正好
+            // 对准 "20"，其余各柱对准各自标签的起始列。
+            let spacing = ((inner.saturating_sub(EQ_LABEL_PAD + 16)) / 15).clamp(0, 3);
+            const FREQ_LABELS: [&str; 16] = [
+                "20", "30", "46", "70", "105", "160", "240", "360",
+                "550", "830", "1.2k", "1.9k", "2.9k", "4.4k", "6.6k", "10k",
+            ];
+            if inner >= 74 {
+                let label_line: String = FREQ_LABELS.iter().map(|l| format!("{:<3} ", l)).collect();
                 line(&mut out, inner, &format!(
-                    "{}动态 EQ{}  20 30 46 70 105 160 240 360 550 830 1.2k 1.9k 2.9k 4.4k 6.6k 10k",
-                    fg(CYAN), RESET));
+                    "{}动态 EQ{}  {}", fg(CYAN), RESET, label_line));
             } else {
                 line(&mut out, inner, &format!(
                     "{}动态 EQ{}  ·  20Hz – 10kHz", fg(CYAN), RESET));
             }
-            let spacing = ((inner.saturating_sub(20)) / 15).clamp(0, 3);
             for row in (1..=7).rev() {
                 let color = EQ_COLORS[row - 1];
                 let mut s = String::with_capacity(inner);
+                s.push_str(&" ".repeat(EQ_LABEL_PAD));
                 for band in 0..16 {
                     if spectrum[band] >= row as u8 {
                         s.push_str(&format!("{}█{}", fg(color), RESET));
@@ -392,8 +411,15 @@ impl Tui {
     pub fn mouse_control(&self, x: u16, y: u16, paused: bool) -> Control {
         if y == self.bar_row {
             let bar_w = (self.width.saturating_sub(4 + 12)).clamp(8, 72) as f64;
-            let offset = (f64::from(x) - 3.0).max(0.0).min(bar_w);
-            return Control::SeekPercent(offset / bar_w);
+            if bar_w <= 1.0 {
+                return Control::None;
+            }
+            // SGR 鼠标 x 为 1-based；进度条自第 BAR_X0 列起，占 bar_w 格。
+            // offset ∈ [0, bar_w-1] → 百分比 = offset / (bar_w-1)，首/末格精确对应 0%/100%。
+            let offset = (f64::from(x) - f64::from(BAR_X0))
+                .max(0.0)
+                .min(bar_w - 1.0);
+            return Control::SeekPercent(offset / (bar_w - 1.0));
         }
         if y == self.status_row {
             return if paused { Control::Play } else { Control::Pause };
@@ -647,5 +673,59 @@ mod tests {
         let (w3, h3) = art_size(&wide, 46, 10);
         assert!(w3 <= 46 && h3 <= 10);
         assert!(w3 > h3, "宽图应保持横向比例");
+    }
+
+    fn test_tui() -> Tui {
+        Tui {
+            title: "t".into(),
+            mode: "m",
+            width: 80,
+            height: 24,
+            active: false,
+            art: None,
+            meta: MetaInfo::default(),
+            status_row: 3,
+            bar_row: 4,
+        }
+    }
+
+    /// 进度条点击映射必须与渲染布局严格一致（回归测试：修复 +3 列系统性偏移）。
+    #[test]
+    fn mouse_bar_click_maps_precisely() {
+        let tui = test_tui();
+        // 80 列 → inner=76 → bar_w=64 → 进度条占 1-based 第 6..69 列
+        assert_eq!(BAR_X0, 6);
+        let bar_w = 64.0;
+        // 起点：进度条第 1 格 → 0%
+        assert_eq!(tui.mouse_control(BAR_X0, 4, false), Control::SeekPercent(0.0));
+        // 终点：进度条最后 1 格 → 100%
+        let c = tui.mouse_control(BAR_X0 + (bar_w as u16) - 1, 4, false);
+        assert!(matches!(c, Control::SeekPercent(p) if (p - 1.0).abs() < 1e-9));
+        // 中点：第 32 格（列 6+31=37）→ 31/63 ≈ 49.2%
+        let c = tui.mouse_control(37, 4, false);
+        assert!(matches!(c, Control::SeekPercent(p) if (p - 31.0 / 63.0).abs() < 1e-9));
+        // 点击进度条左侧（▸ 标记区域）→ 0%
+        assert_eq!(tui.mouse_control(3, 4, false), Control::SeekPercent(0.0));
+        // 超出进度条右端（百分比文字区域）→ 100%（钳制）
+        let c = tui.mouse_control(76, 4, false);
+        assert!(matches!(c, Control::SeekPercent(p) if (p - 1.0).abs() < 1e-9));
+        // 其它行不响应
+        assert_eq!(tui.mouse_control(37, 5, false), Control::None);
+        // 状态行切换播放/暂停
+        assert_eq!(tui.mouse_control(10, 3, true), Control::Play);
+        assert_eq!(tui.mouse_control(10, 3, false), Control::Pause);
+    }
+
+    /// 窄终端（bar_w=24）下偏移映射同样精确。
+    #[test]
+    fn mouse_bar_click_narrow_terminal() {
+        let mut tui = test_tui();
+        tui.width = 40; // inner=36 → bar_w=24 → 进度条占第 6..29 列
+        let bar_w = 24.0;
+        assert_eq!(tui.mouse_control(BAR_X0, 4, false), Control::SeekPercent(0.0));
+        let c = tui.mouse_control(BAR_X0 + (bar_w as u16) - 1, 4, false);
+        assert!(matches!(c, Control::SeekPercent(p) if (p - 1.0).abs() < 1e-9));
+        let c = tui.mouse_control(17, 4, false); // 第 12 格 → 11/23 ≈ 47.8%
+        assert!(matches!(c, Control::SeekPercent(p) if (p - 11.0 / 23.0).abs() < 1e-9));
     }
 }
