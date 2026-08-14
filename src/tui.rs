@@ -83,6 +83,27 @@ const BAR_X0: u16 = 6;
 /// 使第一根柱（20Hz）与标签行的 "20" 对齐。
 const EQ_LABEL_PAD: usize = 9;
 
+/// EQ 频段标签（纯 ASCII，自然单空格分隔）。注意 "1.2k" 等为 4 字符，
+/// 占用 5 列（4 字符 + 1 空格），与 2/3 字符标签不同宽。
+const FREQ_LABELS: [&str; 16] = [
+    "20", "30", "46", "70", "105", "160", "240", "360",
+    "550", "830", "1.2k", "1.9k", "2.9k", "4.4k", "6.6k", "10k",
+];
+
+/// 每根 EQ 柱在标签行中的起始列（内容内偏移，不含 EQ_LABEL_PAD 缩进）：
+/// 柱 i 精确对准标签 i 的首字符。按各标签实际宽度（+1 空格）逐项累计，
+/// 因此 4 字符标签之后列距变为 5，杜绝右端累计漂移。
+fn freq_bar_cols() -> [usize; 16] {
+    let mut cols = [0usize; 16];
+    let mut c = 0usize;
+    for (i, l) in FREQ_LABELS.iter().enumerate() {
+        cols[i] = c;
+        // 标签间单空格；最后一个标签后无空格（与 FREQ_LABELS.join(" ") 一致）
+        c += l.len() + usize::from(i < 15);
+    }
+    cols
+}
+
 // ---------------------------------------------------------------------------
 // 元数据
 // ---------------------------------------------------------------------------
@@ -282,16 +303,13 @@ impl Tui {
         // 动态 EQ
         if eq_rows > 0 {
             // 标签行与柱状行严格对齐：柱状行从内容第 EQ_LABEL_PAD 列起，
-            // 每个频段占 4 列槽位（1 柱 + 3 空格）；标签同样按 4 列槽位左对齐
-            // （2 字符标签补到 3 字符再留 1 空格），因此第一根柱（20Hz）正好
-            // 对准 "20"，其余各柱对准各自标签的起始列。
-            let spacing = ((inner.saturating_sub(EQ_LABEL_PAD + 16)) / 15).clamp(0, 3);
-            const FREQ_LABELS: [&str; 16] = [
-                "20", "30", "46", "70", "105", "160", "240", "360",
-                "550", "830", "1.2k", "1.9k", "2.9k", "4.4k", "6.6k", "10k",
-            ];
+            // 柱状行与标签行精确对齐：每根柱直接放在对应标签的起始列。
+            // 标签为 ASCII 且自然单空格分隔，按实际宽度逐项累计（"1.2k" 等
+            // 4 字符标签占 5 列），不能假设均匀槽位——否则越靠右偏差越大
+            // （"1.2k" 之后每根偏 1 列，"10k" 累计偏 5 列）。
+            let bar_cols = freq_bar_cols();
             if inner >= 74 {
-                let label_line: String = FREQ_LABELS.iter().map(|l| format!("{:<3} ", l)).collect();
+                let label_line = FREQ_LABELS.join(" ");
                 line(&mut out, inner, &format!(
                     "{}动态 EQ{}  {}", fg(CYAN), RESET, label_line));
             } else {
@@ -302,14 +320,30 @@ impl Tui {
                 let color = EQ_COLORS[row - 1];
                 let mut s = String::with_capacity(inner);
                 s.push_str(&" ".repeat(EQ_LABEL_PAD));
-                for band in 0..16 {
-                    if spectrum[band] >= row as u8 {
-                        s.push_str(&format!("{}█{}", fg(color), RESET));
-                    } else {
-                        s.push_str(&format!("{}░{}", fg(GRAY_DIM), RESET));
+                if inner >= 74 {
+                    // 宽屏：柱体精确置于标签起始列（非均匀间距）
+                    let mut cur = 0usize;
+                    for band in 0..16 {
+                        s.push_str(&" ".repeat(bar_cols[band].saturating_sub(cur)));
+                        cur = bar_cols[band] + 1;
+                        if spectrum[band] >= row as u8 {
+                            s.push_str(&format!("{}█{}", fg(color), RESET));
+                        } else {
+                            s.push_str(&format!("{}░{}", fg(GRAY_DIM), RESET));
+                        }
                     }
-                    if band < 15 {
-                        s.push_str(&" ".repeat(spacing));
+                } else {
+                    // 窄屏：无逐频段标签，均匀排布
+                    let spacing = ((inner.saturating_sub(EQ_LABEL_PAD + 16)) / 15).clamp(0, 3);
+                    for band in 0..16 {
+                        if spectrum[band] >= row as u8 {
+                            s.push_str(&format!("{}█{}", fg(color), RESET));
+                        } else {
+                            s.push_str(&format!("{}░{}", fg(GRAY_DIM), RESET));
+                        }
+                        if band < 15 {
+                            s.push_str(&" ".repeat(spacing));
+                        }
                     }
                 }
                 line(&mut out, inner, &s);
@@ -727,5 +761,24 @@ mod tests {
         assert!(matches!(c, Control::SeekPercent(p) if (p - 1.0).abs() < 1e-9));
         let c = tui.mouse_control(17, 4, false); // 第 12 格 → 11/23 ≈ 47.8%
         assert!(matches!(c, Control::SeekPercent(p) if (p - 11.0 / 23.0).abs() < 1e-9));
+    }
+
+    /// EQ 柱起始列必须与标签起始列逐一相等（回归测试：4 字符标签 "1.2k"
+    /// 占 5 列导致右端累计漂移，10kHz 柱曾偏 5 列）。
+    #[test]
+    fn freq_bars_align_with_labels() {
+        let cols = freq_bar_cols();
+        assert_eq!(cols, [0, 3, 6, 9, 12, 16, 20, 24, 28, 32, 36, 41, 46, 51, 56, 61]);
+        // 与标签行（FREQ_LABELS.join(" ")）中每个标签的起始字符位置一致
+        let line = FREQ_LABELS.join(" ");
+        let mut c = 0usize;
+        for (i, l) in FREQ_LABELS.iter().enumerate() {
+            assert_eq!(line[c..].starts_with(l), true, "band {} 标签错位", i);
+            assert_eq!(cols[i], c, "band {} 柱与标签错位", i);
+            c += l.len() + usize::from(i < 15); // 与 freq_bar_cols 同规则
+        }
+        // 标签行总宽（含缩进）须能放入宽屏阈值 inner=74
+        assert_eq!(c, 64);
+        assert!(EQ_LABEL_PAD + c <= 74);
     }
 }
