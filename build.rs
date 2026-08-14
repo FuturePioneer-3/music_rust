@@ -29,14 +29,18 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
     println!("cargo:rerun-if-changed=src/audio_file.c");
     println!("cargo:rerun-if-changed=src/audio_file.h");
+    println!("cargo:rerun-if-changed=src/music_asm.S");
+    println!("cargo:rerun-if-changed=src/music_asm.h");
 
     cc::Build::new()
         .file("src/audio_file.c")
+        .file("src/music_asm.S")
         .include("src")
+        .opt_level(2)
         .warnings(true)
         .compile("music_audio_file");
 
-    for lib in ["libavformat", "libavcodec", "libavutil", "libswresample", "alsa"] {
+    for lib in ["libavformat", "libavcodec", "libavutil", "libswresample", "libswscale", "alsa"] {
         let status = Command::new("pkg-config").args(["--exists", lib]).status();
         if !status.map(|s| s.success()).unwrap_or(false) {
             println!("cargo:warning=未找到 pkg-config 库 {}, 将尝试直接链接", lib);

@@ -115,49 +115,19 @@ impl LimiterState {
         }
     }
 
-    /// 处理一个缓冲区的样本（整块分析 + 平滑增益 + 硬钳制）
+    /// 处理一个缓冲区的样本（整块分析 + 平滑增益 + 硬钳制）。
+    /// 2.4.0：热循环改由独立 AT&T 汇编实现（src/music_asm.S，SSE2，
+    /// 峰值扫描与增益应用均为 4 样本/迭代向量化）。
     #[inline]
     unsafe fn process(&mut self, buf: *mut f32, len: usize) {
-        // 第一遍：求峰值
-        let mut peak: f32 = 0.0;
-        for i in 0..len {
-            let a = (*buf.add(i)).abs();
-            if a > peak {
-                peak = a;
-            }
-        }
-        if peak <= 0.0 {
-            return; // 静音
-        }
-
-        // 目标增益：只压缩不提升（增益 <= 1.0）
-        let mut target_gain = self.target / peak;
-        if target_gain > 1.0 {
-            target_gain = 1.0;
-        }
-
-        // 平滑过渡：压降快（attack），恢复慢（release）
-        let diff = target_gain - self.current_gain;
-        let coef = if diff < 0.0 {
-            self.attack_coef
-        } else {
-            self.release_coef
-        };
-        self.current_gain += diff * coef;
-
-        // 第二遍：应用增益 + 硬钳制
-        let g = self.current_gain;
-        let lim = self.target;
-        for i in 0..len {
-            let x = *buf.add(i) * g;
-            if x > lim {
-                *buf.add(i) = lim;
-            } else if x < -lim {
-                *buf.add(i) = -lim;
-            } else {
-                *buf.add(i) = x;
-            }
-        }
+        music_asm_limiter_process(
+            buf,
+            len,
+            self.target,
+            self.attack_coef,
+            self.release_coef,
+            &mut self.current_gain,
+        );
     }
 }
 
@@ -239,6 +209,9 @@ extern "C" {
         data: *mut c_void,
     ) -> *mut c_void;
     fn delete_fluid_audio_driver(driver: *mut c_void);
+
+    /// 2.4.0：汇编峰值限制器（src/music_asm.S，AT&T 语法，非内联）
+    fn music_asm_limiter_process(buf: *mut f32, n: usize, target: f32, attack: f32, release: f32, gain: *mut f32);
 
     fn new_fluid_settings() -> *mut fluid_settings_t;
     fn delete_fluid_settings(s: *mut fluid_settings_t);
