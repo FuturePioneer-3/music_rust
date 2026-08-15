@@ -2,7 +2,7 @@
 
 # 🎹 music_rust
 
-**MIDI 简谱钢琴演奏器 —— 跨平台（主要 Linux），Rust 主体 + C 音频层**
+**MIDI 简谱钢琴演奏器 —— 跨平台（主要 Linux），Rust 主体 + C/汇编音频层**
 
 <div>
 
@@ -36,10 +36,11 @@ music_rust 是一个**音乐播放器**：简谱 TXT 和 MIDI 使用系统 **lib
 6. ⏱️ `fluid_sequencer` 毫秒级精确事件调度。
 7. 📊 **动态进度条**：实时显示进度百分比、已播/总时长、剩余时间。
 8. 🎮 **交互控制（类似 mpv）**：方向键快进/后退、空格暂停、Enter/P 播放、R 循环、Q 退出，以及 **`9`/`0` 音量调节**。
-9. 🖥️ **终端播放界面**：普通终端自动显示歌曲、进度、音量与循环状态；可点击进度条跳转、点击状态行暂停/继续。
+9. 🖥️ **惊艳全屏 TUI**：渐变标题栏、实时钢琴键盘（按下的键发光）、平滑动画频谱 EQ（峰值保持 + 绿→黄→橙→红渐变）、内嵌日志面板（自研彩色分级日志环形缓冲）、行级 diff 重绘不闪烁；鼠标点进度条跳转、点状态栏播放/暂停。
 10. 🔇 **峰值限制器（默认 -1dBFS）**：自动防止多音符叠加削波/电流声。
-11. 🛠️ 调试模式：详细输出解析日志与每个 MIDI 事件。
-12. 🐍 配套 Python 脚本：`MIDI → 简谱 TXT` 转换器。
+11. ⚙️ **x86-64 SSE2 汇编音频内核**（`src/audio_dsp.S`）：音量渐变、峰值限制、16 段 Goertzel 频谱全部由汇编 SIMD 处理；音量调节/暂停/跳转逐样本线性渐变，彻底杜绝爆音。
+12. 🛠️ 调试模式：详细输出解析日志与每个 MIDI 事件。
+13. 🐍 配套 Python 脚本：`MIDI → 简谱 TXT` 转换器。
 
 ## 快速开始
 
@@ -58,7 +59,7 @@ chmod +x music_rust-x86_64.AppImage
 ### Arch Linux（pkg.tar.zst）
 
 ```bash
-sudo pacman -U music_rust-2.3.0-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-2.42-1-x86_64.pkg.tar.zst
 # 自动安装依赖 fluidsynth + soundfont-fluid
 music 乐曲.txt
 ```

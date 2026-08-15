@@ -52,7 +52,8 @@ use log::{debug, error, info};
 use parser::{parse_file, print_first_events, print_score_summary};
 use synth::SynthPlayer;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 展示版本号（对外发布名 v2.42；Cargo 内部为完整 semver 2.42.0）
+pub const VERSION: &str = "2.42";
 
 fn print_usage() {
     println!("music_rust —— 钢琴演奏器 v{}", VERSION);
@@ -340,7 +341,16 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
         let position = player.position_ms();
         let duration = player.duration_ms();
         if let Some(ui) = &mut tui {
-            ui.draw(position, duration, player.volume_percent(), paused, looping, &["动态频率图（20 Hz - 10 kHz）".to_string()], &player.spectrum());
+            ui.draw(
+                position,
+                duration,
+                player.volume_percent(),
+                paused,
+                looping,
+                &["动态频率图（20 Hz - 10 kHz）".to_string()],
+                &[],
+                &player.spectrum(),
+            );
         }
         if player.finished() {
             if looping {
