@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "audio_file.h"
+#include "audio_dsp.h"
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
@@ -21,6 +22,7 @@ struct music_audio {
     int channels;
     int64_t cursor;
     float volume;
+    float ramp_gain;   /* 逐样本渐变增益（防爆音），由汇编 dsp_vol_s16 维护 */
     int playing;
     int finished;
     int stop;
@@ -48,6 +50,33 @@ static void *audio_thread(void *opaque) {
     uint64_t played_generation = 0;
     while (1) {
         pthread_mutex_lock(&p->lock);
+        // ---- 暂停分支：先淡出当前块（防硬切爆音），再进入等待 ----
+        if (!p->playing && !p->stop) {
+            int64_t fade_left = p->frames - p->cursor;
+            int fade = (fade_left > 0 && p->ramp_gain > 0.003f) ? 1 : 0;
+            if (!fade) {
+                pthread_cond_wait(&p->wake, &p->lock);
+                if (p->stop) { pthread_mutex_unlock(&p->lock); break; }
+                // 被唤醒（play/seek）：锁仍持有，继续正常流程
+            } else {
+                int64_t fade_count = fade_left > 512 ? 512 : fade_left;
+                int64_t fade_start = p->cursor;
+                uint64_t gen = p->generation;
+                pthread_mutex_unlock(&p->lock);
+                int16_t *buffer = malloc((size_t)fade_count * (size_t)p->channels * sizeof(int16_t));
+                if (!buffer) { pthread_mutex_lock(&p->lock); p->finished = 1; p->stop = 1; pthread_mutex_unlock(&p->lock); break; }
+                // 汇编：把剩余音频在 512 帧内线性淡出
+                dsp_vol_s16(p->pcm + fade_start * p->channels, buffer,
+                            (uint32_t)(fade_count * p->channels), &p->ramp_gain, 0.0f);
+                snd_pcm_sframes_t written = snd_pcm_writei(pcm, buffer, (snd_pcm_uframes_t)fade_count);
+                free(buffer);
+                pthread_mutex_lock(&p->lock);
+                if (written < 0) { snd_pcm_recover(pcm, (int)written, 1); pthread_mutex_unlock(&p->lock); continue; }
+                if (gen == p->generation && fade_start == p->cursor) p->cursor += written;
+                if (p->stop) { pthread_mutex_unlock(&p->lock); break; }
+                continue; // 回到循环顶部：此时 ramp_gain≈0，转入等待
+            }
+        }
         while (!p->playing && !p->stop) pthread_cond_wait(&p->wake, &p->lock);
         if (p->stop) { pthread_mutex_unlock(&p->lock); break; }
         int64_t left = p->frames - p->cursor;
@@ -68,10 +97,9 @@ static void *audio_thread(void *opaque) {
         int64_t count = left > 512 ? 512 : left;
         int16_t *buffer = malloc((size_t)count * (size_t)p->channels * sizeof(int16_t));
         if (!buffer) break;
-        for (int64_t i = 0; i < count * p->channels; i++) {
-            int value = (int)((float)p->pcm[start * p->channels + i] * volume);
-            buffer[i] = (int16_t)(value > 32767 ? 32767 : (value < -32768 ? -32768 : value));
-        }
+        // 汇编：音量渐变（音量突变不产生咔哒声）+ 饱和钳制
+        dsp_vol_s16(p->pcm + start * p->channels, buffer,
+                    (uint32_t)(count * p->channels), &p->ramp_gain, volume);
         pthread_mutex_lock(&p->lock);
         int changed = generation != p->generation || start != p->cursor;
         pthread_mutex_unlock(&p->lock);
@@ -134,7 +162,7 @@ music_audio *music_audio_open(const char *path, char *error, int error_len) {
 
 int music_audio_play(music_audio *p) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->playing = 1; p->finished = 0; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
 int music_audio_pause(music_audio *p) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->playing = 0; pthread_mutex_unlock(&p->lock); return 0; }
-int music_audio_seek(music_audio *p, int64_t ms) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->cursor = (ms < 0 ? 0 : ms > p->frames * 1000 / p->sample_rate ? p->frames : ms * p->sample_rate / 1000); p->generation++; p->finished = 0; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
+int music_audio_seek(music_audio *p, int64_t ms) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->cursor = (ms < 0 ? 0 : ms > p->frames * 1000 / p->sample_rate ? p->frames : ms * p->sample_rate / 1000); p->ramp_gain = 0.0f; p->generation++; p->finished = 0; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
 int64_t music_audio_position_ms(music_audio *p) { if (!p) return 0; pthread_mutex_lock(&p->lock); int64_t v = p->cursor * 1000 / p->sample_rate; pthread_mutex_unlock(&p->lock); return v; }
 int64_t music_audio_duration_ms(music_audio *p) { return p ? p->frames * 1000 / p->sample_rate : 0; }
 int music_audio_finished(music_audio *p) { if (!p) return 1; pthread_mutex_lock(&p->lock); int v = p->finished; pthread_mutex_unlock(&p->lock); return v; }
@@ -149,21 +177,9 @@ void music_audio_spectrum(music_audio *p, uint8_t levels[16]) {
     int64_t count = p->frames - start;
     if (count > 1024) count = 1024;
     if (count < 32) { pthread_mutex_unlock(&p->lock); return; }
-    for (int band = 0; band < 16; band++) {
-        // 16 个对数中心频率严格覆盖 20Hz 到 10kHz。
-        float frequency = 20.0f * powf(500.0f, (float)band / 15.0f);
-        float coeff = 2.0f * cosf(2.0f * 3.14159265f * frequency / p->sample_rate);
-        float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f;
-        for (int64_t i = 0; i < count; i++) {
-            float sample = (float)p->pcm[(start + i) * p->channels] / 32768.0f;
-            q0 = coeff * q1 - q2 + sample;
-            q2 = q1;
-            q1 = q0;
-        }
-        float magnitude = sqrtf(q1 * q1 + q2 * q2 - coeff * q1 * q2) / count;
-        int level = (int)(log10f(1.0f + magnitude * 550.0f) * 4.0f);
-        levels[band] = (uint8_t)(level > 7 ? 7 : level);
-    }
+    // 汇编：16 段对数频带 Goertzel 频谱（4 路 SSE 并行）
+    dsp_spectrum_s16(p->pcm + start * p->channels, (uint32_t)count,
+                     (uint32_t)p->channels, (uint32_t)p->sample_rate, levels);
     pthread_mutex_unlock(&p->lock);
 }
 void music_audio_close(music_audio *p) { if (!p) return; if (p->thread_started) { pthread_mutex_lock(&p->lock); p->stop = 1; p->playing = 1; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); pthread_join(p->thread, NULL); } free(p->pcm); pthread_cond_destroy(&p->wake); pthread_mutex_destroy(&p->lock); free(p); }

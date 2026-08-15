@@ -95,6 +95,10 @@ const FLUID_FAILED: c_int = -1;
 //   4. 逐样本应用增益 + 硬钳制，保证任何时刻不超 target
 
 /// 限制器状态（全局，由音频回调访问）
+///
+/// 布局与 C 侧 `dsp_limiter` 一致（4×f32），热路径由 x86-64 SSE2
+/// 汇编 `dsp_limiter_f32` 处理（src/audio_dsp.S），压榨 CPU 效率。
+#[repr(C)]
 struct LimiterState {
     /// 目标峰值电平（线性满刻度，1.0 = 0dBFS）
     target: f32,
@@ -103,6 +107,11 @@ struct LimiterState {
     /// 增益平滑系数（越大越快）
     attack_coef: f32,
     release_coef: f32,
+}
+
+extern "C" {
+    /// 汇编：f32 块级峰值限制器（src/audio_dsp.S）
+    fn dsp_limiter_f32(buf: *mut f32, len: u32, st: *mut LimiterState);
 }
 
 impl LimiterState {
@@ -116,48 +125,15 @@ impl LimiterState {
     }
 
     /// 处理一个缓冲区的样本（整块分析 + 平滑增益 + 硬钳制）
+    ///
+    /// 峰值分析、增益包络与逐样本应用全部在 SSE2 汇编中完成：
+    ///   1. 分析缓冲区峰值
+    ///   2. 若峰值超过 target，计算需要的增益并快速压降（attack）
+    ///   3. 未超限时缓慢恢复增益（release），避免泵浦感
+    ///   4. 逐样本应用增益 + 硬钳制，保证任何时刻不超 target
     #[inline]
     unsafe fn process(&mut self, buf: *mut f32, len: usize) {
-        // 第一遍：求峰值
-        let mut peak: f32 = 0.0;
-        for i in 0..len {
-            let a = (*buf.add(i)).abs();
-            if a > peak {
-                peak = a;
-            }
-        }
-        if peak <= 0.0 {
-            return; // 静音
-        }
-
-        // 目标增益：只压缩不提升（增益 <= 1.0）
-        let mut target_gain = self.target / peak;
-        if target_gain > 1.0 {
-            target_gain = 1.0;
-        }
-
-        // 平滑过渡：压降快（attack），恢复慢（release）
-        let diff = target_gain - self.current_gain;
-        let coef = if diff < 0.0 {
-            self.attack_coef
-        } else {
-            self.release_coef
-        };
-        self.current_gain += diff * coef;
-
-        // 第二遍：应用增益 + 硬钳制
-        let g = self.current_gain;
-        let lim = self.target;
-        for i in 0..len {
-            let x = *buf.add(i) * g;
-            if x > lim {
-                *buf.add(i) = lim;
-            } else if x < -lim {
-                *buf.add(i) = -lim;
-            } else {
-                *buf.add(i) = x;
-            }
-        }
+        dsp_limiter_f32(buf, len as u32, self as *mut LimiterState);
     }
 }
 
@@ -863,6 +839,7 @@ impl SynthPlayer {
                 let ct = unsafe { fluid_player_get_current_tick(player) }.max(0) as u64;
                 let tt = unsafe { fluid_player_get_total_ticks(player) }.max(1) as u64;
                 let notes = active_midi_notes(&display.events, ct);
+                let keys: Vec<u8> = notes.values().flatten().copied().collect();
                 ui.draw(
                     total_ms as u64 * ct / tt,
                     total_ms as u64,
@@ -870,6 +847,7 @@ impl SynthPlayer {
                     paused,
                     looping,
                     &midi_tracks_text(&notes, &display.tracks, display.main_track),
+                    &keys,
                     &midi_spectrum(&notes),
                 );
             }
@@ -1076,7 +1054,17 @@ impl SynthPlayer {
             if paused {
                 if let Some(ui) = &mut tui {
                     let notes = active_score_notes(events, playhead);
-                    ui.draw(playhead as u64, total_ms as u64, self.volume(), true, looping, &score_tracks_text(&notes), &midi_spectrum(&notes));
+                    let keys: Vec<u8> = notes.values().flatten().copied().collect();
+                    ui.draw(
+                        playhead as u64,
+                        total_ms as u64,
+                        self.volume(),
+                        true,
+                        looping,
+                        &score_tracks_text(&notes),
+                        &keys,
+                        &midi_spectrum(&notes),
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
@@ -1092,7 +1080,17 @@ impl SynthPlayer {
             }
             if let Some(ui) = &mut tui {
                 let notes = active_score_notes(events, cur);
-                ui.draw(cur as u64, total_ms as u64, self.volume(), paused, looping, &score_tracks_text(&notes), &midi_spectrum(&notes));
+                let keys: Vec<u8> = notes.values().flatten().copied().collect();
+                ui.draw(
+                    cur as u64,
+                    total_ms as u64,
+                    self.volume(),
+                    paused,
+                    looping,
+                    &score_tracks_text(&notes),
+                    &keys,
+                    &midi_spectrum(&notes),
+                );
             }
 
             // 播放结束判定

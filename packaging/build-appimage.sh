@@ -3,12 +3,15 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 version=$(awk -F '"' '/^version = / { print $2; exit }' "$root/Cargo.toml")
-template="$root/music_rust-2.3.0-x86_64.AppImage"
+version=${version%.0}   # 2.42.0 → 2.42（对外发布名）
+# 模板：取目录中版本号最大的现有 AppImage（自动跟随旧版本）
+template=$(ls -1 "$root"/music_rust-*-x86_64.AppImage 2>/dev/null | sort -V | tail -1)
 output="$root/music_rust-${version}-x86_64.AppImage"
 work="$root/target/appimage-v2"
 tool="$root/target/appimage/appimagetool-x86_64.AppImage"
 
 test -f "$template" || { printf 'missing AppImage template: %s\n' "$template" >&2; exit 1; }
+test "$(basename "$template")" = "$(basename "$output")" && { printf 'template is the same file as output: %s\n' "$template" >&2; exit 1; }
 rm -rf "$work"
 mkdir -p "$work"
 
