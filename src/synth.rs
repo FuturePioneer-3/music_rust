@@ -839,7 +839,6 @@ impl SynthPlayer {
                 let ct = unsafe { fluid_player_get_current_tick(player) }.max(0) as u64;
                 let tt = unsafe { fluid_player_get_total_ticks(player) }.max(1) as u64;
                 let notes = active_midi_notes(&display.events, ct);
-                let keys: Vec<u8> = notes.values().flatten().copied().collect();
                 ui.draw(
                     total_ms as u64 * ct / tt,
                     total_ms as u64,
@@ -847,7 +846,6 @@ impl SynthPlayer {
                     paused,
                     looping,
                     &midi_tracks_text(&notes, &display.tracks, display.main_track),
-                    &keys,
                     &midi_spectrum(&notes),
                 );
             }
@@ -1054,7 +1052,6 @@ impl SynthPlayer {
             if paused {
                 if let Some(ui) = &mut tui {
                     let notes = active_score_notes(events, playhead);
-                    let keys: Vec<u8> = notes.values().flatten().copied().collect();
                     ui.draw(
                         playhead as u64,
                         total_ms as u64,
@@ -1062,7 +1059,6 @@ impl SynthPlayer {
                         true,
                         looping,
                         &score_tracks_text(&notes),
-                        &keys,
                         &midi_spectrum(&notes),
                     );
                 }
@@ -1080,7 +1076,6 @@ impl SynthPlayer {
             }
             if let Some(ui) = &mut tui {
                 let notes = active_score_notes(events, cur);
-                let keys: Vec<u8> = notes.values().flatten().copied().collect();
                 ui.draw(
                     cur as u64,
                     total_ms as u64,
@@ -1088,7 +1083,6 @@ impl SynthPlayer {
                     paused,
                     looping,
                     &score_tracks_text(&notes),
-                    &keys,
                     &midi_spectrum(&notes),
                 );
             }

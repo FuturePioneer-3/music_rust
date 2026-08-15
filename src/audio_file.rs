@@ -2,7 +2,9 @@
 // Copyright (C) 2026 FuturePioneer-3
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::ffi::{c_char, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
+
+use crate::tui::ArtImage;
 
 #[repr(C)]
 struct RawAudio { _private: [u8; 0] }
@@ -18,6 +20,8 @@ extern "C" {
     fn music_audio_set_volume(player: *mut RawAudio, volume: f32);
     fn music_audio_volume(player: *mut RawAudio) -> f32;
     fn music_audio_spectrum(player: *mut RawAudio, levels: *mut u8);
+    fn music_audio_metadata(player: *mut RawAudio, key: *const c_char) -> *const c_char;
+    fn music_audio_art(player: *mut RawAudio, data: *mut *const u8, width: *mut c_int, height: *mut c_int) -> i32;
     fn music_audio_close(player: *mut RawAudio);
 }
 
@@ -44,6 +48,31 @@ impl AudioFilePlayer {
         let mut levels = [0; 16];
         unsafe { music_audio_spectrum(self.raw, levels.as_mut_ptr()); }
         levels
+    }
+
+    /// 读取元数据字段（title/artist/album/composer/date/genre），不存在返回 None。
+    pub fn metadata(&self, key: &str) -> Option<String> {
+        let key = CString::new(key).ok()?;
+        let ptr = unsafe { music_audio_metadata(self.raw, key.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    /// 读取内嵌封面（若有）。
+    pub fn art(&self) -> Option<ArtImage> {
+        let mut data: *const u8 = std::ptr::null();
+        let mut width: c_int = 0;
+        let mut height: c_int = 0;
+        let present = unsafe { music_audio_art(self.raw, &mut data, &mut width, &mut height) };
+        if present == 0 || data.is_null() || width <= 0 || height <= 0 {
+            return None;
+        }
+        let len = (width as usize) * (height as usize) * 4;
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+        Some(ArtImage { data: bytes, width: width as usize, height: height as usize })
     }
 }
 
