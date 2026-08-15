@@ -19,6 +19,8 @@ int music_audio_finished(music_audio *player);
 void music_audio_set_volume(music_audio *player, float volume);
 float music_audio_volume(music_audio *player);
 void music_audio_spectrum(music_audio *player, uint8_t levels[16]);
+const char *music_audio_metadata(music_audio *player, const char *key);
+int music_audio_art(music_audio *player, const unsigned char **data, int *width, int *height);
 void music_audio_close(music_audio *player);
 
 #endif

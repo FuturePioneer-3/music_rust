@@ -38,11 +38,13 @@ The original `music_release/` project was built on the Windows API (`winmm.lib`)
 6. ⏱️ `fluid_sequencer` millisecond-precise event scheduling.
 7. 📊 **Dynamic progress bar**: real-time percentage, elapsed/total time, remaining time.
 8. 🎮 **Interactive controls (mpv-like)**: arrow-key seek, space pause, R loop, Q quit — and **`9`/`0` volume adjustment**.
-9. 🖥️ **Fullscreen TUI**: gradient header, live piano keyboard (pressed keys glow), smoothly animated spectrum EQ with peak-hold and a green→yellow→orange→red gradient, embedded log panel fed by the custom colored ring-buffer logger, flicker-free line-diff redraw; mouse clicks seek on the progress bar and toggle play/pause on the status bar.
-10. 🔇 **Peak limiter (default -1dBFS)**: prevents clipping/buzz from overlapping notes.
-11. ⚙️ **x86-64 SSE2 assembly audio core** (`src/audio_dsp.S`): volume ramping, peak limiting and the 16-band Goertzel spectrum all run as SIMD assembly; volume changes / pause / seek ramp per-sample, eliminating pops and clicks.
-12. 🛠️ Debug mode: detailed parse log + every MIDI event.
-13. 🐍 Companion Python script: `MIDI → jianpu TXT` converter.
+9. 🖥️ **Fullscreen TUI (official 2.4.0/2.4.1 redraw)**: rounded border + truecolor palette, smooth 1/8-step progress bar, gradient dynamic-EQ spectrum with precisely aligned band labels, colored volume bar and status indicators; **real-tty support** (Linux console/serial auto-degrades to 16-color SGR + ASCII borders + incremental redraws to avoid flicker); click the progress bar to seek, click the status row to pause/resume.
+10. 🖼️ **Album art + composer parsing**: embedded covers (ID3 APIC / FLAC PICTURE / M4A covr) are decoded and scaled via FFmpeg and rendered with half-block characters in the TUI, alongside composer/artist/album/date-genre metadata.
+11. 🔇 **Peak limiter (default -1dBFS)**: prevents clipping/buzz from overlapping notes.
+12. ⚙️ **x86-64 SSE2 assembly audio core** (`src/audio_dsp.S`): per-sample linear volume ramping + saturated clamping (no pops on volume/pause/seek), peak limiting and the 16-band Goertzel spectrum (4 lanes in parallel) all run as SIMD assembly.
+13. 📜 **Custom colored leveled logger** (`log.rs`): TRACE/DEBUG/INFO/WARN/ERROR levels with colors, millisecond timestamps and a 300-entry ring buffer.
+14. 🛠️ Debug mode: detailed parse log + every MIDI event.
+15. 🐍 Companion Python script: `MIDI → jianpu TXT` converter.
 
 ## Quick Start
 

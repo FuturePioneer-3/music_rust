@@ -68,6 +68,7 @@ impl Level {
     }
 
     /// TUI 256 色面板着色
+    #[allow(dead_code)]
     pub fn tui_color(self) -> u8 {
         match self {
             Level::Trace => 245,
@@ -85,6 +86,7 @@ impl Level {
 
 /// 一条日志（环形缓冲项）
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LogLine {
     /// 距进程启动的毫秒数
     pub time_ms: u64,
@@ -149,6 +151,7 @@ pub fn consume_log_pending() -> bool {
 }
 
 /// TUI 激活状态（tui.rs 在创建/销毁时调用）
+#[allow(dead_code)]
 pub fn set_tui_active(active: bool) {
     TUI_ACTIVE.store(active, Ordering::Relaxed);
 }
@@ -159,6 +162,7 @@ pub fn tui_active() -> bool {
 }
 
 /// 取环形缓冲快照（TUI 日志面板使用；最新一条在末尾）
+#[allow(dead_code)]
 pub fn snapshot() -> Vec<LogLine> {
     STATE.lock().unwrap().ring.iter().cloned().collect()
 }

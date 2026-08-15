@@ -38,6 +38,7 @@
 //!   空格/P 暂停/继续, [ / ] 微调1秒, R 循环, 1-8 跳转10%-80%, Q 退出
 //!   9/0 降低/增加音量
 
+mod console;
 mod input;
 mod audio_file;
 mod log;
@@ -310,7 +311,22 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
     player.set_volume_percent(volume);
     player.play();
     let mut input = input::InputListener::start();
-    let mut tui = tui::Tui::start(path, "音乐文件", show_tui);
+
+    // 提取元数据（标题/作曲家等）与内嵌封面（MP3 APIC / FLAC PICTURE / M4A covr）
+    let art = player.art();
+    let mut meta = tui::MetaInfo::default();
+    for (key, slot) in [
+        ("title", &mut meta.title),
+        ("artist", &mut meta.artist),
+        ("album", &mut meta.album),
+        ("composer", &mut meta.composer),
+        ("date", &mut meta.date),
+        ("genre", &mut meta.genre),
+    ] {
+        *slot = player.metadata(key);
+    }
+    let display_title = meta.title.clone().unwrap_or_else(|| path.to_string());
+    let mut tui = tui::Tui::start_full(&display_title, "音乐文件", show_tui, art, meta);
     let mut paused = false;
     let mut looping = false;
     loop {
@@ -341,16 +357,7 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
         let position = player.position_ms();
         let duration = player.duration_ms();
         if let Some(ui) = &mut tui {
-            ui.draw(
-                position,
-                duration,
-                player.volume_percent(),
-                paused,
-                looping,
-                &["动态频率图（20 Hz - 10 kHz）".to_string()],
-                &[],
-                &player.spectrum(),
-            );
+            ui.draw(position, duration, player.volume_percent(), paused, looping, &[], &player.spectrum());
         }
         if player.finished() {
             if looping {

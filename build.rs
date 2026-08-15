@@ -39,7 +39,7 @@ fn main() {
         .warnings(true)
         .compile("music_audio_file");
 
-    for lib in ["libavformat", "libavcodec", "libavutil", "libswresample", "alsa"] {
+    for lib in ["libavformat", "libavcodec", "libavutil", "libswresample", "libswscale", "alsa"] {
         let status = Command::new("pkg-config").args(["--exists", lib]).status();
         if !status.map(|s| s.success()).unwrap_or(false) {
             println!("cargo:warning=未找到 pkg-config 库 {}, 将尝试直接链接", lib);

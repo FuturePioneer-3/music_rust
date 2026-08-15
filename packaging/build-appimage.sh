@@ -4,8 +4,8 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 version=$(awk -F '"' '/^version = / { print $2; exit }' "$root/Cargo.toml")
 version=${version%.0}   # 2.42.0 → 2.42（对外发布名）
-# 模板：取目录中版本号最大的现有 AppImage（自动跟随旧版本）
-template=$(ls -1 "$root"/music_rust-*-x86_64.AppImage 2>/dev/null | sort -V | tail -1)
+# 模板：取目录中版本号最大的现有 AppImage（排除当前版本自身）
+template=$(ls -1 "$root"/music_rust-*-x86_64.AppImage 2>/dev/null | grep -Fv -- "-${version}-" | sort -V | tail -1)
 output="$root/music_rust-${version}-x86_64.AppImage"
 work="$root/target/appimage-v2"
 tool="$root/target/appimage/appimagetool-x86_64.AppImage"
@@ -29,4 +29,9 @@ fi
 
 rm -f "$output" "$output.sha256"
 ARCH=x86_64 "$tool" --appimage-extract-and-run "$work/squashfs-root" "$output"
-sha256sum "$output" > "$output.sha256"
+(
+    cd "$root"
+    sha256sum "music_rust-${version}-x86_64.AppImage" \
+        | awk -v v="$version" '{print $1"  music_rust-"v"-x86_64.AppImage"}' \
+        > "music_rust-${version}-x86_64.AppImage.sha256"
+)

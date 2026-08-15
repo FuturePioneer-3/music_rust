@@ -1,3 +1,5 @@
-612db5ba4d6df0f0d1f2da998865c50316481dcb4c15b326faea61aae612fe73  music_rust-2.42-1-x86_64.pkg.tar.zst
 bbabbaff6f0d8042a3d8c9c0ebda982f129a5886d75c0d26f1c52442779546e2  music_rust-2.3.0-x86_64.AppImage
-42fcd5c5b70e53c1e85a0cad26c0ac643a4359309c72ae7b5b339cb353fd3109  music_rust-2.42-x86_64.AppImage
+3bd98a7b6c517c047d9edb0fd8fbfaa9922d0ac47f8e1bc7604fb66af57fc044  music_rust-2.4.0-x86_64.AppImage
+8c11efc4eef152614ae2117c5844e0ec8da4cd0bd07788d440b11d5b77546b88  music_rust-2.4.1-x86_64.AppImage
+f6df1efd7825ff947ab1fb147959f525be2d652145497713231da6932e914912  music_rust-2.42-x86_64.AppImage
+b7b7917c2dcacf877fa229ccf955401069ae8d19b8f4b29b0c4ac57b887f29e8  packaging/music_rust-2.42-1-x86_64.pkg.tar.zst
