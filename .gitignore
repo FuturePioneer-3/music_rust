@@ -4,3 +4,4 @@ __pycache__/
 packaging/pkg/
 packaging/src/
 packaging/music
+testdata/

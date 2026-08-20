@@ -216,6 +216,9 @@ extern "C" {
     ) -> *mut c_void;
     fn delete_fluid_audio_driver(driver: *mut c_void);
 
+    /// 2.4.0：汇编峰值限制器（src/music_asm.S，AT&T 语法，非内联）
+    fn music_asm_limiter_process(buf: *mut f32, n: usize, target: f32, attack: f32, release: f32, gain: *mut f32);
+
     fn new_fluid_settings() -> *mut fluid_settings_t;
     fn delete_fluid_settings(s: *mut fluid_settings_t);
     fn fluid_settings_setstr(s: *mut fluid_settings_t, name: *const c_char, value: *const c_char) -> c_int;

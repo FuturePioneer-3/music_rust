@@ -41,6 +41,10 @@ use std::time::{Duration, Instant};
 use crate::console::{self, Caps, OutputKind};
 use crate::input::Control;
 
+/// GitHub 头像由构建时固定嵌入 ELF，不依赖运行时网络访问。
+const GITHUB_AVATAR_RGBA: &[u8] = include_bytes!("../assets/github_avatar.rgba");
+const GITHUB_AVATAR_SIZE: usize = 96;
+
 /// 内嵌封面：RGBA8 像素（宽 × 高），由 C 侧解码并缩放到 ≤96px。
 /// 定义在本模块（而非 audio_file），使 selftest 等通过 `#[path]`
 /// 复用 tui.rs 的二进制无需链接 audio_file。
@@ -49,6 +53,15 @@ pub struct ArtImage {
     pub data: Vec<u8>,
     pub width: usize,
     pub height: usize,
+}
+
+/// 返回项目所有者的内嵌 GitHub 头像，供无专辑封面的音频显示。
+pub fn github_avatar() -> ArtImage {
+    ArtImage {
+        data: GITHUB_AVATAR_RGBA.to_vec(),
+        width: GITHUB_AVATAR_SIZE,
+        height: GITHUB_AVATAR_SIZE,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,14 +127,13 @@ const FREQ_LABELS: [&str; 16] = [
     "550", "830", "1.2k", "1.9k", "2.9k", "4.4k", "6.6k", "10k",
 ];
 
-/// 每根 EQ 柱在标签行中的起始列（内容内偏移，不含 EQ_LABEL_PAD 缩进）：
-/// 柱 i 精确对准标签 i 的首字符。按各标签实际宽度（+1 空格）逐项累计，
-/// 因此 4 字符标签之后列距变为 5，杜绝右端累计漂移。
+/// 每根 EQ 柱在标签行中的中心列（内容内偏移，不含 EQ_LABEL_PAD 缩进）：
+/// 柱 i 对准标签 i 的中点，偶数宽标签取左中点，避免向右侧字符偏移。
 fn freq_bar_cols() -> [usize; 16] {
     let mut cols = [0usize; 16];
     let mut c = 0usize;
     for (i, l) in FREQ_LABELS.iter().enumerate() {
-        cols[i] = c;
+        cols[i] = c + (l.len().saturating_sub(1)) / 2;
         // 标签间单空格；最后一个标签后无空格（与 FREQ_LABELS.join(" ") 一致）
         c += l.len() + usize::from(i < 15);
     }
@@ -318,6 +330,7 @@ pub struct Tui {
     width: usize,
     height: usize,
     active: bool,
+    logo: ArtImage,
     art: Option<ArtImage>,
     meta: MetaInfo,
     kind: OutputKind,
@@ -387,6 +400,7 @@ impl Tui {
             width: terminal_width(),
             height: terminal_height(),
             active: true,
+            logo: github_avatar(),
             art,
             meta,
             kind,
@@ -478,6 +492,26 @@ impl Tui {
         frame.push(format!(
             "{}{}{}{}{}",
             st.p.col(NamedColor::Cyan), head_prefix, st.box_.h.repeat(fill), st.box_.tr, RESET));
+
+        // 启动 logo：始终显示编译进 ELF 的 GitHub 头像，作为界面标识。
+        // 采用近方形布局，避免横向横幅挤压主体信息。
+        let logo_max_w = if inner >= 64 { 18 } else { 12 };
+        let logo_max_h = if h >= 18 { 8 } else { 6 };
+        let (logo_w, logo_h) = art_size(&self.logo, logo_max_w, logo_max_h);
+        let logo_label = format!("{}  {}", st.tr("GitHub 头像", "GitHub Avatar"), "FuturePioneer-3");
+        // 1-based 鼠标坐标：top=1，logo 行随后，logo label/title/status/bar 依次向下排布。
+        self.status_row = (1 + logo_h + 3) as u16;
+        self.bar_row = (1 + logo_h + 4) as u16;
+        for row in 0..logo_h {
+            let logo_body = if st.truecolor {
+                render_art_row(&self.logo, row, logo_w, logo_h)
+            } else {
+                render_art_row_ascii(&self.logo, row, logo_w, logo_h)
+            };
+            let line_text = format!("{}{}{}", st.p.col(NamedColor::Magenta), logo_body, RESET);
+            frame.push(line(inner, st, &line_text));
+        }
+        frame.push(line(inner, st, &format!("{}{}{} {}", st.p.col(NamedColor::Magenta), st.music, RESET, logo_label)));
 
         // 标题行
         let title_disp = clip_w(&st.safe(&self.title), inner - 2, st.ellipsis);
@@ -1070,6 +1104,7 @@ mod tests {
             width: 80,
             height: 24,
             active: false,
+            logo: github_avatar(),
             art: None,
             meta: MetaInfo::default(),
             kind: OutputKind::Pty,
@@ -1089,24 +1124,25 @@ mod tests {
         // 80 列 → inner=76 → bar_w=64 → 进度条占 1-based 第 6..69 列
         assert_eq!(BAR_X0, 6);
         let bar_w = 64.0;
+        let bar_row = tui.bar_row;
         // 起点：进度条第 1 格 → 0%
-        assert_eq!(tui.mouse_control(BAR_X0, 4, false), Control::SeekPercent(0.0));
+        assert_eq!(tui.mouse_control(BAR_X0, bar_row, false), Control::SeekPercent(0.0));
         // 终点：进度条最后 1 格 → 100%
-        let c = tui.mouse_control(BAR_X0 + (bar_w as u16) - 1, 4, false);
+        let c = tui.mouse_control(BAR_X0 + (bar_w as u16) - 1, bar_row, false);
         assert!(matches!(c, Control::SeekPercent(p) if (p - 1.0).abs() < 1e-9));
         // 中点：第 32 格（列 6+31=37）→ 31/63 ≈ 49.2%
-        let c = tui.mouse_control(37, 4, false);
+        let c = tui.mouse_control(37, bar_row, false);
         assert!(matches!(c, Control::SeekPercent(p) if (p - 31.0 / 63.0).abs() < 1e-9));
         // 点击进度条左侧（▸ 标记区域）→ 0%
-        assert_eq!(tui.mouse_control(3, 4, false), Control::SeekPercent(0.0));
+        assert_eq!(tui.mouse_control(3, bar_row, false), Control::SeekPercent(0.0));
         // 超出进度条右端（百分比文字区域）→ 100%（钳制）
-        let c = tui.mouse_control(76, 4, false);
+        let c = tui.mouse_control(76, bar_row, false);
         assert!(matches!(c, Control::SeekPercent(p) if (p - 1.0).abs() < 1e-9));
         // 其它行不响应
-        assert_eq!(tui.mouse_control(37, 5, false), Control::None);
+        assert_eq!(tui.mouse_control(37, bar_row + 1, false), Control::None);
         // 状态行切换播放/暂停
-        assert_eq!(tui.mouse_control(10, 3, true), Control::Play);
-        assert_eq!(tui.mouse_control(10, 3, false), Control::Pause);
+        assert_eq!(tui.mouse_control(10, tui.status_row, true), Control::Play);
+        assert_eq!(tui.mouse_control(10, tui.status_row, false), Control::Pause);
     }
 
     /// 窄终端（bar_w=24）下偏移映射同样精确。
@@ -1115,25 +1151,25 @@ mod tests {
         let mut tui = test_tui();
         tui.width = 40; // inner=36 → bar_w=24 → 进度条占第 6..29 列
         let bar_w = 24.0;
-        assert_eq!(tui.mouse_control(BAR_X0, 4, false), Control::SeekPercent(0.0));
-        let c = tui.mouse_control(BAR_X0 + (bar_w as u16) - 1, 4, false);
+        let bar_row = tui.bar_row;
+        assert_eq!(tui.mouse_control(BAR_X0, bar_row, false), Control::SeekPercent(0.0));
+        let c = tui.mouse_control(BAR_X0 + (bar_w as u16) - 1, bar_row, false);
         assert!(matches!(c, Control::SeekPercent(p) if (p - 1.0).abs() < 1e-9));
-        let c = tui.mouse_control(17, 4, false); // 第 12 格 → 11/23 ≈ 47.8%
+        let c = tui.mouse_control(17, bar_row, false); // 第 12 格 → 11/23 ≈ 47.8%
         assert!(matches!(c, Control::SeekPercent(p) if (p - 11.0 / 23.0).abs() < 1e-9));
     }
 
-    /// EQ 柱起始列必须与标签起始列逐一相等（回归测试：4 字符标签 "1.2k"
-    /// 占 5 列导致右端累计漂移，10kHz 柱曾偏 5 列）。
+    /// EQ 柱必须对准每个标签的中点（回归测试：短标签不再偏向左侧字符）。
     #[test]
     fn freq_bars_align_with_labels() {
         let cols = freq_bar_cols();
-        assert_eq!(cols, [0, 3, 6, 9, 12, 16, 20, 24, 28, 32, 36, 41, 46, 51, 56, 61]);
-        // 与标签行（FREQ_LABELS.join(" ")）中每个标签的起始字符位置一致
+        assert_eq!(cols, [0, 3, 6, 9, 13, 17, 21, 25, 29, 33, 37, 42, 47, 52, 57, 62]);
+        // 与标签行（FREQ_LABELS.join(" ")）中每个标签的中点一致
         let line = FREQ_LABELS.join(" ");
         let mut c = 0usize;
         for (i, l) in FREQ_LABELS.iter().enumerate() {
             assert_eq!(line[c..].starts_with(l), true, "band {} 标签错位", i);
-            assert_eq!(cols[i], c, "band {} 柱与标签错位", i);
+            assert_eq!(cols[i], c + (l.len().saturating_sub(1)) / 2, "band {} 柱与标签错位", i);
             c += l.len() + usize::from(i < 15); // 与 freq_bar_cols 同规则
         }
         // 标签行总宽（含缩进）须能放入宽屏阈值 inner=74

@@ -24,11 +24,13 @@
 
 music_rust is a **music player**: numbered-notation TXT and MIDI use the system **libfluidsynth** piano synthesizer; WAV, MP3, FLAC, OGG, Opus, AAC, and M4A files use the C/FFmpeg decoder and ALSA output path.
 
-Audio files enter **Music File mode** and are distinct from **MIDI mode** and **Score mode** in the terminal title. Audio file mode defaults to **80%** volume and supports **80%-500%**; `Space` pauses/resumes, `Enter` or `P` plays, and arrow keys or the mouse progress bar seek.
+Audio files enter **Music File mode** and are distinct from **MIDI mode** and **Score mode** in the terminal title. Audio file mode defaults to **80%** volume and supports **80%-500%**; `Space` pauses/resumes, `Enter` or `P` plays, and arrow keys or the mouse progress bar seek. The TUI also renders any embedded **album cover** and **composer/artist/album metadata** below the playback area (2.4.0).
 
 The original `music_release/` project was built on the Windows API (`winmm.lib`) and Windows-only. This project is fully rewritten in **pure Rust** and talks directly to the system `libfluidsynth` via FFI, supporting most Linux distributions.
 
 ## Key Features
+
+> **v2.4.1**: native **real-tty support** — detects pty vs real Linux console/serial and, on a real tty, initializes a basic CJK environment (`ESC % G` UTF-8 mode + best-effort `setfont` with a CJK font), probes the console font via kernel ioctls (KDFONTOP/GIO_UNIMAP) and degrades gracefully: 16-color SGR (no truecolor), ASCII borders/progress/arrows, English labels, luminance-char artwork; plus **incremental redraws** (only changed lines) to eliminate garbling and flicker on slow consoles.
 
 1. 💯 **Pure Rust**, no Windows dependencies.
 2. 🎹 Plays custom jianpu TXT files with a piano timbre via the system SoundFont.
@@ -180,7 +182,7 @@ The synth output passes through a **real-time peak limiter** (default `-1dBFS`),
 - distortion/buzz when volume is raised
 - distortion above full-scale (0dBFS)
 
-Limiter features:
+Limiter features (hot loops rewritten in assembly since 2.4.0):
 - **compress-only, never boosts**: normal segments keep original dynamics, only peaks above the target are pulled down
 - **smooth gain envelope** (fast attack / slow release): no pop on compression, no pumping on recovery
 - **hard-clamp fallback**: samples never exceed the target level
