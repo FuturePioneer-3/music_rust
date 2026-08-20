@@ -193,7 +193,38 @@ Customize the target with `--limit`, e.g. more conservative `-6 dBFS` or more ag
 ./target/release/music 乐曲.txt --limit -6
 ```
 
-## TXT Format (Improved Multitrack)
+## TXT v3 Format (Recommended)
+
+v3 replaces the old line-oriented timing model with **absolute tick events** and one global tempo map.
+Line breaks, rests, and track output order no longer affect timing, and original MIDI track IDs are preserved.
+
+```text
+#MUSIC_RUST 3
+#TITLE Example
+#PPQ 480
+@TEMPO 0 500000
+@TEMPO 1920 666667
+@TRACK 0 0 "Melody"
+@NOTE 0 0 480 60 96
+@NOTE 0 480 480 62 96
+@TRACK 3 1 "Bass"
+@NOTE 3 0 960 48 80
+```
+
+`@TEMPO` uses exact microseconds per quarter note. `@NOTE` contains track ID, start tick,
+duration tick, MIDI key, and velocity. Silence is represented by the gap between absolute events.
+The converter emits v3 by default:
+
+```bash
+python3 convert/convert.py song.mid -o song.v3.txt
+python3 convert/convert.py song.mid --bpm 90       # scale the complete tempo map
+python3 convert/convert.py song.mid --track 2,5    # select original MIDI track IDs
+```
+
+Use `--v2` for the older readable `T` format or `--legacy` for the original two-line format.
+The player continues to read both older formats.
+
+## TXT Format (v2 Compatibility)
 
 ### Header
 
@@ -273,7 +304,10 @@ The original Windows version's two-line-per-group left/right hand format is stil
 python3 convert/convert.py 歌曲.mid              # default output 歌曲.txt
 python3 convert/convert.py 歌曲.mid -o 输出.txt  # specify output
 python3 convert/convert.py 歌曲.mid --bpm 100    # specify tempo
-python3 convert/convert.py 歌曲.mid --track 0,1  # only convert the first two tracks
+python3 convert/convert.py 歌曲.mid --track 0,1  # select original MIDI tracks 0 and 1
+python3 convert/convert.py 歌曲.mid              # interactively enter a velocity multiplier
+python3 convert/convert.py 歌曲.mid --velocity-scale 1.25
+python3 convert/convert.py 歌曲.mid --v2       # output readable legacy T format
 python3 convert/convert.py 歌曲.mid --legacy     # output legacy two-line format
 ```
 
@@ -288,18 +322,20 @@ python3 convert/convert.py 歌曲.mid --legacy     # output legacy two-line form
 | `--max-tracks <n>` | max number of tracks |
 | `--drum` | include drum tracks (excluded by default) |
 | `--min-vel <n>` | filter low-velocity notes |
+| `--velocity-scale <x>` | multiply MIDI velocity; prompts interactively when omitted |
 | `--keep-empty` | keep empty tracks |
 | `--no-chord` | do not merge chords |
+| `--v2` | output the older readable multitrack T format |
 | `--legacy` | output legacy v1/v2 format |
 
 > The converter is pure Python standard library, no third-party deps, supports standard MIDI (SMF type 0/1/2).
+> In an interactive terminal, omitting `--velocity-scale` prompts for any positive multiplier (for example `0.5`, `1.25`, or `2`). Values are clamped to MIDI 1–127. v3 preserves velocity; v2/legacy notation has no velocity field.
 
 ### Dynamic BPM (Mid-song Tempo Change)
 
-The converter auto-detects **tempo changes** in the MIDI:
-
-- parses all tempo events from the first (conductor) track
-- emits a `#BPM xxx` directive line before each tempo change; the Rust player **switches tempo precisely** at that point
+The converter collects tempo events from all MIDI tracks and writes a global `@TEMPO tick us_per_quarter`
+map in v3. The player converts absolute ticks using that map, so tempo changes cannot drift between tracks.
+`--bpm` scales the complete tempo map. The older `--v2` output retains `#BPM` compatibility behavior.
 
 ```
 #BPM 120

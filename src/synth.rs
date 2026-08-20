@@ -1159,6 +1159,11 @@ fn midi_note_name(key: u8) -> String {
 
 fn active_score_notes(events: &[crate::parser::ScheduledNote], at_ms: i64) -> BTreeMap<usize, BTreeSet<u8>> {
     let mut active: BTreeMap<u8, BTreeSet<u8>> = BTreeMap::new();
+    // 预先登记所有轨道，即使当前时刻没有按下音符也要保留显示行。
+    // 否则 details.len() 会随音符开关变化，导致 TUI 布局上下跳动/闪烁。
+    for event in events {
+        active.entry(event.channel).or_default();
+    }
     for event in events.iter().take_while(|event| event.at_ms as i64 <= at_ms) {
         let notes = active.entry(event.channel).or_default();
         if event.on {
@@ -1173,8 +1178,14 @@ fn active_score_notes(events: &[crate::parser::ScheduledNote], at_ms: i64) -> BT
 fn score_tracks_text(active: &BTreeMap<usize, BTreeSet<u8>>) -> Vec<String> {
     active
         .iter()
-        .filter(|(_, notes)| !notes.is_empty())
-        .map(|(channel, notes)| format!("轨道 {}: {}", channel + 1, notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" ")))
+        .map(|(channel, notes)| {
+            let text = if notes.is_empty() {
+                "x".to_string()
+            } else {
+                notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" ")
+            };
+            format!("轨道 {}: {}", channel + 1, text)
+        })
         .collect()
 }
 
@@ -1316,7 +1327,10 @@ fn midi_tracks_text(active: &BTreeMap<usize, BTreeSet<u8>>, tracks: &[usize], ma
         .enumerate()
         .map(|(display_index, track)| {
             let label = if Some(*track) == main_track { "主旋律" } else { "轨道" };
-            let notes = active.get(track).map(|notes| notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "-".to_string());
+            let notes = active.get(track)
+                .filter(|notes| !notes.is_empty())
+                .map(|notes| notes.iter().map(|key| midi_note_name(*key)).collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|| "x".to_string());
             format!("{} {}: {}", label, display_index + 1, notes)
         })
         .collect()
@@ -1344,6 +1358,25 @@ impl Drop for SynthPlayer {
                 delete_fluid_settings(self.settings);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn score_empty_tracks_use_x_placeholder() {
+        let mut active = BTreeMap::new();
+        active.insert(0usize, BTreeSet::new());
+        active.insert(1usize, [60u8].into_iter().collect());
+        assert_eq!(score_tracks_text(&active), vec!["轨道 1: x", "轨道 2: C4"]);
+    }
+
+    #[test]
+    fn midi_empty_tracks_use_x_placeholder() {
+        let active = BTreeMap::new();
+        assert_eq!(midi_tracks_text(&active, &[0, 1], None), vec!["轨道 1: x", "轨道 2: x"]);
     }
 }
 

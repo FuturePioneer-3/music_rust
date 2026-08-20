@@ -21,7 +21,7 @@
 MIDI → 简谱TXT 转换器
 music_rust 钢琴演奏器配套工具
 
-将标准 MIDI 文件 (.mid/.midi) 转换为 music_rust 使用的多音轨简谱 TXT。
+将标准 MIDI 文件 (.mid/.midi) 转换为 music_rust v3 绝对事件 TXT。
 
 用法:
     python3 convert.py 输入.mid [-o 输出.txt] [选项]
@@ -34,9 +34,11 @@ music_rust 钢琴演奏器配套工具
     --max-tracks <n>     最多转换多少音轨 (默认全部非打击乐)
     --drum / --no-drum    是否包含打击乐轨 (默认 --no-drum)
     --min-vel <n>        最低力度 (默认 0)
+    --velocity-scale <x> 力度倍率；交互终端未指定时会询问 (默认 1.0)
     --keep-empty         保留空白音轨
     --no-chord           不合并和弦 (每个音单独token)
-    --legacy             输出旧版 v1/v2 两行一组格式
+    --v2                 输出旧版可读多音轨 T 格式
+    --legacy             输出最旧的 v1/v2 两行一组格式
 
 MIDI 音符编号 → 简谱:
     简谱用 1~7 表示 do re mi fa sol la si
@@ -46,6 +48,7 @@ MIDI 音符编号 → 简谱:
 """
 
 import argparse
+import math
 import os
 import struct
 import sys
@@ -327,6 +330,40 @@ def quantize_tick(tick, quantum):
     return int(round(tick / quantum) * quantum)
 
 
+def choose_velocity_scale(value=None):
+    """选择 MIDI 力度倍率。
+
+    交互终端默认询问；管道/重定向等非交互场景直接使用 1.0，保证转换器
+    可以安全地用于脚本。倍率在真正写出前应用，并最终钳制到 MIDI 的 1-127。
+    """
+    if value is not None:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("力度倍率必须是大于 0 的有限数字")
+        return value
+    if not sys.stdin.isatty():
+        return 1.0
+    while True:
+        try:
+            raw = input("MIDI 力度倍率 [1.0]（例如 0.5、1.5、2）：").strip()
+        except EOFError:
+            return 1.0
+        if not raw:
+            return 1.0
+        try:
+            scale = float(raw)
+        except ValueError:
+            print("请输入正数，例如 0.5、1 或 1.5。", file=sys.stderr)
+            continue
+        if math.isfinite(scale) and scale > 0:
+            return scale
+        print("力度倍率必须是大于 0 的有限数字。", file=sys.stderr)
+
+
+def scale_velocity(velocity, multiplier):
+    """按倍率调整单个 MIDI 力度，并限制到合法范围。"""
+    return max(1, min(127, int(round(velocity * multiplier))))
+
+
 # ---------------------------------------------------------------------------
 # 时值 → 简谱后缀
 # ---------------------------------------------------------------------------
@@ -418,14 +455,16 @@ DEFAULT_TEMPO_US = 500000  # 120 BPM
 
 def build_tempo_timeline(tracks):
     """
-    从第一个轨道 (conductor track) 构建 tempo 时间线。
+    从所有轨道收集 tempo 时间线。
     返回 (initial_us, [(tick, us_per_quarter), ...])。
-    SMF type 1 规范：tempo 元事件位于第一个轨道。
+    标准 MIDI 通常把 tempo 放在 conductor track，但现实文件经常不遵守这一点；
+    收集全部轨道并按 tick 合并可避免丢失变速事件。
     """
-    timeline = []
-    if tracks and tracks[0].tempo_events:
-        for tick, us in sorted(tracks[0].tempo_events, key=lambda e: e[0]):
-            timeline.append((tick, us))
+    by_tick = {}
+    for track in tracks:
+        for tick, us in track.tempo_events:
+            by_tick[tick] = us
+    timeline = sorted(by_tick.items())
     # 归一化：确保 tick=0 时有 tempo（无则用默认）
     initial_us = DEFAULT_TEMPO_US
     if timeline and timeline[0][0] == 0:
@@ -460,19 +499,30 @@ def tempo_change_points(timeline, initial_us):
 
 def convert(midi_path, out_path, opts):
     division, tracks = parse_midi(midi_path)
+    velocity_scale = choose_velocity_scale(getattr(opts, 'velocity_scale', None))
+    # 记录交互选择的实际值，主程序用于回显。
+    opts.velocity_scale = velocity_scale
 
-    # 动态 BPM：构建 tempo 时间线（第一个轨道 = conductor track）
+    # 动态 BPM：构建跨所有轨道的全局 tempo 时间线
     initial_us, tempo_timeline = build_tempo_timeline(tracks)
 
-    bpm = opts.bpm if opts.bpm else int(round(60000000 / initial_us))
+    source_bpm = 60000000 / initial_us
+    bpm = opts.bpm if opts.bpm else int(round(source_bpm))
+    # -b/--bpm 是整体速度缩放，而不是只改第一拍；保留原 MIDI 的变速比例。
+    if opts.bpm:
+        target_initial_us = 60000000 / opts.bpm
+        scale = target_initial_us / initial_us
+        tempo_timeline = [(tick, max(1, int(round(us * scale)))) for tick, us in tempo_timeline]
+        initial_us = tempo_timeline[0][1]
     initial_tempo_ms = 60000 / bpm  # 初始 ms/四分音符
     quarter_ticks = division  # 一个四分音符的 tick 数
 
     # 构建音轨
-    out_tracks = []  # (name, list[NoteEvent])
+    out_tracks = []  # (source MIDI index, name, list[NoteEvent])
     for idx, t in enumerate(tracks):
-        if opts.max_tracks is not None and len(out_tracks) >= opts.max_tracks:
-            break
+        # 先按原始 MIDI 索引筛选，再做其它过滤；--track 永远引用原始轨道号。
+        if opts.track_list is not None and idx not in opts.track_list:
+            continue
         # 过滤打击乐
         if not opts.drum:
             # 检查是否打击乐轨 (大部分音符在 ch9)
@@ -481,42 +531,65 @@ def convert(midi_path, out_path, opts):
         # 过滤低力度
         if opts.min_vel:
             t.events = [ev for ev in t.events if ev.velocity >= opts.min_vel]
+        if velocity_scale != 1.0:
+            for ev in t.events:
+                ev.velocity = scale_velocity(ev.velocity, velocity_scale)
         if not opts.keep_empty and not t.events:
             continue
         name = t.name.strip() if t.name.strip() else f"Track{idx + 1}"
-        out_tracks.append((name, t.events))
-
-    # 指定音轨筛选
-    if opts.track_list is not None:
-        selected = [out_tracks[i] for i in opts.track_list if i < len(out_tracks)]
-        out_tracks = selected
+        out_tracks.append((idx, name, t.events))
+        if opts.max_tracks is not None and len(out_tracks) >= opts.max_tracks:
+            break
 
     # 按轨转简谱
     lines = []
-    lines.append(f"#TITLE {os.path.splitext(os.path.basename(midi_path))[0]}")
-    lines.append(f"#BPM {bpm}")
-    # 变速点注释（Rust 解析器忽略 # 开头且非 BPM 的行）
-    for tick, us in tempo_change_points(tempo_timeline, initial_us):
-        bpm_at = int(round(60000000 / us))
-        lines.append(f"# tempo change @tick{tick}: {bpm_at} BPM ({us}us/q)")
-    lines.append("")
-
     if opts.legacy:
-        _convert_legacy(out_tracks, division, opts, lines, tempo_timeline, initial_tempo_ms)
+        legacy_tracks = [(name, events) for _idx, name, events in out_tracks]
+        lines.extend([f"#TITLE {os.path.splitext(os.path.basename(midi_path))[0]}", f"#BPM {bpm}", ""])
+        _convert_legacy(legacy_tracks, division, opts, lines, tempo_timeline, initial_tempo_ms)
+    elif opts.v2:
+        v2_tracks = [(name, events) for _idx, name, events in out_tracks]
+        lines.extend([f"#TITLE {os.path.splitext(os.path.basename(midi_path))[0]}", f"#BPM {bpm}", ""])
+        global_start = min((e.start for _n, _name, evs in out_tracks for e in evs), default=0)
+        for name, events in v2_tracks:
+            _convert_track_to_lines(name, events, division, opts, lines, tempo_timeline, initial_tempo_ms, global_start)
     else:
-        # 计算全局时间线起始（所有轨最早的音符 tick）
-        global_start = min((e.start for _n, evs in out_tracks for e in evs), default=0)
-        for name, events in out_tracks:
-            _convert_track_to_lines(
-                name, events, division, opts, lines,
-                tempo_timeline, initial_tempo_ms, global_start,
-            )
+        _convert_v3(out_tracks, division, tempo_timeline, midi_path, lines)
 
     # 写入
     content = '\n'.join(lines)
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(content)
     return len(out_tracks)
+
+
+def _quote_track_name(name):
+    """v3 track 名称按整行保存，转义反斜杠和双引号。"""
+    return '"' + name.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def _convert_v3(out_tracks, division, tempo_timeline, midi_path, lines):
+    """输出 v3：绝对 tick 音符 + 单一全局 tempo 表。
+
+    每个 MIDI 轨道保留原始索引，音符不再通过简谱 token 的顺序和休止符重建时间，
+    因而不会出现轨道错位、短音符被拉长或变速点漂移。
+    """
+    lines.extend([
+        "#MUSIC_RUST 3",
+        f"#TITLE {os.path.splitext(os.path.basename(midi_path))[0]}",
+        f"#PPQ {division}",
+    ])
+    for tick, us in tempo_timeline:
+        lines.append(f"@TEMPO {tick} {us}")
+    lines.append("")
+    for source_idx, name, events in out_tracks:
+        channel = events[0].channel if events else 0
+        lines.append(f"@TRACK {source_idx} {channel} {_quote_track_name(name)}")
+        for event in sorted(events, key=lambda e: (e.start, e.note, e.end or e.start)):
+            if event.end is None or event.end <= event.start:
+                continue
+            lines.append(f"@NOTE {source_idx} {event.start} {event.end - event.start} {event.note} {event.velocity}")
+        lines.append("")
 
 
 def _track_lead_rests(events, division, tempo_timeline, initial_tempo_ms, global_start):
@@ -788,9 +861,11 @@ def main():
     parser.add_argument('--max-tracks', type=int, help='最多转换音轨数')
     parser.add_argument('--drum', action='store_true', help='包含打击乐轨')
     parser.add_argument('--min-vel', type=int, default=0, help='最低力度')
+    parser.add_argument('--velocity-scale', type=float, help='MIDI 力度倍率；交互终端未指定时询问（默认 1.0）')
     parser.add_argument('--keep-empty', action='store_true', help='保留空白音轨')
     parser.add_argument('--no-chord', action='store_true', help='不合并和弦')
-    parser.add_argument('--legacy', action='store_true', help='输出旧版两行一组格式')
+    parser.add_argument('--v2', action='store_true', help='输出旧版可读多音轨 T 格式（默认输出 v3）')
+    parser.add_argument('--legacy', action='store_true', help='输出最旧版两行一组格式')
     args = parser.parse_args()
 
     if not os.path.isfile(args.midi):
@@ -815,11 +890,15 @@ def main():
     except MidiError as e:
         print(f"错误: {e}", file=sys.stderr)
         sys.exit(1)
+    except ValueError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"转换完成: {args.midi} → {out}")
     print(f"音轨数: {count}")
     if args.bpm:
         print(f"速度: {args.bpm} BPM")
+    print(f"力度倍率: {args.velocity_scale:g}")
 
 
 if __name__ == '__main__':

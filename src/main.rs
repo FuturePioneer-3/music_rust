@@ -288,7 +288,7 @@ fn main() {
     events.sort_by(|a, b| {
         a.at_ms
             .cmp(&b.at_ms)
-            .then_with(|| a.on.cmp(&b.on))
+            .then_with(|| b.on.cmp(&a.on))
     });
     info(format!("已收集 {} 个 MIDI 事件", events.len()));
 
