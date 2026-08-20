@@ -49,6 +49,7 @@ struct music_audio {
     float volume;
     float ramp_gain;   /* 逐样本渐变增益（防爆音），由汇编 dsp_vol_s16 维护 */
     int playing;
+    int paused;
     int finished;
     int stop;
     int thread_started;
@@ -140,6 +141,7 @@ static music_audio *load_wav_direct(const char *path) {
     p->sample_rate = (int)meta.sample_rate;
     p->channels = (int)meta.channels;
     p->volume = 0.8f;
+    p->paused = 0;
 
     const uint8_t *data = file + meta.data_offset;
     if (!audio_wav_to_s16(data, p->pcm, samples, meta.format, meta.bits_per_sample)) {
@@ -278,6 +280,11 @@ static void *audio_thread(void *opaque) {
         pthread_mutex_lock(&p->lock);
         // ---- 暂停分支：先淡出当前块（防硬切爆音），再进入等待 ----
         if (!p->playing && !p->stop) {
+            if (p->paused) {
+                pthread_cond_wait(&p->wake, &p->lock);
+                if (p->stop) { pthread_mutex_unlock(&p->lock); break; }
+                continue;
+            }
             int64_t fade_left = p->frames - p->cursor;
             int fade = (fade_left > 0 && p->ramp_gain > 0.003f) ? 1 : 0;
             if (!fade) {
@@ -384,6 +391,7 @@ music_audio *music_audio_open(const char *path, char *error, int error_len) {
         set_error(error, error_len, "FFmpeg 音频重采样初始化失败"); if (swr) swr_free(&swr); avcodec_free_context(&ctx); avformat_close_input(&format); music_audio_close(p); return NULL;
     }
     p->sample_rate = rate; p->channels = channels; p->volume = 0.8f;
+    p->paused = 0;
     pthread_mutex_init(&p->lock, NULL); pthread_cond_init(&p->wake, NULL);
     AVPacket *packet = av_packet_alloc(); AVFrame *frame = av_frame_alloc();
     while (packet && frame && av_read_frame(format, packet) >= 0) {
@@ -408,8 +416,8 @@ music_audio *music_audio_open(const char *path, char *error, int error_len) {
     return p;
 }
 
-int music_audio_play(music_audio *p) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->playing = 1; p->finished = 0; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
-int music_audio_pause(music_audio *p) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->playing = 0; pthread_mutex_unlock(&p->lock); return 0; }
+int music_audio_play(music_audio *p) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->paused = 0; p->playing = 1; p->finished = 0; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
+int music_audio_pause(music_audio *p) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->paused = 1; p->playing = 0; p->ramp_gain = 0.0f; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
 int music_audio_seek(music_audio *p, int64_t ms) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->cursor = (ms < 0 ? 0 : ms > p->frames * 1000 / p->sample_rate ? p->frames : ms * p->sample_rate / 1000); p->ramp_gain = 0.0f; p->generation++; p->finished = 0; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
 int64_t music_audio_position_ms(music_audio *p) { if (!p) return 0; pthread_mutex_lock(&p->lock); int64_t v = p->cursor * 1000 / p->sample_rate; pthread_mutex_unlock(&p->lock); return v; }
 int64_t music_audio_duration_ms(music_audio *p) { return p ? p->frames * 1000 / p->sample_rate : 0; }

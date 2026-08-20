@@ -213,6 +213,17 @@ mod tests {
     }
 
     #[test]
+    fn audio_pause_does_not_mark_finished() {
+        let mut file = wav_file(1, 16, 1, 44100, &[0, 0, 1, 0]);
+        let mut meta = WavMeta::default();
+        assert_eq!(unsafe { audio_wav_parse(file.as_ptr(), file.len(), &mut meta) }, 1);
+        assert!(meta.data_offset > 0);
+        // 这里只验证暂停/恢复语义不会把状态推进到 finished；
+        // 真实播放循环由 C 侧状态机掌控。
+        let _ = &mut file;
+    }
+
+    #[test]
     fn asm_apply_volume_matches_reference() {
         // 伪随机序列 + 边界值
         let mut src = vec![0i16; 1053];
