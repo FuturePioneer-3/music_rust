@@ -29,13 +29,19 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
     println!("cargo:rerun-if-changed=src/audio_file.c");
     println!("cargo:rerun-if-changed=src/audio_file.h");
+    println!("cargo:rerun-if-changed=src/audio_wav.S");
     println!("cargo:rerun-if-changed=src/audio_dsp.S");
     println!("cargo:rerun-if-changed=src/audio_dsp.h");
+    println!("cargo:rerun-if-changed=src/music_asm.S");
+    println!("cargo:rerun-if-changed=src/music_asm.h");
 
     cc::Build::new()
         .file("src/audio_file.c")
+        .file("src/audio_wav.S")
         .file("src/audio_dsp.S")
+        .file("src/music_asm.S")
         .include("src")
+        .opt_level(2)
         .warnings(true)
         .compile("music_audio_file");
 

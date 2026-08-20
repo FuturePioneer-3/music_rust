@@ -1,9 +1,19 @@
 // music_rust —— FFmpeg + ALSA 音频文件播放器
 // Copyright (C) 2026 FuturePioneer-3
 // SPDX-License-Identifier: GPL-3.0-or-later
+//
+// 2.4.0 新增：
+//   - 热循环改用独立 AT&T 汇编（music_asm.S）：
+//       * 音量饱和缩放  music_asm_apply_volume_s16（音频线程，8 样本/迭代 SSE2）
+//       * 频谱 Goertzel  music_asm_goertzel4（16 频段分 4 组并行谐振器）
+//   - 元数据提取（title/artist/album/composer/date/genre，如 MP3 ID3 TCOM → composer）
+//   - 内嵌封面图提取（MP3 APIC / FLAC PICTURE / M4A covr），解码并缩放到 ≤96px RGBA，
+//     供 TUI 以半块字符渲染。
 
 #include "audio_file.h"
 #include "audio_dsp.h"
+#include "audio_wav.h"
+#include "music_asm.h"
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
@@ -14,8 +24,17 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <math.h>
+
+static void *audio_thread(void *opaque);
+
+static int is_wav_path(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return 0;
+    return strcasecmp(dot, ".wav") == 0;
+}
 
 #define MUSIC_META_LEN 256
 /// 封面图最长边（像素）。TUI 再按终端尺寸二次缩放渲染。
@@ -49,6 +68,98 @@ struct music_audio {
     int art_w;
     int art_h;
 };
+
+static void set_error(char *out, int len, const char *message) {
+    if (out && len > 0) snprintf(out, (size_t)len, "%s", message);
+}
+
+static void free_audio_state(music_audio *p) {
+    if (!p) return;
+    free(p->pcm);
+    free(p->art);
+    free(p);
+}
+
+static music_audio *load_wav_direct(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long file_len = ftell(fp);
+    if (file_len <= 0) {
+        fclose(fp);
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    uint8_t *file = malloc((size_t)file_len);
+    if (!file) {
+        fclose(fp);
+        return NULL;
+    }
+    if (fread(file, 1, (size_t)file_len, fp) != (size_t)file_len) {
+        free(file);
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+
+    music_wav_meta meta = {0};
+    if (!audio_wav_parse(file, (size_t)file_len, &meta)) {
+        free(file);
+        return NULL;
+    }
+
+    uint64_t frames64 = meta.data_size / meta.block_align;
+    if (frames64 == 0 || frames64 > (uint64_t)INT64_MAX) {
+        free(file);
+        return NULL;
+    }
+    size_t samples = (size_t)frames64 * (size_t)meta.channels;
+    if (samples == 0 || samples > SIZE_MAX / sizeof(int16_t)) {
+        free(file);
+        return NULL;
+    }
+
+    music_audio *p = calloc(1, sizeof(*p));
+    if (!p) {
+        free(file);
+        return NULL;
+    }
+    p->pcm = malloc(samples * sizeof(int16_t));
+    if (!p->pcm) {
+        free(file);
+        free_audio_state(p);
+        return NULL;
+    }
+    p->frames = (int64_t)frames64;
+    p->sample_rate = (int)meta.sample_rate;
+    p->channels = (int)meta.channels;
+    p->volume = 0.8f;
+
+    const uint8_t *data = file + meta.data_offset;
+    if (!audio_wav_to_s16(data, p->pcm, samples, meta.format, meta.bits_per_sample)) {
+        free(file);
+        free_audio_state(p);
+        return NULL;
+    }
+    free(file);
+
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_cond_init(&p->wake, NULL);
+    if (pthread_create(&p->thread, NULL, audio_thread, p) != 0) {
+        pthread_cond_destroy(&p->wake);
+        pthread_mutex_destroy(&p->lock);
+        free_audio_state(p);
+        return NULL;
+    }
+    p->thread_started = 1;
+    return p;
+}
 
 /// 从 FFmpeg 字典复制一个元数据字段到定长缓冲区（空值保持空串）。
 static void copy_meta(char *dst, size_t dst_len, AVDictionary *dict, const char *key) {
@@ -152,10 +263,6 @@ static void load_attached_picture_fallback(music_audio *p, const char *path) {
     avformat_close_input(&format);
 }
 
-static void set_error(char *out, int len, const char *message) {
-    if (out && len > 0) snprintf(out, (size_t)len, "%s", message);
-}
-
 static void *audio_thread(void *opaque) {
     music_audio *p = (music_audio *)opaque;
     snd_pcm_t *pcm = NULL;
@@ -235,6 +342,13 @@ static void *audio_thread(void *opaque) {
 }
 
 music_audio *music_audio_open(const char *path, char *error, int error_len) {
+    if (is_wav_path(path)) {
+        music_audio *wav = load_wav_direct(path);
+        if (wav) {
+            return wav;
+        }
+    }
+
     AVFormatContext *format = NULL;
     if (avformat_open_input(&format, path, NULL, NULL) < 0 || avformat_find_stream_info(format, NULL) < 0) {
         set_error(error, error_len, "FFmpeg 无法打开音频文件"); if (format) avformat_close_input(&format); return NULL;

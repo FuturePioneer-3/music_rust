@@ -21,8 +21,14 @@
 //! 跨平台(主要 Linux) MIDI 简谱播放器。
 //! 读取自定义简谱 TXT（支持多音轨），通过系统 libfluidsynth + SoundFont 演奏钢琴音色。
 //!
+//! 3.1.0：
+//!   - TUI 全面重绘（圆角边框/真彩色/平滑进度条/渐变 EQ）
+//!   - 音频文件模式解析内嵌专辑封面与作曲家等元数据，渲染在播放区下方
+//!   - 音量缩放、频谱 Goertzel 谐振器、峰值限制器热循环改为独立
+//!     AT&T 语法汇编（src/music_asm.S，非内联，SSE2）
+//!
 //! 用法:
-//!   music <乐曲.txt> [选项]
+//!   music <乐曲.txt|音频文件> [选项]
 //!
 //! 选项:
 //!   -d, --debug          详细调试输出
@@ -53,8 +59,8 @@ use log::{debug, error, info};
 use parser::{parse_file, print_first_events, print_score_summary};
 use synth::SynthPlayer;
 
-/// 展示版本号（对外发布名 v2.42；Cargo 内部为完整 semver 2.42.0）
-pub const VERSION: &str = "2.42";
+/// 展示版本号（对外发布名 v3.1；Cargo 使用完整 semver 3.1.0）
+pub const VERSION: &str = "3.1";
 
 fn print_usage() {
     println!("music_rust —— 钢琴演奏器 v{}", VERSION);
@@ -74,6 +80,8 @@ fn print_usage() {
     println!("说明:");
     println!("  默认模式：播放简谱 TXT（自动识别新版多轨/旧版左右手格式）");
     println!("  使用 -m 或传入 .mid 文件：直接播放 MIDI（多轨与变速完全准确）");
+    println!("  传入音频文件（wav/mp3/flac/ogg/opus/aac/m4a/wma）：直接播放，");
+    println!("  TUI 解析并显示内嵌专辑封面与作曲家等元数据（若有）");
     println!();
     println!("播放控制 (类似 mpv):");
     println!("  ← / →         后退/快进 5 秒");
@@ -313,7 +321,8 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
     let mut input = input::InputListener::start();
 
     // 提取元数据（标题/作曲家等）与内嵌封面（MP3 APIC / FLAC PICTURE / M4A covr）
-    let art = player.art();
+    // MP3/FLAC/M4A 有专辑封面时优先显示专辑封面，否则显示编译进 ELF 的 GitHub 头像。
+    let art = player.art().or_else(|| Some(tui::github_avatar()));
     let mut meta = tui::MetaInfo::default();
     for (key, slot) in [
         ("title", &mut meta.title),
