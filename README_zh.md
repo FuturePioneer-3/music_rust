@@ -199,7 +199,42 @@ cargo build --release
 ./target/release/music 乐曲.txt --limit -6
 ```
 
-## TXT 格式（改进版多音轨）
+## TXT v3 格式（推荐）
+
+v3 专门解决旧版“按行推进时间”的歧义。它使用**绝对 tick 音符事件**和一张全局 tempo 表：
+换行、休止符数量、轨道输出顺序都不会改变实际时间；MIDI 的每个原始轨道 ID 也会保留。
+
+```text
+#MUSIC_RUST 3
+#TITLE 示例
+#PPQ 480
+@TEMPO 0 500000       # tick, 每四分音符微秒数（120 BPM）
+@TEMPO 1920 666667    # 从 tick 1920 起切换到约 90 BPM
+@TRACK 0 0 "旋律"
+@NOTE 0 0 480 60 96   # track, 起始 tick, 时长 tick, MIDI 音高, 力度
+@NOTE 0 480 480 62 96
+@TRACK 3 1 "伴奏"
+@NOTE 3 0 960 48 80
+```
+
+字段约定：
+
+- `#PPQ` 是 tick 分辨率，通常等于 MIDI 文件的 division。
+- `@TEMPO` 对所有轨道全局生效，单位是 microseconds per quarter，不使用四舍五入后的 BPM。
+- `@TRACK` 的第一个数字是原始 MIDI 轨道 ID，第二个数字是 MIDI channel。
+- `@NOTE` 使用 MIDI 音高 0–127 和力度 1–127；休止通过绝对时间间隔自然表达。
+
+MIDI 转换器现在默认生成 v3：
+
+```bash
+python3 convert/convert.py song.mid -o song.v3.txt
+python3 convert/convert.py song.mid --bpm 90       # 按比例缩放整张 tempo 表
+python3 convert/convert.py song.mid --track 2,5    # 按原始 MIDI 轨道编号选择
+```
+
+需要旧格式时使用 `--v2`（可读的 `T` 多轨格式）或 `--legacy`（v1/v2 两行一组）。旧格式仍可由播放器读取。
+
+## TXT 格式（v2 兼容）
 
 ### 头部
 
@@ -279,7 +314,10 @@ T 贝斯       | 1,, 0 1,, 0 | 4,, 0 2,, 0 | 3,, 0 6,, 0 | 5,, 0 7,, 0
 python3 convert/convert.py 歌曲.mid              # 默认输出 歌曲.txt
 python3 convert/convert.py 歌曲.mid -o 输出.txt  # 指定输出
 python3 convert/convert.py 歌曲.mid --bpm 100    # 指定速度
-python3 convert/convert.py 歌曲.mid --track 0,1  # 只转换前两轨
+python3 convert/convert.py 歌曲.mid --track 0,1  # 按原始 MIDI 编号转换 0、1 轨
+python3 convert/convert.py 歌曲.mid              # 交互输入力度倍率，如 0.5、1.25、2
+python3 convert/convert.py 歌曲.mid --velocity-scale 1.25
+python3 convert/convert.py 歌曲.mid --v2       # 输出旧版可读 T 多轨格式
 python3 convert/convert.py 歌曲.mid --legacy     # 输出旧版两行一组格式
 ```
 
@@ -294,18 +332,21 @@ python3 convert/convert.py 歌曲.mid --legacy     # 输出旧版两行一组格
 | `--max-tracks <n>` | 最多音轨数 |
 | `--drum` | 包含打击乐轨（默认排除） |
 | `--min-vel <n>` | 过滤低力度音符 |
+| `--velocity-scale <x>` | MIDI 力度倍率；交互终端未指定时自由输入，默认 1.0 |
 | `--keep-empty` | 保留空白音轨 |
 | `--no-chord` | 不合并和弦 |
+| `--v2` | 输出旧版可读多音轨 T 格式 |
 | `--legacy` | 输出旧版 v1/v2 格式 |
 
 > 转换器纯 Python 标准库实现，无第三方依赖，支持标准 MIDI (SMF type 0/1/2)。
+> 在交互终端运行且未指定 `--velocity-scale` 时，转换器会询问力度倍率；可输入任意正数，输出会钳制到 MIDI 的 1–127。v3 会保存力度，v2/legacy 简谱格式没有力度字段。
 
 ### 动态 BPM（中途变速）
 
-转换器自动探测 MIDI 中的**速度变化**（tempo change）：
+转换器会从所有 MIDI 轨道收集 tempo 事件，并在 v3 文件中写成全局 `@TEMPO tick us_per_quarter` 表；
+播放器按绝对 tick 换算时间，不再依赖每条轨道里的 `#BPM` 行。`--bpm` 会等比例缩放整张 tempo 表。
 
-- 从第一个轨道（conductor track）解析所有 tempo 事件
-- 变速点前输出 `#BPM xxx` 指令行，Rust 播放器在对应位置**精确切换速度**
+`--v2` 输出的旧格式仍保留 `#BPM` 兼容行为，但不建议用于包含复杂变速的 MIDI。
 
 ```
 #BPM 120

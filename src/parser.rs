@@ -18,6 +18,9 @@
 
 //! 简谱(TXT)解析器 —— 改进版：支持多音轨
 //!
+//! v3 文件使用 `#MUSIC_RUST 3` 标记、全局 `@TEMPO` 表和绝对 `@NOTE` 事件；
+//! v1/v2 的行式简谱格式仍由下面的兼容解析器处理。
+//!
 //! ## 格式说明
 //!
 //! 第一行：速度。两种形式：
@@ -48,6 +51,7 @@
 //! 一个“事件” = 一个音符或和弦，从空格处切分。每个事件按顺序推进时间线。
 
 use crate::log::{debug, info, warn};
+use std::collections::BTreeMap;
 
 /// 一条排程事件
 #[derive(Debug, Clone)]
@@ -310,11 +314,19 @@ pub fn parse_file(path: &str, force_tempo: Option<u32>) -> Result<Score, String>
 
 /// 解析字符串内容。
 pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, String> {
-    let mut tempo_ms = force_tempo.unwrap_or(500);
-    let mut title = String::new();
-
     // 第一遍：扫描行分类，得到结构
     let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    // v3 使用绝对 tick 和全局 tempo 表，必须在旧版行式解析前单独处理。
+    if lines.iter().any(|l| {
+        let t = l.trim().to_ascii_uppercase();
+        t == "#MUSIC_RUST 3" || t == "#FORMAT 3" || t.starts_with("#MUSIC_RUST 3 ")
+    }) {
+        return parse_v3_format(&lines, force_tempo);
+    }
+
+    let mut tempo_ms = force_tempo.unwrap_or(500);
+    let mut title = String::new();
 
     // 预处理：判断是否新格式（含 T 轨头），决定解析模式
     let has_track_header = lines
@@ -402,16 +414,166 @@ pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, Strin
     }
     score.total_ms = max_end;
 
-    // 排序事件：先 note-off 后 note-on？不，同时间的 note-on 先发，note-off 后发。
+    // 排序事件：同一时刻先发 note-on，再发 note-off，避免音符衔接出现空洞。
     for t in &mut score.tracks {
         t.events.sort_by(|a, b| {
             a.at_ms
                 .cmp(&b.at_ms)
-                .then_with(|| a.on.cmp(&b.on)) // false(noteoff) 排后
+                .then_with(|| b.on.cmp(&a.on)) // 同时刻 note-on 先于 note-off
         });
     }
 
     Ok(score)
+}
+
+/// v3 绝对事件格式。
+///
+/// ```text
+/// #MUSIC_RUST 3
+/// #TITLE 曲名
+/// #PPQ 480
+/// @TEMPO 0 500000       # tick, microseconds per quarter
+/// @TEMPO 1920 666667
+/// @TRACK 0 0 主旋律     # id, MIDI channel, name
+/// @NOTE 0 0 480 60 96   # track id, start tick, duration tick, key, velocity
+/// ```
+///
+/// 音符使用绝对 tick，不依赖空格、换行或简谱时值后缀；tempo 只定义一次，
+/// 对所有音轨全局生效，因此不会出现各轨道变速点错位的问题。
+fn parse_v3_format(lines: &[String], force_tempo: Option<u32>) -> Result<Score, String> {
+    #[derive(Clone)]
+    struct TrackDef { id: u32, channel: u8, name: String }
+    #[derive(Clone, Copy)]
+    struct NoteDef { track: u32, start: u64, dur: u64, key: u8, vel: u8 }
+
+    let mut title = String::new();
+    let mut ppq: u32 = 480;
+    let mut tempos: Vec<(u64, u64)> = Vec::new();
+    let mut tracks: Vec<TrackDef> = Vec::new();
+    let mut notes: Vec<NoteDef> = Vec::new();
+
+    for (line_no, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() { continue; }
+        if let Some(rest) = line.strip_prefix('#') {
+            let rest = rest.trim();
+            let upper = rest.to_ascii_uppercase();
+            if upper.starts_with("TITLE") {
+                let value = rest[5..].trim_start_matches([':', ' ', '\t']);
+                title = value.to_string();
+            } else if upper.starts_with("PPQ") {
+                let value = rest[3..].trim();
+                ppq = value.parse::<u32>().map_err(|_| format!("v3 第{}行 PPQ 无效", line_no + 1))?;
+                if ppq == 0 { return Err(format!("v3 第{}行 PPQ 不能为 0", line_no + 1)); }
+            }
+            continue;
+        }
+
+        let mut fields = line.split_whitespace();
+        let kind = fields.next().unwrap_or("").to_ascii_uppercase();
+        match kind.as_str() {
+            "@TEMPO" | "TEMPO" => {
+                let tick = fields.next().ok_or_else(|| format!("v3 第{}行缺少 tempo tick", line_no + 1))?
+                    .parse::<u64>().map_err(|_| format!("v3 第{}行 tempo tick 无效", line_no + 1))?;
+                let us = fields.next().ok_or_else(|| format!("v3 第{}行缺少 us/q", line_no + 1))?
+                    .parse::<u64>().map_err(|_| format!("v3 第{}行 us/q 无效", line_no + 1))?;
+                if us == 0 { return Err(format!("v3 第{}行 us/q 不能为 0", line_no + 1)); }
+                tempos.push((tick, us));
+            }
+            "@TRACK" | "TRACK" => {
+                let id = fields.next().ok_or_else(|| format!("v3 第{}行缺少 track id", line_no + 1))?
+                    .parse::<u32>().map_err(|_| format!("v3 第{}行 track id 无效", line_no + 1))?;
+                let channel = fields.next().ok_or_else(|| format!("v3 第{}行缺少 MIDI channel", line_no + 1))?
+                    .parse::<u8>().map_err(|_| format!("v3 第{}行 channel 无效", line_no + 1))?;
+                if channel > 15 { return Err(format!("v3 第{}行 channel 必须是 0-15", line_no + 1)); }
+                let mut name = fields.collect::<Vec<_>>().join(" ");
+                if name.starts_with('"') && name.ends_with('"') && name.len() >= 2 {
+                    name = name[1..name.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\");
+                }
+                tracks.push(TrackDef { id, channel, name: if name.is_empty() { format!("Track{}", id + 1) } else { name } });
+            }
+            "@NOTE" | "NOTE" => {
+                let mut parse = |label: &str| -> Result<u64, String> {
+                    fields.next().ok_or_else(|| format!("v3 第{}行缺少 {}", line_no + 1, label))?
+                        .parse::<u64>().map_err(|_| format!("v3 第{}行 {} 无效", line_no + 1, label))
+                };
+                let track_raw = parse("track id")?;
+                if track_raw > u32::MAX as u64 { return Err(format!("v3 第{}行 track id 越界", line_no + 1)); }
+                let track = track_raw as u32;
+                let start = parse("start tick")?;
+                let dur = parse("duration tick")?;
+                let key = parse("MIDI key")?;
+                let vel = parse("velocity")?;
+                if dur == 0 || key > 127 || vel == 0 || vel > 127 {
+                    return Err(format!("v3 第{}行音符参数越界", line_no + 1));
+                }
+                notes.push(NoteDef { track, start, dur, key: key as u8, vel: vel as u8 });
+            }
+            _ => return Err(format!("v3 第{}行未知记录类型: {}", line_no + 1, kind)),
+        }
+    }
+
+    if tracks.is_empty() { return Err("v3 文件没有 @TRACK".into()); }
+    if tempos.is_empty() { tempos.push((0, 500_000)); }
+    tempos.sort_by_key(|(tick, _)| *tick);
+    // 同一 tick 的 tempo 以后出现者覆盖前者，符合 MIDI 事件顺序。
+    let mut normalized: Vec<(u64, u64)> = Vec::new();
+    for (tick, us) in tempos {
+        if let Some(last) = normalized.last_mut() {
+            if last.0 == tick { last.1 = us; continue; }
+        }
+        normalized.push((tick, us));
+    }
+    if normalized[0].0 != 0 { normalized.insert(0, (0, 500_000)); }
+
+    let base_us = normalized[0].1;
+    let target_us = force_tempo.map(|ms| (ms.max(1) as u64) * 1000).unwrap_or(base_us);
+    let scaled_tempos: Vec<(u64, u64)> = normalized.iter()
+        .map(|(tick, us)| (*tick, ((*us as u128 * target_us as u128 + base_us as u128 / 2) / base_us as u128) as u64))
+        .collect();
+
+    fn tick_to_ms(tick: u64, ppq: u32, tempos: &[(u64, u64)]) -> u64 {
+        let mut cur_tick = 0u64;
+        let mut cur_us = tempos[0].1;
+        // 保留到最后再除以 ppq，避免每个 tempo 段分别取整造成累计漂移。
+        let mut elapsed_tick_us = 0u128;
+        for &(tempo_tick, tempo_us) in tempos.iter().skip(1) {
+            if tempo_tick >= tick { break; }
+            if tempo_tick > cur_tick {
+                elapsed_tick_us += (tempo_tick - cur_tick) as u128 * cur_us as u128;
+            }
+            cur_tick = tempo_tick;
+            cur_us = tempo_us;
+        }
+        if tick > cur_tick {
+            elapsed_tick_us += (tick - cur_tick) as u128 * cur_us as u128;
+        }
+        (elapsed_tick_us / ppq as u128 / 1000) as u64
+    }
+
+    let mut by_id: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut score_tracks = Vec::with_capacity(tracks.len());
+    for def in tracks {
+        if by_id.insert(def.id, score_tracks.len()).is_some() {
+            return Err(format!("v3 重复的 track id: {}", def.id));
+        }
+        score_tracks.push(Track { name: def.name, channel: def.channel, events: Vec::new() });
+    }
+    for note in notes {
+        let idx = *by_id.get(&note.track).ok_or_else(|| format!("v3 音符引用不存在的 track id: {}", note.track))?;
+        let start_ms = tick_to_ms(note.start, ppq, &scaled_tempos).min(u32::MAX as u64) as u32;
+        let end_ms = tick_to_ms(note.start.saturating_add(note.dur), ppq, &scaled_tempos).min(u32::MAX as u64) as u32;
+        let track = &mut score_tracks[idx];
+        track.events.push(ScheduledNote { at_ms: start_ms, key: note.key, vel: note.vel, on: true, channel: track.channel });
+        track.events.push(ScheduledNote { at_ms: end_ms.max(start_ms.saturating_add(1)), key: note.key, vel: note.vel, on: false, channel: track.channel });
+    }
+    for track in &mut score_tracks {
+        track.events.sort_by(|a, b| a.at_ms.cmp(&b.at_ms).then_with(|| b.on.cmp(&a.on)));
+    }
+    let total_ms = score_tracks.iter().flat_map(|t| t.events.iter()).map(|e| e.at_ms).max().unwrap_or(0);
+    let tempo_ms = (target_us / 1000).max(1).min(u32::MAX as u64) as u32;
+    info(format!("v3 解析完成：{} 个音轨，{} 个绝对事件", score_tracks.len(), score_tracks.iter().map(|t| t.events.len()).sum::<usize>()));
+    Ok(Score { tempo_ms, tracks: score_tracks, title, total_ms })
 }
 
 /// 旧版格式：行与行按时间顺序推进；两行一组=左右手同时。
@@ -753,5 +915,29 @@ mod tests {
         println!("[4,6,1]- notes={:?} dur={}", notes2, dur2);
         let events = parse_line("[1,3,5,]- [4,6,1]- [2,4#,6,]- [1,3,5,]-", 500);
         println!("parse_line events: {:?}", events);
+    }
+
+    #[test]
+    fn test_v3_absolute_ticks_and_global_tempo() {
+        let text = "#MUSIC_RUST 3\n#TITLE V3\n#PPQ 480\n@TEMPO 0 500000\n@TEMPO 480 1000000\n@TRACK 7 3 \"Piano Main\"\n@TRACK 2 1 Bass\n@NOTE 7 0 480 60 100\n@NOTE 2 960 480 36 80\n";
+        let score = parse_str(text, None).unwrap();
+        assert_eq!(score.title, "V3");
+        assert_eq!(score.tracks.len(), 2);
+        assert_eq!(score.tracks[0].name, "Piano Main");
+        assert_eq!(score.tracks[0].channel, 3);
+        assert_eq!(score.tracks[0].events[0].at_ms, 0);
+        assert_eq!(score.tracks[0].events[1].at_ms, 500);
+        // tick 480-960 使用新 tempo：第二个音符起点为 500ms + 1000ms。
+        assert_eq!(score.tracks[1].events[0].at_ms, 1500);
+        assert_eq!(score.total_ms, 2500);
+    }
+
+    #[test]
+    fn test_v3_force_tempo_scales_whole_timeline() {
+        let text = "#FORMAT 3\n#PPQ 480\n@TEMPO 0 500000\n@TEMPO 480 1000000\n@TRACK 0 0 P\n@NOTE 0 0 960 60 96\n";
+        let score = parse_str(text, Some(250)).unwrap();
+        // 原始 120 BPM 被整体压到 240 BPM，变速比例仍保持 1:2。
+        assert_eq!(score.tempo_ms, 250);
+        assert_eq!(score.total_ms, 750);
     }
 }
