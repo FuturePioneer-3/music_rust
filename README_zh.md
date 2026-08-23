@@ -2,7 +2,7 @@
 
 # 🎹 music_rust
 
-**MIDI 简谱钢琴演奏器 —— 跨平台（主要 Linux），Rust 主体 + C/汇编音频层**
+**终端音乐播放器：简谱 / MIDI / 音频文件 —— 跨平台（主要 Linux），Rust 主体 + C/汇编音频层**
 
 <div>
 
@@ -16,57 +16,85 @@
 <div>
 <a href="https://img.shields.io/github/v/release/FuturePioneer-3/music_rust"><img src="https://img.shields.io/github/v/release/FuturePioneer-3/music_rust?color=76bad9" alt="release"></a>
 <a href="https://img.shields.io/badge/rust-2021-edition-blue.svg"><img src="https://img.shields.io/badge/rust-2021-edition-blue.svg" alt="rust"></a>
-<a href="LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-green.svg" alt="license"></a>
 <a href="https://img.shields.io/github/license/FuturePioneer-3/music_rust"><img src="https://img.shields.io/github/license/FuturePioneer-3/music_rust?color=green" alt="GPLv3"></a>
 </div>
 
 </div>
 
-music_rust 是一个**音乐播放器**：简谱 TXT 和 MIDI 使用系统 **libfluidsynth** 钢琴合成器；WAV、MP3、FLAC、OGG、Opus、AAC、M4A 等音频文件使用 C/FFmpeg 解码并通过 ALSA 输出。
+music_rust 是一个**终端音乐播放器**，内置三套播放引擎：
 
-原项目 `music_release/` 基于 Windows API (`winmm.lib`) 开发，仅支持 Windows。本项目完全用 **Rust** 重写，通过 FFI 直连系统 `libfluidsynth` 合成器，支持绝大多数 Linux 发行版。
+| 模式 | 输入 | 引擎 |
+| ---- | ---- | ---- |
+| 🎼 **简谱模式** | 简谱 TXT（v3 / v2 / 旧版 v1） | 系统 **libfluidsynth** + SoundFont，毫秒级排程 |
+| 🎵 **MIDI 模式** | `.mid` / `.midi` | fluidsynth 原生播放器（多轨同步 + tempo 变速，最准确） |
+| 📁 **音乐文件模式** | WAV / MP3 / FLAC / OGG / Opus / AAC / M4A / WMA | C/FFmpeg 解码 + ALSA 输出，专辑封面与元数据渲染 |
+
+原项目 `music_release/` 基于 Windows API (`winmm.lib`) 开发，仅支持 Windows。
+本项目完全用 **Rust** 重写，通过 FFI 直连系统 `libfluidsynth` 合成器，支持绝大多数 Linux 发行版。
+**不带参数**运行会打开交互式启动选择器；带文件运行则直接开始播放。
+
+## v3.20 新特性
+
+- 🧭 **无参数启动选择器**：浏览当前目录的可播放文件、选择 SoundFont、设置简谱播放使用的
+  GM 音色号（0–127），确认后直接进入播放 TUI。
+- 🎛️ **内置 `electronic_synth.sf2` 电子合成器音色库**：随仓库与 Arch 包分发
+  （安装到 `/usr/share/music_rust/soundfonts/`），启动时自动发现。
+- 🎚️ 新增 `-i, --instrument <0-127>`：简谱播放可任选 GM 音色
+  （默认 0 = 原声大钢琴；如 81 = 锯齿波主音）。
+- 🔧 修复 MIDI/TXT 音量状态与实际合成增益不一致、限制器包络残留导致的响度滞后。
+- 🔧 修复音频文件暂停/跳转线程死锁、EOF 竞态与 TUI 进度条行号错位。
+
+近期里程碑：**v3.1** 新增纯汇编 WAV 快速路径（普通 WAV 完全不经过 FFmpeg）；
+**v3.0** 引入绝对 tick 的 TXT v3 格式与全局 tempo 表。
 
 ## 特性
 
-> **v2.4.1**：新增 **真实 tty 支持** —— 自动区分 pty（终端模拟器）与真实 Linux 控制台/串口；在真实 tty 上初始化基础中文环境（`ESC % G` 切换 UTF-8 + 尽力 `setfont` 加载 CJK 字体），并通过内核 ioctl（KDFONTOP/GIO_UNIMAP）探测字体字形能力自动降级：16 色 SGR（无真彩色）、ASCII 边框/进度/箭头、英文标签、亮度字符封面；同时改为**增量重绘**（仅刷新变化的行），彻底消除慢速控制台的乱码与闪烁。
-
-1. 💯 **纯 Rust** 实现，无任何 Windows 依赖。
-2. 🎹 通过系统 SoundFont 用钢琴音色演奏自定义简谱 TXT。
-3. 🎼 **直接播放 MIDI 文件**（`-m` 或 `.mid` 扩展名）：fluidsynth 原生多轨同步 + tempo 变速，最准确。
-4. 🧵 **改进版多音轨 TXT 格式**：支持任意数量并行音轨 + 轨内顺序段落。
-5. 📜 完全兼容原版 v1/v2 格式（左右手双轨、空行分组）。
-6. ⏱️ `fluid_sequencer` 毫秒级精确事件调度。
-7. 📊 **动态进度条**：实时显示进度百分比、已播/总时长、剩余时间。
-8. 🎮 **交互控制（类似 mpv）**：方向键快进/后退、空格暂停、Enter/P 播放、R 循环、Q 退出，以及 **`9`/`0` 音量调节**。
-9. 🖥️ **全屏 TUI（2.4.0/2.4.1 官方重绘）**：圆角边框 + 真彩色、平滑 1/8 精度进度条、渐变动态 EQ 频率图（频段标签精确对齐）、彩色音量条与状态指示；**真实 tty 支持**（Linux 控制台/串口自动降级 16 色 + ASCII 边框 + 增量重绘防闪烁）；鼠标点进度条跳转、点状态行播放/暂停。
-10. 🖼️ **专辑封面 + 作曲家解析**：音频文件内嵌封面（MP3 APIC / FLAC PICTURE / M4A covr）经 FFmpeg 解码缩放后以半块字符渲染在 TUI 中，并显示作曲家/艺术家/专辑/年代风格等元数据。
-11. 🔇 **峰值限制器（默认 -1dBFS）**：自动防止多音符叠加削波/电流声。
-12. ⚙️ **x86-64 SSE2 汇编音频内核**（`src/audio_dsp.S`）：音量逐样本线性渐变 + 饱和钳制（音量调节/暂停/跳转不爆音）、峰值限制、16 段 Goertzel 频谱（4 路并行）全部由汇编 SIMD 处理。
-13. 📜 **自研彩色分级日志**（`log.rs`）：TRACE/DEBUG/INFO/WARN/ERROR 分级着色 + 毫秒时间戳 + 300 条环形缓冲。
-14. 🛠️ 调试模式：详细输出解析日志与每个 MIDI 事件。
-15. 🐍 配套 Python 脚本：`MIDI → 简谱 TXT` 转换器。
-16. 🧭 无参数启动选择器：浏览乐曲文件、选择 SoundFont（默认电子合成器）与简谱 GM 音色号。
+1. 💯 **纯 Rust** 主体，无任何 Windows 依赖；音频热路径由 C 与手写 x86-64 SSE2 汇编实现。
+2. 🧭 **启动选择器**（无参数运行）：文件浏览、SoundFont 选择、GM 音色号输入；`Q`/`Esc` 取消。
+3. 🎹 用任意 SoundFont 音色演奏自定义简谱 TXT，GM 音色可通过 `--instrument` 选择。
+4. 🎼 **直接播放 MIDI 文件**（`-m` 或 `.mid` 扩展名）：fluidsynth 原生多轨同步 + tempo 变速。
+5. 📄 **TXT v3 格式**：绝对 tick 事件 + 全局 tempo 表；换行/休止/输出顺序不再影响时间，保留原始 MIDI 轨道 ID。
+6. 📜 完全兼容旧格式：v2 多轨 `T` 行、原版 v1 两行一组左右手格式。
+7. ⏱️ `fluid_sequencer` 毫秒级精确事件调度；快进/后退/循环/暂停精确到毫秒。
+8. 📊 **动态进度条**：实时百分比、已播/总时长、剩余时间。
+9. 🎮 **交互控制（类似 mpv）**：方向键快进/后退、空格暂停、R 循环、Q 退出、`9`/`0` 音量、鼠标点击进度条跳转。
+10. 🖥️ **全屏 TUI**：圆角边框 + 真彩色、平滑 1/8 精度进度条、渐变动态 EQ 频谱（频段标签精确对齐）、彩色音量条与状态指示；**真实 tty 支持**（Linux 控制台/串口自动降级 16 色 SGR + ASCII 边框 + 增量重绘，无乱码无闪烁）。
+11. 🖼️ **专辑封面 + 元数据**：内嵌封面（MP3 APIC / FLAC PICTURE / M4A covr）经 FFmpeg 解码缩放，以半块字符渲染，并显示作曲家/艺术家/专辑/年代风格等信息。
+12. ⚡ **WAV 快速路径**（`src/audio_wav.S`）：RIFF 块遍历 + PCM 转换全部汇编实现——普通 WAV 完全不经过 FFmpeg。
+13. ⚙️ **SSE2 汇编音频内核**（`src/audio_dsp.S`、`src/music_asm.S`）：逐样本音量线性渐变 + 饱和钳制（音量调节/暂停/跳转不爆音）、峰值限制、16 段 Goertzel 频谱（4 路并行）。
+14. 🔇 **峰值限制器（默认 -1dBFS）**：自动防止多音符叠加削波/电流声。
+15. 📜 **自研彩色分级日志**（`log.rs`）：TRACE/DEBUG/INFO/WARN/ERROR 分级着色 + 毫秒时间戳 + 300 条环形缓冲。
+16. 🐍 配套纯 Python 转换器：`MIDI → 简谱 TXT`（默认输出 v3）。
 
 ## 快速开始
 
+所有二进制均以 **release 资产**形式分发——请从
+[Releases](https://github.com/FuturePioneer-3/music_rust/releases) 页面下载
+（git 仓库只保留源码）。
+
 ### AppImage（推荐，开箱即用）
 
-从 [Releases](https://github.com/FuturePioneer-3/music_rust/releases) 页面下载 `music_rust-*-x86_64.AppImage`，内置精简 GM 音源，无需任何依赖。
+从最新 release 下载 `music_rust-<版本>-x86_64.AppImage`（及对应 `.sha256`）。
+内置精简 GM 音源，无需任何依赖。
 
 ```bash
-chmod +x music_rust-x86_64.AppImage
-./music_rust-x86_64.AppImage 乐曲.txt     # 播放简谱
-./music_rust-x86_64.AppImage 歌曲.mid     # 播放 MIDI
+chmod +x music_rust-*-x86_64.AppImage
+./music_rust-*-x86_64.AppImage            # 打开启动选择器
+./music_rust-*-x86_64.AppImage 乐曲.txt    # 播放简谱
+./music_rust-*-x86_64.AppImage 歌曲.mid    # 播放 MIDI
 ```
 
 内置 SoundFont 已自动加载；如需指定其它音源：`--soundfont /path/to/xx.sf2`。
 
 ### Arch Linux（pkg.tar.zst）
 
+从最新 release 下载 `music_rust-<版本>-1-x86_64.pkg.tar.zst`，然后：
+
 ```bash
 sudo pacman -U music_rust-3.20-1-x86_64.pkg.tar.zst
 # 包内已包含电子合成器 SoundFont；自动安装 fluidsynth 等运行依赖
 music 乐曲.txt
+music                # 或打开启动选择器
 ```
 
 ### 从源码构建
@@ -78,7 +106,8 @@ cargo build --release
 ./target/release/music 乐曲.txt
 ```
 
-**依赖（运行时）**：MIDI/TXT 需要 `libfluidsynth.so`；WAV/MP3 等音频文件需要 FFmpeg 运行库与 ALSA（`libavformat`、`libavcodec`、`libavutil`、`libswresample`、`libasound`）。AppImage 内置 SoundFont，但音频解码库仍使用系统库。
+**运行依赖**：简谱/MIDI 需要 `libfluidsynth.so` + 任意 SoundFont 文件；
+音频文件需要 FFmpeg 运行库（`libavformat`/`libavcodec`/`libavutil`/`libswresample`）与 ALSA（`libasound`）。
 
 | 发行版 | 安装命令 |
 | ------ | -------- |
@@ -93,23 +122,26 @@ cargo build --release
 ## 使用
 
 ```bash
-# 播放一首简谱 TXT（自动找系统 SoundFont）
-./target/release/music 乐曲.txt
-
-# 无参数打开启动选择器（文件、SoundFont、简谱 GM 音色号）
+# 打开启动选择器（文件、SoundFont、GM 音色号）
 ./target/release/music
+
+# 播放一首简谱 TXT（自动发现 SoundFont）
+./target/release/music 乐曲.txt
 
 # 直接播放 MIDI 文件（fluidsynth 原生多轨+变速，最准确）
 ./target/release/music 歌曲.mid
 ./target/release/music -m 歌曲.mid
 
-# 调试模式（详细日志，无进度条）
+# 播放音频文件（TUI 显示专辑封面与元数据）
+./target/release/music song.flac
+
+# 调试模式（详细日志，不启用 TUI）
 ./target/release/music 乐曲.txt -d
 
 # 指定 SoundFont
 ./target/release/music 乐曲.txt --soundfont /path/to/piano.sf2
 
-# 使用项目根目录的电子合成器 SoundFont，并选择锯齿波主音（GM 81）
+# 使用内置电子合成器 SoundFont，并选择锯齿波主音（GM 81）
 ./target/release/music 乐曲.txt --soundfont ./electronic_synth.sf2 --instrument 81
 
 # 安装 Arch 包后，随包音色会被自动发现
@@ -124,21 +156,21 @@ music 乐曲.txt --instrument 81
 ./target/release/music 乐曲.txt --volume 110
 ```
 
-不带任何参数运行时会打开启动选择器：从当前目录浏览可播放文件，SoundFont
-默认优先使用随程序提供的 `electronic_synth.sf2`，并可设置简谱使用的 GM 音色号
-（0–127）。选择完成后自动进入原有播放 TUI；按 `Q`/`Esc` 可取消并退出。
+**SoundFont 查找顺序**：`--soundfont` 指定路径 → 随包音色
+（`/usr/share/music_rust/soundfonts/electronic_synth.sf2`）→ `./electronic_synth.sf2` →
+常见系统路径（FluidR3、GeneralUser、MS Basic 等）→ `~/.local/share/soundfonts`。
+启动选择器会列出所有找到的候选音源供挑选。
 
-> **两种模式**：传入 `.mid`/`.midi` 文件或使用 `-m` 参数即进入 MIDI 模式，
-> 用 fluidsynth 内置播放器原生处理多轨同步与 tempo 变化（最准确，推荐）。
-> 其余情况解析简谱 TXT。
+**模式判定**：`.mid`/`.midi`（或使用 `-m`）→ MIDI 模式；`.wav`/`.mp3`/`.flac`/`.ogg`/`.opus`/
+`.aac`/`.m4a`/`.wma` → 音乐文件模式；其余文本 → 简谱模式。TUI 标题会明确显示当前模式。
 
 ### 命令行参数
 
 | 参数 | 说明 |
 | ---- | ---- |
 | `-d, --debug` | 详细调试输出（解析 + 每个 MIDI 事件） |
-| `-s, --soundfont <路径>` | 指定 SoundFont 文件 |
-| `-i, --instrument <0-127>` | 指定简谱音色的 GM Program（默认 0；例如 81 为锯齿波主音） |
+| `-s, --soundfont <路径>` | 指定 SoundFont (.sf2/.sf3) 文件 |
+| `-i, --instrument <0-127>` | 简谱音色的 GM Program（默认 0；如 81 = 锯齿波主音） |
 | `-m, --midi <file>` | 直接播放 MIDI 文件（fluidsynth 原生多轨+变速） |
 | `-t, --tempo <ms>` | 覆盖速度（毫秒/四分音符） |
 | `-b, --bpm <n>` | 覆盖速度（BPM） |
@@ -168,17 +200,13 @@ music 乐曲.txt --instrument 81
 | `9` / `0` | **降低 / 增加音量** |
 | `Q` | 退出 |
 
-普通交互终端会自动启用全屏播放界面，并支持鼠标：点击进度条可跳转，点击状态行可暂停或继续。`-d` 调试模式保持原有详细日志输出，不启用播放界面。
+鼠标：点击进度条跳转，点击状态行暂停/继续。
 
-### 音频文件播放
-
-传入 `.wav`、`.mp3`、`.flac`、`.ogg`、`.opus`、`.aac`、`.m4a` 或 `.wma` 文件时，程序自动进入**音乐文件模式**；`.mid`/`.midi` 仍进入 **MIDI 模式**，其它文本文件进入**简谱模式**。TUI 标题会明确显示当前模式。
-
-音频文件模式默认音量为 **80%**，可调范围为 **0%-500%**（0% 静音）。`9` 降低 10%，`0` 增加 10%；`Space` 暂停/继续，`Enter` 或 `P` 播放，方向键和鼠标进度条跳转。音频模式在 TUI 中显示实时动态频率估算值，并在下方渲染内嵌**专辑封面**与**作曲家**等元数据（若有）；MIDI 与简谱模式显示各音轨当前按下的音名，例如 `C4`、`C#4`、`D4`。
-
-> **TXT 模式**（简谱）基于事件动态重排，快进/后退/循环/暂停都精确到毫秒；
-> **MIDI 模式**使用 fluidsynth 原生播放器（`fluid_player_seek` / `set_loop`），同样支持上述按键。
-> 键盘控制仅在 stdin 为终端时启用（管道/重定向输入自动禁用，不影响自动化）。
+> **简谱模式**基于事件动态重排，快进/后退/循环/暂停都精确到毫秒；
+> **MIDI 模式**使用 fluidsynth 原生播放器（`fluid_player_seek` / `set_loop`），按键相同；
+> **音乐文件模式**默认音量 80%，可调范围 0%–500%。
+> 键盘控制仅在 stdin 为终端时启用（管道/重定向自动禁用，不影响自动化）。
+> `-d` 调试模式保持传统日志输出，不启用 TUI。
 
 ## 音频驱动自动探测（防爆音）
 
@@ -203,7 +231,7 @@ music 乐曲.txt --instrument 81
 - 音量调大后的破音/电流声
 - 超出音频满刻度（0dBFS）的失真
 
-限制器特性（2.4.0 起热循环由汇编实现）：
+限制器特性（热循环由汇编实现）：
 - **只压缩不放大**：正常音量段保持原始动态，仅当峰值超过目标电平时自动压下来
 - **平滑增益包络**（快 attack / 慢 release）：压降不爆音，恢复无泵浦感
 - **硬钳制兜底**：任何时刻样本都不会超过目标电平
@@ -216,7 +244,7 @@ music 乐曲.txt --instrument 81
 
 ## TXT v3 格式（推荐）
 
-v3 专门解决旧版“按行推进时间”的歧义。它使用**绝对 tick 音符事件**和一张全局 tempo 表：
+v3 专门解决旧版"按行推进时间"的歧义。它使用**绝对 tick 音符事件**和一张全局 tempo 表：
 换行、休止符数量、轨道输出顺序都不会改变实际时间；MIDI 的每个原始轨道 ID 也会保留。
 
 ```text
@@ -225,8 +253,8 @@ v3 专门解决旧版“按行推进时间”的歧义。它使用**绝对 tick 
 #PPQ 480
 @TEMPO 0 500000       # tick, 每四分音符微秒数（120 BPM）
 @TEMPO 1920 666667    # 从 tick 1920 起切换到约 90 BPM
-@TRACK 0 0 "旋律"
-@NOTE 0 0 480 60 96   # track, 起始 tick, 时长 tick, MIDI 音高, 力度
+@TRACK 0 0 "旋律"     # 原始 MIDI 轨道 ID, MIDI 通道, 轨名
+@NOTE 0 0 480 60 96   # 轨道, 起始 tick, 时长 tick, MIDI 音高, 力度
 @NOTE 0 480 480 62 96
 @TRACK 3 1 "伴奏"
 @NOTE 3 0 960 48 80
@@ -236,10 +264,10 @@ v3 专门解决旧版“按行推进时间”的歧义。它使用**绝对 tick 
 
 - `#PPQ` 是 tick 分辨率，通常等于 MIDI 文件的 division。
 - `@TEMPO` 对所有轨道全局生效，单位是 microseconds per quarter，不使用四舍五入后的 BPM。
-- `@TRACK` 的第一个数字是原始 MIDI 轨道 ID，第二个数字是 MIDI channel。
-- `@NOTE` 使用 MIDI 音高 0–127 和力度 1–127；休止通过绝对时间间隔自然表达。
+- 休止通过绝对时间间隔自然表达。
+- MIDI 音高 0–127，力度 1–127。
 
-MIDI 转换器现在默认生成 v3：
+MIDI 转换器默认生成 v3：
 
 ```bash
 python3 convert/convert.py song.mid -o song.v3.txt
@@ -247,7 +275,7 @@ python3 convert/convert.py song.mid --bpm 90       # 按比例缩放整张 tempo
 python3 convert/convert.py song.mid --track 2,5    # 按原始 MIDI 轨道编号选择
 ```
 
-需要旧格式时使用 `--v2`（可读的 `T` 多轨格式）或 `--legacy`（v1/v2 两行一组）。旧格式仍可由播放器读取。
+需要旧格式时使用 `--v2`（可读的 `T` 多轨格式）或 `--legacy`（v1 两行一组）。旧格式仍可由播放器读取。
 
 ## TXT 格式（v2 兼容）
 
@@ -326,7 +354,7 @@ T 贝斯       | 1,, 0 1,, 0 | 4,, 0 2,, 0 | 3,, 0 6,, 0 | 5,, 0 7,, 0
 ## MIDI → TXT 转换器
 
 ```bash
-python3 convert/convert.py 歌曲.mid              # 默认输出 歌曲.txt
+python3 convert/convert.py 歌曲.mid              # 默认输出 歌曲.txt（v3 格式）
 python3 convert/convert.py 歌曲.mid -o 输出.txt  # 指定输出
 python3 convert/convert.py 歌曲.mid --bpm 100    # 指定速度
 python3 convert/convert.py 歌曲.mid --track 0,1  # 按原始 MIDI 编号转换 0、1 轨
@@ -359,21 +387,16 @@ python3 convert/convert.py 歌曲.mid --legacy     # 输出旧版两行一组格
 ### 动态 BPM（中途变速）
 
 转换器会从所有 MIDI 轨道收集 tempo 事件，并在 v3 文件中写成全局 `@TEMPO tick us_per_quarter` 表；
-播放器按绝对 tick 换算时间，不再依赖每条轨道里的 `#BPM` 行。`--bpm` 会等比例缩放整张 tempo 表。
-
-`--v2` 输出的旧格式仍保留 `#BPM` 兼容行为，但不建议用于包含复杂变速的 MIDI。
+播放器按绝对 tick 换算时间，变速不会在轨道之间漂移。`--bpm` 会等比例缩放整张 tempo 表。
+`--v2` 输出的旧格式仍保留 `#BPM` 兼容行为：
 
 ```
 #BPM 120
-# tempo change @tick2400: 90 BPM (666666us/q)
-
 T Trk
 1 2 3 4          # 120 BPM
 #BPM 90
-5 6 7 1^         # 90 BPM
+5 6 7 1^         # 从此处起 90 BPM
 ```
-
-`#BPM` 指令可出现在**任意位置**（轨内、轨间），作用为**从该点起切换速度**：
 
 | 速度指令 | 说明 |
 | -------- | ---- |
@@ -384,19 +407,20 @@ T Trk
 
 | | 原版 `music_release` | 本项目 `music_rust` |
 | --- | --- | --- |
-| 语言 | C++ | Rust |
+| 语言 | C++ | Rust（+ C / x86-64 汇编音频层） |
 | 平台 | 仅 Windows x64 | Linux（兼容大多数发行版） |
 | 音频后端 | Windows MIDI API (`winmm`) | fluidsynth + SoundFont |
-| 音色 | 系统默认 MIDI 音色 | 钢琴（可换任何 SoundFont） |
+| 音色 | 系统默认 MIDI 音色 | 任意 SoundFont + 可选 GM 音色号 |
 | 音轨 | 最多 2 轨（左右手） | 任意多轨并行 |
 | 调度精度 | 线程 + `clock()` 忙等 | fluidsynth sequencer 毫秒级 |
 | 播放等待 | 忙等 | 事件驱动等待 |
-| 交互控制 | ✗ | ✅（方向键/暂停/循环/退出 + 音量） |
+| 交互控制 | ✗ | ✅（方向键/暂停/循环/退出 + 音量 + 鼠标） |
 | MIDI 直接播放 | ✗ | ✅（`-m`，原生多轨+变速） |
+| 音频文件播放 | ✗ | ✅（WAV/MP3/FLAC/OGG/Opus/AAC/M4A/WMA + 封面） |
 
 ## 调试
 
-`-d` 参数会输出（调试模式下进度条自动隐藏，日志与进度不混排）：
+`-d` 参数会输出（调试模式下不启用 TUI，日志与进度不混排）：
 
 - 解析速度、音轨数量、每轨音符数
 - 前 20 条排程事件
@@ -404,6 +428,14 @@ T Trk
 
 ```bash
 ./target/release/music 1.txt -d 2>&1 | head -40
+```
+
+随 `music` 一起构建的 `selftest` 会通过完整合成/限制器/ALSA 链路播放 C 大调音阶与和弦，
+用来快速验证音频环境：
+
+```bash
+cargo build --release --bin selftest
+./target/release/selftest
 ```
 
 ## 许可证

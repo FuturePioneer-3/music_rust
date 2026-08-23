@@ -2,7 +2,7 @@
 
 # 🎹 music_rust
 
-**MIDI numbered-notation (jianpu) piano player — cross-platform, Linux-first, pure Rust**
+**Terminal music player: jianpu (numbered-notation) scores, MIDI and audio files — Linux-first, Rust core + C/assembly audio layer**
 
 <div>
 
@@ -16,59 +16,86 @@
 <div>
 <a href="https://img.shields.io/github/v/release/FuturePioneer-3/music_rust"><img src="https://img.shields.io/github/v/release/FuturePioneer-3/music_rust?color=76bad9" alt="release"></a>
 <a href="https://img.shields.io/badge/rust-2021-edition-blue.svg"><img src="https://img.shields.io/badge/rust-2021-edition-blue.svg" alt="rust"></a>
-<a href="LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-green.svg" alt="license"></a>
 <a href="https://img.shields.io/github/license/FuturePioneer-3/music_rust"><img src="https://img.shields.io/github/license/FuturePioneer-3/music_rust?color=green" alt="GPLv3"></a>
 </div>
 
 </div>
 
-music_rust is a **music player**: numbered-notation TXT and MIDI use the system **libfluidsynth** piano synthesizer; WAV, MP3, FLAC, OGG, Opus, AAC, and M4A files use the C/FFmpeg decoder and ALSA output path.
+music_rust is a **terminal music player** with three playback engines:
 
-Audio files enter **Music File mode** and are distinct from **MIDI mode** and **Score mode** in the terminal title. Audio file mode defaults to **80%** volume and supports **80%-500%**; `Space` pauses/resumes, `Enter` or `P` plays, and arrow keys or the mouse progress bar seek. The TUI also renders any embedded **album cover** and **composer/artist/album metadata** below the playback area (2.4.0).
+| Mode | Input | Engine |
+| ---- | ----- | ------ |
+| 🎼 **Score mode** | jianpu TXT (v3 / v2 / legacy v1) | system **libfluidsynth** + SoundFont, millisecond-precise sequencer |
+| 🎵 **MIDI mode** | `.mid` / `.midi` | fluidsynth native player (multitrack sync + tempo map, most accurate) |
+| 📁 **Audio file mode** | WAV / MP3 / FLAC / OGG / Opus / AAC / M4A / WMA | C/FFmpeg decoder + ALSA output, album art & metadata rendering |
 
-The original `music_release/` project was built on the Windows API (`winmm.lib`) and Windows-only. This project is fully rewritten in **pure Rust** and talks directly to the system `libfluidsynth` via FFI, supporting most Linux distributions.
+The original `music_release/` project was built on the Windows API (`winmm.lib`) and Windows-only.
+This project is fully rewritten in **Rust** and talks directly to the system `libfluidsynth` via FFI,
+supporting most Linux distributions. Run it with **no arguments** to open an interactive startup
+selector; run it with a file to start playing immediately.
+
+## What's New in v3.20
+
+- 🧭 **No-argument startup selector**: browse playable files from the current directory, pick a
+  SoundFont, and choose the GM program (0–127) used for jianpu playback — then hand off to the TUI.
+- 🎛️ **Bundled `electronic_synth.sf2` synthesizer SoundFont**: shipped in the project root and in
+  the Arch package (`/usr/share/music_rust/soundfonts/`), auto-discovered at startup.
+- 🎚️ New `-i, --instrument <0-127>` option selects any GM program for score playback
+  (default 0 = Acoustic Grand Piano; e.g. 81 = Saw Lead).
+- 🔧 Fixed volume-state vs. synth-gain mismatch in MIDI/TXT modes and limiter-envelope loudness lag.
+- 🔧 Fixed audio-file pause/seek thread deadlock, EOF race and TUI progress-bar row misalignment.
+
+Recent milestones: **v3.1** added an all-assembly WAV fast path (plain WAV files never touch
+FFmpeg); **v3.0** introduced the absolute-tick TXT v3 format with a global tempo map.
 
 ## Key Features
 
-> **v2.4.1**: native **real-tty support** — detects pty vs real Linux console/serial and, on a real tty, initializes a basic CJK environment (`ESC % G` UTF-8 mode + best-effort `setfont` with a CJK font), probes the console font via kernel ioctls (KDFONTOP/GIO_UNIMAP) and degrades gracefully: 16-color SGR (no truecolor), ASCII borders/progress/arrows, English labels, luminance-char artwork; plus **incremental redraws** (only changed lines) to eliminate garbling and flicker on slow consoles.
-
-1. 💯 **Pure Rust**, no Windows dependencies.
-2. 🎹 Plays custom jianpu TXT files with a piano timbre via the system SoundFont.
-3. 🎼 **Direct MIDI playback** (`-m` or `.mid` extension): fluidsynth-native multitrack sync + tempo changes, most accurate.
-4. 🧵 **Improved multitrack TXT format**: any number of parallel tracks + sequential sections within a track.
-5. 📜 Fully compatible with the legacy v1/v2 format (left/right hand dual tracks, blank-line grouping).
-6. ⏱️ `fluid_sequencer` millisecond-precise event scheduling.
-7. 📊 **Dynamic progress bar**: real-time percentage, elapsed/total time, remaining time.
-8. 🎮 **Interactive controls (mpv-like)**: arrow-key seek, space pause, R loop, Q quit — and **`9`/`0` volume adjustment**.
-9. 🖥️ **Fullscreen TUI (official 2.4.0/2.4.1 redraw)**: rounded border + truecolor palette, smooth 1/8-step progress bar, gradient dynamic-EQ spectrum with precisely aligned band labels, colored volume bar and status indicators; **real-tty support** (Linux console/serial auto-degrades to 16-color SGR + ASCII borders + incremental redraws to avoid flicker); click the progress bar to seek, click the status row to pause/resume.
-10. 🖼️ **Album art + composer parsing**: embedded covers (ID3 APIC / FLAC PICTURE / M4A covr) are decoded and scaled via FFmpeg and rendered with half-block characters in the TUI, alongside composer/artist/album/date-genre metadata.
-11. 🔇 **Peak limiter (default -1dBFS)**: prevents clipping/buzz from overlapping notes.
-12. ⚙️ **x86-64 SSE2 assembly audio core** (`src/audio_dsp.S`): per-sample linear volume ramping + saturated clamping (no pops on volume/pause/seek), peak limiting and the 16-band Goertzel spectrum (4 lanes in parallel) all run as SIMD assembly.
-13. 📜 **Custom colored leveled logger** (`log.rs`): TRACE/DEBUG/INFO/WARN/ERROR levels with colors, millisecond timestamps and a 300-entry ring buffer.
-14. 🛠️ Debug mode: detailed parse log + every MIDI event.
-15. 🐍 Companion Python script: `MIDI → jianpu TXT` converter.
-16. 🧭 No-argument startup selector for browsing files, choosing a SoundFont (electronic synth by default), and setting the jianpu GM program.
+1. 💯 **Pure Rust** core, no Windows dependencies; audio hot paths in C and hand-written x86-64 SSE2 assembly.
+2. 🧭 **Startup selector** (no arguments): file browser, SoundFont picker, GM program input; `Q`/`Esc` cancels.
+3. 🎹 Plays custom jianpu TXT with any SoundFont timbre; GM instrument selectable via `--instrument`.
+4. 🎼 **Direct MIDI playback** (`-m` or `.mid` extension): fluidsynth-native multitrack sync + tempo changes.
+5. 📄 **TXT v3 format**: absolute tick events + one global tempo map; line breaks/rests/order never shift timing, original MIDI track IDs preserved.
+6. 📜 Fully compatible with legacy formats: v2 multi-track `T` lines and the original v1 two-line left/right-hand groups.
+7. ⏱️ `fluid_sequencer` millisecond-precise event scheduling; seek/loop/pause exact to the millisecond.
+8. 📊 **Dynamic progress bar**: percentage, elapsed/total time, remaining time.
+9. 🎮 **Interactive controls (mpv-like)**: arrow-key seek, space pause, R loop, Q quit, `9`/`0` volume, mouse click on the progress bar.
+10. 🖥️ **Fullscreen TUI**: rounded borders + truecolor palette, smooth 1/8-step progress bar, gradient dynamic-EQ spectrum with aligned band labels, colored volume bar and status indicators; **real-tty support** (Linux console/serial auto-degrades to 16-color SGR + ASCII borders + incremental redraws, no flicker).
+11. 🖼️ **Album art + metadata**: embedded covers (ID3 APIC / FLAC PICTURE / M4A covr) decoded and scaled via FFmpeg, rendered with half-block characters alongside composer/artist/album/date-genre info.
+12. ⚡ **WAV fast path** (`src/audio_wav.S`): RIFF chunk walk + PCM conversion in assembly — plain WAV files bypass FFmpeg entirely.
+13. ⚙️ **SSE2 assembly audio core** (`src/audio_dsp.S`, `src/music_asm.S`): per-sample volume ramping + saturated clamping (no pops on volume/pause/seek), peak limiting and the 16-band Goertzel spectrum (4 lanes in parallel).
+14. 🔇 **Peak limiter (default -1dBFS)**: prevents clipping/buzz from overlapping notes.
+15. 📜 **Custom colored leveled logger** (`log.rs`): TRACE/DEBUG/INFO/WARN/ERROR with colors, millisecond timestamps and a 300-entry ring buffer.
+16. 🐍 Companion pure-Python converter: `MIDI → jianpu TXT` (v3 by default).
 
 ## Quick Start
 
+All binaries are distributed as **release assets** — download them from the
+[Releases](https://github.com/FuturePioneer-3/music_rust/releases) page
+(the git repository contains source only).
+
 ### AppImage (recommended, works out of the box)
 
-Download `music_rust-*-x86_64.AppImage` from the [Releases](https://github.com/FuturePioneer-3/music_rust/releases) page. It bundles a compact GM SoundFont, no dependencies required.
+Download `music_rust-<version>-x86_64.AppImage` (and its `.sha256`) from the latest release.
+It bundles a compact GM SoundFont, no dependencies required.
 
 ```bash
-chmod +x music_rust-x86_64.AppImage
-./music_rust-x86_64.AppImage 乐曲.txt     # play a jianpu TXT
-./music_rust-x86_64.AppImage 歌曲.mid     # play a MIDI file
+chmod +x music_rust-*-x86_64.AppImage
+./music_rust-*-x86_64.AppImage            # open the startup selector
+./music_rust-*-x86_64.AppImage 乐曲.txt    # play a jianpu TXT
+./music_rust-*-x86_64.AppImage 歌曲.mid    # play a MIDI file
 ```
 
 The bundled SoundFont is loaded automatically. To use another font: `--soundfont /path/to/xx.sf2`.
 
 ### Arch Linux (pkg.tar.zst)
 
+Download `music_rust-<version>-1-x86_64.pkg.tar.zst` from the latest release, then:
+
 ```bash
 sudo pacman -U music_rust-3.20-1-x86_64.pkg.tar.zst
-# bundles the synthesizer SoundFont and pulls in FluidSynth automatically
+# bundles the electronic-synth SoundFont and pulls in FluidSynth automatically
 music 乐曲.txt
+music                # or open the startup selector
 ```
 
 ### Build from Source
@@ -80,7 +107,9 @@ cargo build --release
 ./target/release/music 乐曲.txt
 ```
 
-**Runtime dependencies**: `libfluidsynth.so` + any SoundFont file.
+**Runtime dependencies**: `libfluidsynth.so` + any SoundFont file for scores/MIDI;
+FFmpeg libraries (`libavformat`/`libavcodec`/`libavutil`/`libswresample`) + ALSA (`libasound`)
+for audio files.
 
 | Distro | Install command |
 | ------ | -------- |
@@ -95,23 +124,26 @@ cargo build --release
 ## Usage
 
 ```bash
-# Play a jianpu TXT (auto-discovers system SoundFont)
-./target/release/music 乐曲.txt
-
-# Open the startup selector with no arguments (file, SoundFont, GM program)
+# Open the startup selector (file, SoundFont, GM program)
 ./target/release/music
+
+# Play a jianpu TXT (auto-discovers a SoundFont)
+./target/release/music 乐曲.txt
 
 # Direct MIDI playback (native multitrack + tempo, most accurate)
 ./target/release/music 歌曲.mid
 ./target/release/music -m 歌曲.mid
 
-# Debug mode (detailed logs, no progress bar)
+# Play an audio file (album art + metadata in the TUI)
+./target/release/music song.flac
+
+# Debug mode (detailed logs, no TUI)
 ./target/release/music 乐曲.txt -d
 
 # Specify a SoundFont
 ./target/release/music 乐曲.txt --soundfont /path/to/piano.sf2
 
-# Use the synthesizer SoundFont in the project root with Saw Lead (GM 81)
+# Use the bundled electronic-synth SoundFont with Saw Lead (GM 81)
 ./target/release/music 乐曲.txt --soundfont ./electronic_synth.sf2 --instrument 81
 
 # After installing the Arch package, the bundled SoundFont is found automatically
@@ -126,22 +158,22 @@ music 乐曲.txt --instrument 81
 ./target/release/music 乐曲.txt --volume 110
 ```
 
-Running without arguments opens a startup selector. It browses playable files from the
-current directory, prefers the bundled `electronic_synth.sf2`, and lets you set the GM
-program used by jianpu TXT playback (0–127). After confirmation it hands off to the
-existing playback TUI; `Q`/`Esc` cancels and exits.
+**SoundFont discovery order**: `--soundfont` path → packaged font
+(`/usr/share/music_rust/soundfonts/electronic_synth.sf2`) → `./electronic_synth.sf2` →
+common system paths (FluidR3, GeneralUser, MS Basic, …) → `~/.local/share/soundfonts`.
+The startup selector lists every candidate it finds and lets you pick one.
 
-> **Two modes**: passing a `.mid`/`.midi` file or using `-m` enters MIDI mode, using
-> fluidsynth's built-in player for native multitrack sync and tempo changes.
-> Everything else parses the jianpu TXT.
+**Mode selection**: `.mid`/`.midi` (or `-m`) → MIDI mode; `.wav`/`.mp3`/`.flac`/`.ogg`/`.opus`/
+`.aac`/`.m4a`/`.wma` → audio file mode; anything else → jianpu score mode. The TUI title shows
+the active mode.
 
 ### Command-line Options
 
 | Option | Description |
 | ---- | ---- |
 | `-d, --debug` | detailed debug output (parse + each MIDI event) |
-| `-s, --soundfont <path>` | specify a SoundFont file |
-| `-i, --instrument <0-127>` | GM Program for jianpu playback (default 0; e.g. 81 is Saw Lead) |
+| `-s, --soundfont <path>` | specify a SoundFont (.sf2/.sf3) file |
+| `-i, --instrument <0-127>` | GM program for jianpu playback (default 0; e.g. 81 = Saw Lead) |
 | `-m, --midi <file>` | direct MIDI playback (native multitrack + tempo) |
 | `-t, --tempo <ms>` | override tempo (ms per quarter note) |
 | `-b, --bpm <n>` | override tempo (BPM) |
@@ -171,9 +203,13 @@ Playback is fully controllable from the keyboard (mpv-like).
 | `9` / `0` | **decrease / increase volume** |
 | `Q` | quit |
 
-> **TXT mode** (jianpu) uses dynamic event rescheduling; seek/rewind/loop/pause are millisecond-precise.
+Mouse: click the progress bar to seek, click the status row to pause/resume.
+
+> **Score mode** (jianpu) uses dynamic event rescheduling; seek/rewind/loop/pause are millisecond-precise.
 > **MIDI mode** uses the fluidsynth native player (`fluid_player_seek` / `set_loop`) with the same keys.
+> **Audio file mode** defaults to 80% volume, adjustable 0%–500%.
 > Keyboard control is only enabled when stdin is a terminal (automatically disabled for pipes/redirection).
+> `-d` debug mode keeps the classic log output and does not open the TUI.
 
 ## Automatic Audio-Driver Detection (Anti-Pop)
 
@@ -198,7 +234,7 @@ The synth output passes through a **real-time peak limiter** (default `-1dBFS`),
 - distortion/buzz when volume is raised
 - distortion above full-scale (0dBFS)
 
-Limiter features (hot loops rewritten in assembly since 2.4.0):
+Limiter features (hot loops in assembly):
 - **compress-only, never boosts**: normal segments keep original dynamics, only peaks above the target are pulled down
 - **smooth gain envelope** (fast attack / slow release): no pop on compression, no pumping on recovery
 - **hard-clamp fallback**: samples never exceed the target level
@@ -218,17 +254,22 @@ Line breaks, rests, and track output order no longer affect timing, and original
 #MUSIC_RUST 3
 #TITLE Example
 #PPQ 480
-@TEMPO 0 500000
-@TEMPO 1920 666667
-@TRACK 0 0 "Melody"
-@NOTE 0 0 480 60 96
+@TEMPO 0 500000       # tick, microseconds per quarter note (120 BPM)
+@TEMPO 1920 666667    # switch to ~90 BPM from tick 1920
+@TRACK 0 0 "Melody"   # original MIDI track ID, MIDI channel, name
+@NOTE 0 0 480 60 96   # track, start tick, duration ticks, MIDI key, velocity
 @NOTE 0 480 480 62 96
 @TRACK 3 1 "Bass"
 @NOTE 3 0 960 48 80
 ```
 
-`@TEMPO` uses exact microseconds per quarter note. `@NOTE` contains track ID, start tick,
-duration tick, MIDI key, and velocity. Silence is represented by the gap between absolute events.
+Field conventions:
+
+- `#PPQ` is the tick resolution, usually equal to the MIDI file's division.
+- `@TEMPO` applies globally to all tracks; exact microseconds per quarter, no rounded BPM.
+- Silence is simply the gap between absolute events.
+- MIDI keys 0–127, velocities 1–127.
+
 The converter emits v3 by default:
 
 ```bash
@@ -317,7 +358,7 @@ The original Windows version's two-line-per-group left/right hand format is stil
 ## MIDI → TXT Converter
 
 ```bash
-python3 convert/convert.py 歌曲.mid              # default output 歌曲.txt
+python3 convert/convert.py 歌曲.mid              # default output 歌曲.txt (v3 format)
 python3 convert/convert.py 歌曲.mid -o 输出.txt  # specify output
 python3 convert/convert.py 歌曲.mid --bpm 100    # specify tempo
 python3 convert/convert.py 歌曲.mid --track 0,1  # select original MIDI tracks 0 and 1
@@ -351,19 +392,15 @@ python3 convert/convert.py 歌曲.mid --legacy     # output legacy two-line form
 
 The converter collects tempo events from all MIDI tracks and writes a global `@TEMPO tick us_per_quarter`
 map in v3. The player converts absolute ticks using that map, so tempo changes cannot drift between tracks.
-`--bpm` scales the complete tempo map. The older `--v2` output retains `#BPM` compatibility behavior.
+`--bpm` scales the complete tempo map. The older `--v2` output retains `#BPM` compatibility behavior:
 
 ```
 #BPM 120
-# tempo change @tick2400: 90 BPM (666666us/q)
-
 T Trk
 1 2 3 4          # 120 BPM
 #BPM 90
-5 6 7 1^         # 90 BPM
+5 6 7 1^         # 90 BPM from here on
 ```
-
-`#BPM` may appear **anywhere** (inside or between tracks) and switches tempo **from that point on**:
 
 | Tempo Directive | Description |
 | -------- | ---- |
@@ -374,19 +411,20 @@ T Trk
 
 | | Original `music_release` | This project `music_rust` |
 | --- | --- | --- |
-| Language | C++ | Rust |
+| Language | C++ | Rust (+ C / x86-64 assembly audio layer) |
 | Platform | Windows x64 only | Linux (most distros) |
 | Audio backend | Windows MIDI API (`winmm`) | fluidsynth + SoundFont |
-| Timbre | system default MIDI timbre | piano (any SoundFont) |
+| Timbre | system default MIDI timbre | any SoundFont + selectable GM program |
 | Tracks | max 2 (left/right hand) | arbitrary multitrack parallel |
 | Scheduling | thread + `clock()` busy-wait | fluidsynth sequencer ms-level |
 | Playback wait | busy-wait | event-driven wait |
-| Interactive control | ✗ | ✅ (arrow keys/pause/loop/quit + volume) |
+| Interactive control | ✗ | ✅ (arrow keys/pause/loop/quit + volume + mouse) |
 | Direct MIDI playback | ✗ | ✅ (`-m`, native multitrack + tempo) |
+| Audio file playback | ✗ | ✅ (WAV/MP3/FLAC/OGG/Opus/AAC/M4A/WMA + covers) |
 
 ## Debugging
 
-The `-d` flag outputs (the progress bar is auto-hidden in debug mode, so logs and progress never mix):
+The `-d` flag outputs (the TUI is replaced by plain logs in debug mode, so logs and progress never mix):
 
 - parse tempo, track count, notes per track
 - the first 20 scheduled events
@@ -394,6 +432,14 @@ The `-d` flag outputs (the progress bar is auto-hidden in debug mode, so logs an
 
 ```bash
 ./target/release/music 1.txt -d 2>&1 | head -40
+```
+
+A `selftest` binary is built alongside `music`; it plays a C-major scale plus a chord through
+the full synth/limiter/ALSA chain — useful for verifying audio setup:
+
+```bash
+cargo build --release --bin selftest
+./target/release/selftest
 ```
 
 ## License
