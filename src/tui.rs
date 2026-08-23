@@ -441,7 +441,20 @@ impl Tui {
         // ---- 自适应布局 ----
         let need_details = details.len().min(4);
         let footer_rows = if h >= 19 { 2 } else { 1 };
-        let fixed = 7 + footer_rows; // 顶框+标题+状态+进度+时间+音量+脚注+底框
+        // 固定主体：顶框 + 标题 + 状态 + 进度 + 时间 + 音量 + 脚注 + 底框。
+        // 顶部头像曾未计入高度预算，音频模式再加封面后会把整帧撑出屏幕并
+        // 触发终端滚屏，导致屏幕上的进度条行落到逻辑“暂停行”的坐标。
+        let core_rows = 7 + footer_rows;
+        let logo_max_w = if inner >= 64 { 18 } else { 12 };
+        let preferred_logo_h = if h >= 18 { 8 } else { 6 };
+        let logo_room = h.saturating_sub(core_rows);
+        let (logo_w, logo_h) = if logo_room >= 2 {
+            art_size(&self.logo, logo_max_w, preferred_logo_h.min(logo_room - 1))
+        } else {
+            (0, 0)
+        };
+        let logo_rows = if logo_h > 0 { logo_h + 1 } else { 0 }; // 图像 + 标签
+        let fixed = core_rows + logo_rows;
         let meta = self.meta.lines();
         let meta_w = if !meta.is_empty() { (inner / 3).clamp(14, 30) } else { 0 };
 
@@ -452,7 +465,7 @@ impl Tui {
         let mut section_rows = 0usize;
         if let Some(img) = &self.art {
             let max_art = ((h.saturating_sub(fixed)) as f64 * 0.45) as usize;
-            let search_max = max_art.clamp(1, 16);
+            let search_max = max_art.min(16);
             for mh in (1..=search_max).rev() {
                 // 并排元数据时：可用宽度 = 内宽 − 元数据列 − 间距，再取 46 列上限；
                 // 屏幕足够宽时封面可到 46 列，而不是被元数据挤到十几列。
@@ -472,8 +485,10 @@ impl Tui {
                     break;
                 }
             }
-        } else if !meta.is_empty() {
-            section_rows = meta.len().min(4);
+        }
+        // 封面放不下时仍可显示元数据，但必须受剩余高度约束。
+        if art_disp.is_none() && !meta.is_empty() {
+            section_rows = meta.len().min(4).min(h.saturating_sub(fixed));
         }
 
         let left = h.saturating_sub(fixed + section_rows);
@@ -495,13 +510,10 @@ impl Tui {
 
         // 启动 logo：始终显示编译进 ELF 的 GitHub 头像，作为界面标识。
         // 采用近方形布局，避免横向横幅挤压主体信息。
-        let logo_max_w = if inner >= 64 { 18 } else { 12 };
-        let logo_max_h = if h >= 18 { 8 } else { 6 };
-        let (logo_w, logo_h) = art_size(&self.logo, logo_max_w, logo_max_h);
         let logo_label = format!("{}  {}", st.tr("GitHub 头像", "GitHub Avatar"), "FuturePioneer-3");
         // 1-based 鼠标坐标：top=1，logo 行随后，logo label/title/status/bar 依次向下排布。
-        self.status_row = (1 + logo_h + 3) as u16;
-        self.bar_row = (1 + logo_h + 4) as u16;
+        self.status_row = (3 + logo_rows) as u16;
+        self.bar_row = (4 + logo_rows) as u16;
         for row in 0..logo_h {
             let logo_body = if st.truecolor {
                 render_art_row(&self.logo, row, logo_w, logo_h)
@@ -511,7 +523,9 @@ impl Tui {
             let line_text = format!("{}{}{}", st.p.col(NamedColor::Magenta), logo_body, RESET);
             frame.push(line(inner, st, &line_text));
         }
-        frame.push(line(inner, st, &format!("{}{}{} {}", st.p.col(NamedColor::Magenta), st.music, RESET, logo_label)));
+        if logo_h > 0 {
+            frame.push(line(inner, st, &format!("{}{}{} {}", st.p.col(NamedColor::Magenta), st.music, RESET, logo_label)));
+        }
 
         // 标题行
         let title_disp = clip_w(&st.safe(&self.title), inner - 2, st.ellipsis);
@@ -634,7 +648,7 @@ impl Tui {
         if let Some((aw, ah)) = art_disp {
             self.render_art_section(&mut frame, inner, aw, ah, art_side, &meta);
         } else if !meta.is_empty() {
-            for (label, value) in meta.iter().take(4) {
+            for (label, value) in meta.iter().take(section_rows) {
                 frame.push(line(inner, st, &format!("{}", meta_text(label, value, inner - 2, st))));
             }
         }
@@ -667,6 +681,7 @@ impl Tui {
             "{}{}{}{}",
             st.p.col(NamedColor::Cyan), st.box_.bl, st.box_.h.repeat(w.saturating_sub(2)), st.box_.br));
 
+        debug_assert!(frame.len() <= h, "TUI frame exceeds terminal height");
         self.emit(&frame);
     }
 
@@ -679,11 +694,7 @@ impl Tui {
         let mut out = String::with_capacity((self.width + 8) * frame.len() + 4096);
         match self.kind {
             OutputKind::Pty => {
-                out.push_str("\x1b[H\x1b[2J");
-                for l in frame {
-                    out.push_str(l);
-                    out.push('\n');
-                }
+                append_pty_frame(&mut out, frame);
             }
             OutputKind::Tty => {
                 if self.prev_lines.is_empty() {
@@ -815,6 +826,18 @@ impl Drop for Tui {
             }
             let _ = io::stdout().flush();
             self.active = false;
+        }
+    }
+}
+
+/// 生成 PTY 全屏帧。最后一行刻意不带换行：若它恰好位于终端底部，
+/// 换行会触发滚屏，使后续 SGR 鼠标坐标整体错位一行。
+fn append_pty_frame(out: &mut String, frame: &[String]) {
+    out.push_str("\x1b[H\x1b[2J");
+    for (i, line) in frame.iter().enumerate() {
+        out.push_str(line);
+        if i + 1 < frame.len() {
+            out.push('\n');
         }
     }
 }
@@ -1068,6 +1091,14 @@ fn terminal_height() -> usize { 24 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_frame_does_not_scroll_after_last_row() {
+        let mut out = String::new();
+        append_pty_frame(&mut out, &["row1".into(), "row2".into()]);
+        assert_eq!(out, "\x1b[H\x1b[2Jrow1\nrow2");
+        assert!(!out.ends_with('\n'));
+    }
 
     #[test]
     fn clip_and_pad_respect_cjk_width() {

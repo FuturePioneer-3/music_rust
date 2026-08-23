@@ -283,6 +283,10 @@ static void *audio_thread(void *opaque) {
             if (p->paused) {
                 pthread_cond_wait(&p->wake, &p->lock);
                 if (p->stop) { pthread_mutex_unlock(&p->lock); break; }
+                // pthread_cond_wait() 返回时仍持有 p->lock。回到循环顶部前
+                // 必须显式解锁，否则下一轮会在同一线程上再次加锁而死锁，
+                // 导致暂停后 play/seek/position 全部卡住。
+                pthread_mutex_unlock(&p->lock);
                 continue;
             }
             int64_t fade_left = p->frames - p->cursor;
@@ -307,6 +311,7 @@ static void *audio_thread(void *opaque) {
                 if (written < 0) { snd_pcm_recover(pcm, (int)written, 1); pthread_mutex_unlock(&p->lock); continue; }
                 if (gen == p->generation && fade_start == p->cursor) p->cursor += written;
                 if (p->stop) { pthread_mutex_unlock(&p->lock); break; }
+                pthread_mutex_unlock(&p->lock);
                 continue; // 回到循环顶部：此时 ramp_gain≈0，转入等待
             }
         }
@@ -324,7 +329,19 @@ static void *audio_thread(void *opaque) {
             continue;
         }
         if (left <= 0) {
-            pthread_mutex_lock(&p->lock); p->finished = 1; p->playing = 0; pthread_mutex_unlock(&p->lock);
+            /*
+             * The snapshot above is taken without holding the mutex while the
+             * PCM device is serviced.  A seek can therefore move the cursor
+             * (and bump generation) after `left` was computed but before this
+             * branch runs.  Do not let that stale end-of-file observation
+             * cancel the newly requested playback position.
+             */
+            pthread_mutex_lock(&p->lock);
+            if (generation == p->generation && start == p->cursor && p->playing) {
+                p->finished = 1;
+                p->playing = 0;
+            }
+            pthread_mutex_unlock(&p->lock);
             continue;
         }
         int64_t count = left > 512 ? 512 : left;
@@ -418,7 +435,21 @@ music_audio *music_audio_open(const char *path, char *error, int error_len) {
 
 int music_audio_play(music_audio *p) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->paused = 0; p->playing = 1; p->finished = 0; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
 int music_audio_pause(music_audio *p) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->paused = 1; p->playing = 0; p->ramp_gain = 0.0f; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
-int music_audio_seek(music_audio *p, int64_t ms) { if (!p) return -1; pthread_mutex_lock(&p->lock); p->cursor = (ms < 0 ? 0 : ms > p->frames * 1000 / p->sample_rate ? p->frames : ms * p->sample_rate / 1000); p->ramp_gain = 0.0f; p->generation++; p->finished = 0; pthread_cond_signal(&p->wake); pthread_mutex_unlock(&p->lock); return 0; }
+int music_audio_seek(music_audio *p, int64_t ms) {
+    if (!p) return -1;
+    pthread_mutex_lock(&p->lock);
+    int was_finished = p->finished;
+    p->cursor = (ms < 0 ? 0 : ms > p->frames * 1000 / p->sample_rate ? p->frames : ms * p->sample_rate / 1000);
+    p->ramp_gain = 0.0f;
+    p->generation++;
+    p->finished = 0;
+    /* A seek made after natural EOF is a new play request.  An explicit
+     * pause remains sticky, matching MIDI/TUI behavior. */
+    if (was_finished && !p->paused && !p->stop) p->playing = 1;
+    pthread_cond_signal(&p->wake);
+    pthread_mutex_unlock(&p->lock);
+    return 0;
+}
 int64_t music_audio_position_ms(music_audio *p) { if (!p) return 0; pthread_mutex_lock(&p->lock); int64_t v = p->cursor * 1000 / p->sample_rate; pthread_mutex_unlock(&p->lock); return v; }
 int64_t music_audio_duration_ms(music_audio *p) { return p ? p->frames * 1000 / p->sample_rate : 0; }
 int music_audio_finished(music_audio *p) { if (!p) return 1; pthread_mutex_lock(&p->lock); int v = p->finished; pthread_mutex_unlock(&p->lock); return v; }

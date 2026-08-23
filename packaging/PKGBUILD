@@ -3,19 +3,21 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 pkgname=music_rust
-pkgver=3.1.0
+pkgver=3.20
 pkgrel=1
 pkgdesc='Cross-platform MIDI and numbered-notation piano player'
 arch=('x86_64')
 url='https://github.com/FuturePioneer-3/music_rust'
 license=('GPL-3.0-or-later')
-depends=('ffmpeg' 'alsa-lib' 'fluidsynth' 'soundfont-fluid')
+depends=('ffmpeg' 'alsa-lib' 'fluidsynth')
 options=('!debug')
 source=('music')
 sha256sums=('SKIP')
 
 package() {
     install -Dm755 "$srcdir/music" "$pkgdir/usr/bin/music"
+    install -Dm644 "$startdir/../electronic_synth.sf2" \
+        "$pkgdir/usr/share/music_rust/soundfonts/electronic_synth.sf2"
     install -Dm644 "$startdir/../README.md" "$pkgdir/usr/share/doc/music_rust/README.md"
     install -Dm644 "$startdir/../LICENSE" "$pkgdir/usr/share/licenses/music_rust/LICENSE"
 }

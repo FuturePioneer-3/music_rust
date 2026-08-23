@@ -21,18 +21,23 @@
 //! 跨平台(主要 Linux) MIDI 简谱播放器。
 //! 读取自定义简谱 TXT（支持多音轨），通过系统 libfluidsynth + SoundFont 演奏钢琴音色。
 //!
-//! 3.1.0：
+//! 3.20：
+//!   - 新增无参数启动选择器，可选择乐曲、SoundFont 与简谱 GM 音色号
+//!   - 修复 MIDI/TXT 音量状态与实际合成增益不一致，以及 limiter 残留包络导致的响度滞后
+//!   - 修复音频文件暂停/跳转线程死锁、EOF 竞态和 TUI 进度条行号错位
 //!   - TUI 全面重绘（圆角边框/真彩色/平滑进度条/渐变 EQ）
 //!   - 音频文件模式解析内嵌专辑封面与作曲家等元数据，渲染在播放区下方
 //!   - 音量缩放、频谱 Goertzel 谐振器、峰值限制器热循环改为独立
 //!     AT&T 语法汇编（src/music_asm.S，非内联，SSE2）
 //!
 //! 用法:
+//!   music                       无参数时进入启动选择界面
 //!   music <乐曲.txt|音频文件> [选项]
 //!
 //! 选项:
 //!   -d, --debug          详细调试输出
 //!   -s, --soundfont <p>  指定 SoundFont (.sf2/.sf3) 路径
+//!   -i, --instrument <n>  简谱音色的 GM Program (0-127，默认 0)
 //!   -m, --midi <file>    直接播放 MIDI 文件（fluidsynth 原生多轨+变速）
 //!   -t, --tempo <ms>     覆盖速度 (ms/四分音符)
 //!   -b, --bpm <n>        覆盖速度 (BPM)
@@ -46,6 +51,7 @@
 
 mod console;
 mod input;
+mod launcher;
 mod audio_file;
 mod log;
 mod parser;
@@ -59,17 +65,20 @@ use log::{debug, error, info};
 use parser::{parse_file, print_first_events, print_score_summary};
 use synth::SynthPlayer;
 
-/// 展示版本号（对外发布名 v3.1；Cargo 使用完整 semver 3.1.0）
-pub const VERSION: &str = "3.1";
+/// 展示版本号（与 Cargo/Arch 包保持一致）
+pub const VERSION: &str = "3.20";
 
 fn print_usage() {
     println!("music_rust —— 钢琴演奏器 v{}", VERSION);
     println!();
-    println!("用法: music <乐曲.txt|MIDI文件> [选项]");
+    println!("用法:");
+    println!("  music                       无参数时打开启动选择器");
+    println!("  music <乐曲.txt|MIDI文件> [选项]");
     println!();
     println!("选项:");
     println!("  -d, --debug           详细调试输出");
     println!("  -s, --soundfont <p>   指定 SoundFont (.sf2/.sf3) 路径");
+    println!("  -i, --instrument <n>  简谱音色的 GM Program (0-127，默认 0)");
     println!("  -m, --midi <file>     直接播放 MIDI 文件（fluidsynth 原生多轨+变速）");
     println!("  -t, --tempo <ms>      覆盖速度 (ms/四分音符)");
     println!("  -b, --bpm <n>         覆盖速度 (BPM)");
@@ -102,6 +111,7 @@ struct Args {
     file: Option<String>,
     debug: bool,
     soundfont: Option<String>,
+    instrument: u8,
     tempo: Option<u32>,
     volume: u32,
     limit_db: f32,
@@ -114,6 +124,7 @@ fn parse_args() -> Result<Args, String> {
         file: None,
         debug: false,
         soundfont: None,
+        instrument: 0,
         tempo: None,
         volume: 80,
         limit_db: -1.0,
@@ -129,6 +140,16 @@ fn parse_args() -> Result<Args, String> {
             "-s" | "--soundfont" => {
                 let v = args.next().ok_or("--soundfont 需要一个参数")?;
                 out.soundfont = Some(v);
+            }
+            "-i" | "--instrument" => {
+                let v = args.next().ok_or("--instrument 需要一个参数 (0-127)")?;
+                let program: u16 = v
+                    .parse()
+                    .map_err(|_| "音色编号需为 0-127 的整数")?;
+                if program > 127 {
+                    return Err("音色编号超出范围 (0-127)".into());
+                }
+                out.instrument = program as u8;
             }
             "-m" | "--midi" => {
                 let v = args.next().ok_or("--midi 需要一个参数")?;
@@ -181,7 +202,10 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
-    let args = match parse_args() {
+    // 只有完全不带命令行参数时才进入启动选择器。这样 `music --debug`
+    // 之类的“带参数但漏了文件”仍保持原有的参数错误提示，不会意外进入交互界面。
+    let no_cli_args = std::env::args_os().len() == 1;
+    let mut args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("参数错误: {}", e);
@@ -191,6 +215,23 @@ fn main() {
     };
 
     log::init(args.debug);
+
+    // 启动选择器是一次性的独立备用屏；返回时已经恢复终端，后续仍沿用
+    // 原有的音频 / MIDI / 简谱分流和播放 TUI，不让选择状态混入主 TUI。
+    if no_cli_args {
+        match launcher::select_startup() {
+            Ok(Some(selection)) => {
+                args.file = Some(selection.file);
+                args.soundfont = selection.soundfont;
+                args.instrument = selection.instrument;
+            }
+            Ok(None) => return,
+            Err(e) => {
+                error(format!("启动选择界面失败: {}", e));
+                exit(1);
+            }
+        }
+    }
 
     let file = match &args.file {
         Some(f) => f.clone(),
@@ -275,10 +316,11 @@ fn main() {
     };
     player.set_volume_percent(args.volume);
 
-    // 设置每个音轨的乐器（钢琴 GM Program 0）
+    // 设置每个音轨的乐器（默认钢琴 GM Program 0，可由 --instrument 覆盖）
     for track in &score.tracks {
-        player.set_instrument(track.channel as i32, 0);
+        player.set_instrument(track.channel as i32, args.instrument);
     }
+    info(format!("简谱音色: GM Program {}", args.instrument));
 
     // 收集全部事件（已按 at_ms 排序）
     let mut events: Vec<parser::ScheduledNote> = Vec::new();

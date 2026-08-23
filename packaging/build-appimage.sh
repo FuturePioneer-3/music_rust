@@ -3,7 +3,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 version=$(awk -F '"' '/^version = / { print $2; exit }' "$root/Cargo.toml")
-version=${version%.0}   # 3.1.0 → 3.1（对外发布名）
+version=${version%.0}   # Cargo 使用完整 semver，发布文件名使用简化版本号
 # 模板：取目录中版本号最大的现有 AppImage（排除当前版本自身）
 template=$(ls -1 "$root"/music_rust-*-x86_64.AppImage 2>/dev/null | grep -Fv -- "-${version}-" | sort -V | tail -1)
 output="$root/music_rust-${version}-x86_64.AppImage"

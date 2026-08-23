@@ -20,7 +20,7 @@
 //!
 //! 直接通过 `extern "C"` 调用系统 libfluidsynth（libfluidsynth.so.x）。
 //! 支持大多数 Linux 发行版：只要安装了 fluidsynth 运行时库即可。
-//! SoundFont (.sf2/.sf3) 会依次尝试：用户指定路径 → 常见系统路径 → 用户目录。
+//! SoundFont (.sf2/.sf3) 会依次尝试：用户指定路径 → 随包音源 → 常见系统路径 → 用户目录。
 //!
 //! 注：本模块同时被 selftest 通过 `#[path]` 复用，因此部分方法在不同 crate
 //! 中可能被标记为 dead_code，这里统一允许。
@@ -30,6 +30,7 @@
 use std::ffi::{c_char, c_int, c_short, c_uint, c_void, CString};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::log::{debug, info, warn};
 
@@ -79,6 +80,25 @@ type audio_func_t = unsafe extern "C" fn(
 
 const FLUID_OK: c_int = 0;
 const FLUID_FAILED: c_int = -1;
+
+/// 用户界面音量是相对于合成器基准增益的线性倍率。
+///
+/// FluidSynth 的 `synth.gain` 是一个内部增益参数；这里保持项目原有的
+/// 约定（100% = 1.0），不要把它和 FluidSynth 的默认配置值 0.2 混用。
+/// 这样 MIDI/TXT 与音频文件模式的 0%-500% 音量语义一致。
+const DEFAULT_VOLUME_SCALE: f32 = 0.8;
+const MAX_VOLUME_SCALE: f32 = 5.0;
+const MAX_VOLUME_PERCENT: u32 = 500;
+
+#[inline]
+fn volume_scale_from_percent(percent: u32) -> f32 {
+    percent.min(MAX_VOLUME_PERCENT) as f32 / 100.0
+}
+
+#[inline]
+fn volume_percent_from_scale(scale: f32) -> u32 {
+    (scale.clamp(0.0, MAX_VOLUME_SCALE) * 100.0).round() as u32
+}
 
 // ---------------------------------------------------------------------------
 // 音频限制器 (Limiter)
@@ -177,6 +197,32 @@ static mut LIMITER: LimiterState = LimiterState {
 
 static mut LIMITER_SYNTH: *mut fluid_synth_t = std::ptr::null_mut();
 
+/// 音量变化后请求音频线程丢弃旧的 limiter 包络。
+///
+/// limiter 的 release 很慢（用来避免泵浦），如果用户从大音量调小，
+/// 旧包络会让后续数秒的输出继续被压低，造成 UI 音量与实际响度不符。
+/// 主线程只递增这个原子计数，音频回调独占修改 LIMITER，避免跨线程
+/// 直接写 `static mut` 的数据竞争。
+static LIMITER_RESET_REVISION: AtomicU32 = AtomicU32::new(0);
+static mut LIMITER_RESET_SEEN: u32 = 0;
+
+#[inline]
+fn request_limiter_reset() {
+    LIMITER_RESET_REVISION.fetch_add(1, Ordering::Release);
+}
+
+#[inline]
+fn reset_limiter_if_requested(
+    revision: u32,
+    seen: &mut u32,
+    limiter: &mut LimiterState,
+) {
+    if revision != *seen {
+        limiter.current_gain = 1.0;
+        *seen = revision;
+    }
+}
+
 /// 音频回调：渲染 + 限制
 unsafe extern "C" fn audio_render_callback(
     _data: *mut c_void,
@@ -190,13 +236,37 @@ unsafe extern "C" fn audio_render_callback(
     if synth.is_null() {
         return FLUID_FAILED;
     }
-    // 渲染音频到 out[]
-    let ret = fluid_synth_process(synth, len, nfx, fx, nout, out);
+    // 渲染音频到 out[]。普通音频驱动通常不给回调提供 fx 缓冲区
+    // （nfx == 0）；FluidSynth 文档要求此时用 dry 输出作为 effect
+    // 缓冲别名，否则内置混响/合唱可能被丢弃，造成 MIDI/TXT 与预期响度
+    // 不一致。常见输出是立体声，4 个 effect 槽按声道循环别名即可。
+    let mut fx_alias = [std::ptr::null_mut(); 4];
+    let ret = if nfx == 0 && nout > 0 && !out.is_null() {
+        for i in 0..fx_alias.len() {
+            fx_alias[i] = *out.add(i % nout as usize);
+        }
+        fluid_synth_process(
+            synth,
+            len,
+            fx_alias.len() as c_int,
+            fx_alias.as_mut_ptr(),
+            nout,
+            out,
+        )
+    } else {
+        fluid_synth_process(synth, len, nfx, fx, nout, out)
+    };
     if ret != FLUID_OK {
         return ret;
     }
-    // 对每个输出通道应用限制器
+    // 音量改变后不要沿用上一个音量的慢释放包络，否则实际响度会滞后
+    // UI 数值数秒。LIMITER 只由音频回调线程写入，主线程通过原子版本号
+    // 通知，避免直接跨线程访问 static mut。
     let l = &mut *(&raw mut LIMITER);
+    let revision = LIMITER_RESET_REVISION.load(Ordering::Acquire);
+    let seen = &mut *(&raw mut LIMITER_RESET_SEEN);
+    reset_limiter_if_requested(revision, seen, l);
+    // 对每个输出通道应用限制器
     for ch in 0..nout {
         let buf = *out.add(ch as usize);
         if !buf.is_null() {
@@ -237,6 +307,7 @@ extern "C" {
     fn fluid_synth_program_change(synth: *mut fluid_synth_t, chan: c_int, program: c_int) -> c_int;
     fn fluid_synth_cc(synth: *mut fluid_synth_t, chan: c_int, ctrl: c_int, val: c_int) -> c_int;
     fn fluid_synth_all_notes_off(synth: *mut fluid_synth_t, chan: c_int) -> c_int;
+    fn fluid_synth_all_sounds_off(synth: *mut fluid_synth_t, chan: c_int) -> c_int;
     fn fluid_synth_set_gain(synth: *mut fluid_synth_t, gain: f32);
     #[allow(dead_code)]
     fn fluid_synth_get_gain(synth: *mut fluid_synth_t) -> f32;
@@ -300,6 +371,10 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 const SF2_CANDIDATES: &[&str] = &[
+    // Arch 包随程序安装的电子合成器音源
+    "/usr/share/music_rust/soundfonts/electronic_synth.sf2",
+    // 项目根目录中的可选电子合成器音源（从项目目录启动时自动发现）
+    "electronic_synth.sf2",
     "/usr/share/soundfonts/FluidR3_GM.sf2",
     "/usr/share/soundfonts/FluidR3_GS.sf2",
     "/usr/share/soundfonts/FluidR3_GM.sf3",
@@ -394,6 +469,80 @@ pub fn find_soundfont(explicit: Option<&str>) -> Option<String> {
     }
 
     None
+}
+
+/// 返回当前系统中可供选择的 SoundFont 文件。
+///
+/// 顺序与自动加载保持一致：随包/项目自带的电子合成器音源优先，
+/// 然后是系统音源和用户音源。该函数只负责枚举，不输出日志，方便
+/// 启动选择界面时安全地扫描而不污染终端画面。
+pub fn available_soundfonts() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    // 候选表里的 `electronic_synth.sf2` 与当前目录扫描得到的
+    // `./electronic_synth.sf2` 可能指向同一个文件；按规范化路径去重，
+    // 避免启动选择器显示两个相同音源。
+    let same_file = |a: &str, b: &str| {
+        a == b
+            || match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+    };
+    let mut add = |path: String| {
+        if !out.iter().any(|p| same_file(p, &path)) {
+            out.push(path);
+        }
+    };
+
+    for candidate in SF2_CANDIDATES {
+        let path = Path::new(candidate);
+        if path.is_file() {
+            add(candidate.to_string());
+        }
+    }
+
+    // 当前目录是最常见的“临时音源”放置位置；自动加载候选中只列了
+    // 默认电子合成器，因此这里补充同目录下的其它 .sf2/.sf3 文件。
+    if let Ok(entries) = std::fs::read_dir(".") {
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_soundfont_path(p))
+            .collect();
+        paths.sort();
+        for path in paths {
+            add(path.to_string_lossy().into_owned());
+        }
+    }
+
+    for dir in user_sf_dirs() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut paths: Vec<_> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| is_soundfont_path(p))
+                .collect();
+            paths.sort();
+            for path in paths {
+                add(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    out
+}
+
+/// 判断路径是否看起来像 SoundFont 文件。
+fn is_soundfont_path(path: &Path) -> bool {
+    path.is_file()
+        && matches!(
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("sf2" | "sf3")
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -496,9 +645,10 @@ impl SynthPlayer {
         }
         info(format!("SoundFont 加载成功 (id={}): {}", sfont_id, sf));
 
-        // 设置合成器增益（默认 0.2 太弱，提升到 1.0 让输出达到正常响度，
-        // 峰值交给限制器兜底，保证不削波）
-        unsafe { fluid_synth_set_gain(synth, 1.0) };
+        // 设置合成器增益。项目把 100% 定义为 FluidSynth gain=1.0；
+        // 必须和下面的 `SynthPlayer.gain` 同时初始化，否则启动瞬间会
+        // 显示 80% 但实际仍是 100%。峰值交给限制器兜底，保证不削波。
+        unsafe { fluid_synth_set_gain(synth, DEFAULT_VOLUME_SCALE) };
 
         // 所有通道默认钢琴 (GM Program 0)
         unsafe { fluid_synth_program_reset(synth) };
@@ -517,6 +667,7 @@ impl SynthPlayer {
             LIMITER_SYNTH = synth;
             LIMITER = LimiterState::new(limit_db); // 峰值限制到 limit_db dBFS
         }
+        request_limiter_reset();
         let audio_driver = unsafe { new_fluid_audio_driver2(settings, audio_render_callback, std::ptr::null_mut()) };
         if audio_driver.is_null() {
             unsafe {
@@ -568,7 +719,7 @@ impl SynthPlayer {
             sfont_id: inner.sfont_id,
             soundfont: inner.soundfont,
             tempo_ms,
-            gain: 0.8,
+            gain: DEFAULT_VOLUME_SCALE,
             freed: false,
         })
     }
@@ -576,14 +727,19 @@ impl SynthPlayer {
     /// 调整音量（合成器增益），步进 ±0.1，范围 0%-500%。
     pub fn adjust_volume(&mut self, delta: f32) -> f32 {
         let mut g = self.gain + delta;
+        // 交互步进按百分比工作；先量化到 1% 再送入 FluidSynth，避免
+        // 0.8 - 0.1 - 0.1 之类的二进制浮点累积让实际增益落在 0.6
+        // 附近、而 UI 显示/音频模式使用的是精确的 60%。
+        g = (g * 100.0).round() / 100.0;
         if g < 0.0 {
             g = 0.0;
         }
-        if g > 5.0 {
-            g = 5.0;
+        if g > MAX_VOLUME_SCALE {
+            g = MAX_VOLUME_SCALE;
         }
         self.gain = g;
         unsafe { fluid_synth_set_gain(self.synth, g) };
+        request_limiter_reset();
         debug(format!("音量: {:.0}%", g * 100.0));
         g
     }
@@ -591,13 +747,14 @@ impl SynthPlayer {
     /// 当前音量百分比
     #[allow(dead_code)]
     pub fn volume(&self) -> u32 {
-        (self.gain * 100.0) as u32
+        volume_percent_from_scale(self.gain)
     }
 
     /// 设置绝对音量百分比，范围 0%-500%。
     pub fn set_volume_percent(&mut self, percent: u32) {
-        self.gain = percent.clamp(0, 500) as f32 / 100.0;
+        self.gain = volume_scale_from_percent(percent);
         unsafe { fluid_synth_set_gain(self.synth, self.gain) };
+        request_limiter_reset();
     }
 
     /// 调度一个音符事件到绝对时间点（毫秒）。
@@ -641,6 +798,26 @@ impl SynthPlayer {
     pub fn clear_schedule(&self) {
         unsafe {
             fluid_sequencer_remove_events(self.sequencer, -1, -1, -1);
+        }
+    }
+
+    /// 立即清除所有正在发声的合成器音符。
+    ///
+    /// 清理 sequencer 只会移除尚未执行的事件，已经送入 synth 的
+    /// note-on（尤其是带 sustain 的音符）仍可能继续发声。因此暂停、
+    /// 跳转和退出时都要同时清理事件队列与 synth 当前声音。
+    pub fn silence(&self) {
+        // 跳转/暂停后下一段音频不应继承旧播放头的 limiter 包络。
+        request_limiter_reset();
+        unsafe {
+            for ch in 0..16 {
+                // all_sounds_off 是硬静音，保证暂停/拖动后不会留下释放尾音；
+                // all_notes_off 和 sustain 复位则清理 MIDI 通道状态。
+                fluid_synth_all_sounds_off(self.synth, ch);
+                fluid_synth_all_notes_off(self.synth, ch);
+                fluid_synth_cc(self.synth, ch, 64, 0);  // sustain pedal off
+                fluid_synth_cc(self.synth, ch, 123, 0); // all notes off (CC)
+            }
         }
     }
 
@@ -729,6 +906,10 @@ impl SynthPlayer {
         let mut prog = crate::progress::Progress::new(show_progress && tui.is_none());
         let mut last_bpm: i32 = 0;
         let mut paused = false;
+        // FluidSynth 将 stop() 定义为暂停，但 seek() 是异步的；暂停时
+        // 只在这里保存目标 tick，不调用 seek，避免拖动进度条重新启动
+        // player。恢复时再一次性应用目标 tick。
+        let mut paused_tick: Option<i32> = None;
         let mut looping = false;
         let mut quit = false;
 
@@ -746,21 +927,41 @@ impl SynthPlayer {
                         }
                         crate::input::Control::Pause => {
                             if !paused {
+                                paused_tick = Some(unsafe { fluid_player_get_current_tick(player) }.max(0));
                                 unsafe { fluid_player_stop(player) };
+                                self.silence();
                                 info("暂停".to_string());
                                 prog.finish();
                                 paused = true;
                             } else {
-                                unsafe { fluid_player_play(player) };
-                                info("继续".to_string());
-                                paused = false;
+                                let target = paused_tick.take()
+                                    .unwrap_or_else(|| unsafe { fluid_player_get_current_tick(player) }.max(0));
+                                self.silence();
+                                unsafe { fluid_player_seek(player, target) };
+                                let ret = unsafe { fluid_player_play(player) };
+                                if ret == FLUID_OK {
+                                    info("继续".to_string());
+                                    paused = false;
+                                } else {
+                                    paused_tick = Some(target);
+                                    warn("MIDI 播放器恢复失败，仍保持暂停".to_string());
+                                }
                             }
                         }
                         crate::input::Control::Play => {
                             if paused {
-                                unsafe { fluid_player_play(player) };
-                                info("播放".to_string());
-                                paused = false;
+                                let target = paused_tick.take()
+                                    .unwrap_or_else(|| unsafe { fluid_player_get_current_tick(player) }.max(0));
+                                self.silence();
+                                unsafe { fluid_player_seek(player, target) };
+                                let ret = unsafe { fluid_player_play(player) };
+                                if ret == FLUID_OK {
+                                    info("播放".to_string());
+                                    paused = false;
+                                } else {
+                                    paused_tick = Some(target);
+                                    warn("MIDI 播放器恢复失败，仍保持暂停".to_string());
+                                }
                             }
                         }
                         crate::input::Control::Loop => {
@@ -780,11 +981,32 @@ impl SynthPlayer {
                                 -1
                             };
                             let ticks = ticks_per_second(player) * s as i32 * sign;
-                            seek_relative(player, ticks);
+                            if paused {
+                                let cur = paused_tick
+                                    .unwrap_or_else(|| unsafe { fluid_player_get_current_tick(player) }.max(0));
+                                let total = unsafe { fluid_player_get_total_ticks(player) }.max(0);
+                                let target = cur.saturating_add(ticks).clamp(0, total);
+                                paused_tick = Some(target);
+                                // 暂停状态只更新逻辑播放头，绝不调用
+                                // fluid_player_seek（该操作可能触发异步播放）。
+                                self.silence();
+                            } else {
+                                self.silence();
+                                seek_relative(player, ticks);
+                            }
                             info(format!("跳转 {}s", sign as i32 * s as i32));
                         }
                         crate::input::Control::SeekPercent(p) => {
-                            seek_percent(player, p);
+                            if paused {
+                                let total = unsafe { fluid_player_get_total_ticks(player) }.max(0);
+                                let target = ((total as f64 * p.clamp(0.0, 1.0)).round() as i32)
+                                    .clamp(0, total);
+                                paused_tick = Some(target);
+                                self.silence();
+                            } else {
+                                self.silence();
+                                seek_percent(player, p);
+                            }
                             info(format!("跳转到 {}%", (p * 100.0) as i32));
                         }
                         crate::input::Control::VolumeDown => {
@@ -798,14 +1020,41 @@ impl SynthPlayer {
                                 let mouse = ui.mouse_control(x, y, paused);
                                 match mouse {
                                     crate::input::Control::Pause if !paused => {
+                                        paused_tick = Some(unsafe { fluid_player_get_current_tick(player) }.max(0));
                                         unsafe { fluid_player_stop(player) };
+                                        self.silence();
                                         paused = true;
+                                        info("暂停".to_string());
+                                        prog.finish();
                                     }
                                     crate::input::Control::Pause => {
-                                        unsafe { fluid_player_play(player) };
-                                        paused = false;
+                                        let target = paused_tick.take()
+                                            .unwrap_or_else(|| unsafe { fluid_player_get_current_tick(player) }.max(0));
+                                        self.silence();
+                                        unsafe { fluid_player_seek(player, target) };
+                                        let ret = unsafe { fluid_player_play(player) };
+                                        if ret == FLUID_OK {
+                                            paused = false;
+                                            info("继续".to_string());
+                                        } else {
+                                            paused_tick = Some(target);
+                                            warn("MIDI 播放器恢复失败，仍保持暂停".to_string());
+                                        }
                                     }
-                                    crate::input::Control::SeekPercent(p) => seek_percent(player, p),
+                                    crate::input::Control::SeekPercent(p) => {
+                                        let total = unsafe { fluid_player_get_total_ticks(player) }.max(0);
+                                        let target = ((total as f64 * p.clamp(0.0, 1.0)).round() as i32)
+                                            .clamp(0, total);
+                                        if paused {
+                                            paused_tick = Some(target);
+                                            self.silence();
+                                        } else {
+                                            self.silence();
+                                            unsafe { fluid_player_seek(player, target) };
+                                        }
+                                        info(format!("跳转到 {}%", (p * 100.0) as i32));
+                                        prog.finish();
+                                    }
                                     _ => {}
                                 }
                             }
@@ -822,10 +1071,15 @@ impl SynthPlayer {
             }
 
             // 进度显示（基于真实经过时间）
+            let current_tick = if paused {
+                paused_tick.unwrap_or_else(|| unsafe { fluid_player_get_current_tick(player) }.max(0))
+            } else {
+                unsafe { fluid_player_get_current_tick(player) }.max(0)
+            };
             if show_progress {
                 let elapsed_ms = std::time::Instant::now();
                 // 用 tick 计算更准确（暂停时 tick 不前进）
-                let ct = unsafe { fluid_player_get_current_tick(player) };
+                let ct = current_tick;
                 let tt = unsafe { fluid_player_get_total_ticks(player) };
                 if tt > 0 {
                     let pct = (ct as f64 / tt as f64).clamp(0.0, 1.0);
@@ -839,7 +1093,7 @@ impl SynthPlayer {
                 }
             }
             if let Some(ui) = &mut tui {
-                let ct = unsafe { fluid_player_get_current_tick(player) }.max(0) as u64;
+                let ct = current_tick as u64;
                 let tt = unsafe { fluid_player_get_total_ticks(player) }.max(1) as u64;
                 let notes = active_midi_notes(&display.events, ct);
                 ui.draw(
@@ -858,6 +1112,7 @@ impl SynthPlayer {
                 if !paused {
                     if looping {
                         // set_loop 模式下 DONE 表示循环已结束？这里手动继续
+                        paused_tick = None;
                         unsafe { fluid_player_play(player) };
                         continue;
                     } else {
@@ -874,6 +1129,11 @@ impl SynthPlayer {
         prog.finish();
         drop(tui);
 
+        // stop/join 先于 delete，避免用户按 Q 时后台 MIDI 线程仍访问
+        // 已释放的 player；同时清除所有可能残留的合成器声音。
+        unsafe { fluid_player_stop(player); }
+        unsafe { fluid_player_join(player); }
+        self.silence();
         unsafe { delete_fluid_player(player) };
         info("MIDI 播放完成".to_string());
         Ok(())
@@ -930,6 +1190,31 @@ impl SynthPlayer {
         ) -> u32 {
             player.clear_schedule();
             let base = player.now_ms(); // 当前绝对 tick（毫秒）
+
+            // 暂停/跳转会主动清掉 synth 中的发声。若播放头落在一个
+            // 长音符中，恢复时需要在新的基准 tick 重新补发 note-on，
+            // 否则只会收到后续 note-off，听感上像音符被截断。
+            let mut active: BTreeMap<(u8, u8), Vec<u8>> = BTreeMap::new();
+            for ev in events {
+                if ev.at_ms as i64 >= playhead {
+                    break;
+                }
+                let key = (ev.channel, ev.key);
+                if ev.on {
+                    active.entry(key).or_default().push(ev.vel);
+                } else if let Some(velocities) = active.get_mut(&key) {
+                    velocities.pop();
+                    if velocities.is_empty() {
+                        active.remove(&key);
+                    }
+                }
+            }
+            for ((channel, key), velocities) in active {
+                for vel in velocities {
+                    player.schedule_note(channel as i32, key, vel, base, true);
+                }
+            }
+
             for ev in events {
                 // 只排未来事件：at_ms >= playhead
                 if ev.at_ms as i64 >= playhead {
@@ -954,25 +1239,31 @@ impl SynthPlayer {
                         break;
                     }
                     crate::input::Control::Pause => {
-                        paused = !paused;
                         if paused {
-                            // 记录暂停时的位置
+                            // 恢复：先确保旧音符已静音，再从播放头重排。
+                            self.silence();
+                            anchor_tick = schedule_from(self, events, playhead);
+                            paused = false;
+                            info("继续".to_string());
+                        } else {
+                            // 记录暂停时的位置，移除未来事件并立即清掉
+                            // 已经送进 synth 的音符（含 sustain 音符）。
                             let now = self.now_ms();
-                            playhead = playhead + now as i64 - anchor_tick as i64;
+                            playhead = (playhead + now as i64 - anchor_tick as i64)
+                                .clamp(0, total_ms as i64);
                             anchor_tick = now;
                             self.clear_schedule();
+                            self.silence();
+                            paused = true;
                             info("暂停".to_string());
                             prog.finish();
-                        } else {
-                            // 恢复：从记录的位置重排
-                            anchor_tick = schedule_from(self, events, playhead);
-                            info("继续".to_string());
                         }
                     }
                     crate::input::Control::Play => {
                         if paused {
-                            paused = false;
+                            self.silence();
                             anchor_tick = schedule_from(self, events, playhead);
+                            paused = false;
                             info("播放".to_string());
                         }
                     }
@@ -1000,7 +1291,15 @@ impl SynthPlayer {
                         };
                         let target = (cur + delta).clamp(0, total_ms as i64);
                         playhead = target;
-                        anchor_tick = schedule_from(self, events, playhead);
+                        self.clear_schedule();
+                        self.silence();
+                        anchor_tick = if paused {
+                            // 暂停时只移动播放头，绝不重新排程；否则
+                            // sequencer 会在暂停状态下继续触发音符。
+                            self.now_ms()
+                        } else {
+                            schedule_from(self, events, playhead)
+                        };
                         info(format!("跳转至 {:.1}s", playhead as f64 / 1000.0));
                         prog.finish();
                     }
@@ -1008,7 +1307,13 @@ impl SynthPlayer {
                         let target = ((total_ms as f64 * p.clamp(0.0, 1.0)).round() as i64)
                             .clamp(0, total_ms as i64);
                         playhead = target;
-                        anchor_tick = schedule_from(self, events, playhead);
+                        self.clear_schedule();
+                        self.silence();
+                        anchor_tick = if paused {
+                            self.now_ms()
+                        } else {
+                            schedule_from(self, events, playhead)
+                        };
                         info(format!("跳转至 {}%", (p * 100.0) as i32));
                         prog.finish();
                     }
@@ -1022,23 +1327,41 @@ impl SynthPlayer {
                         if let Some(ui) = &tui {
                             match ui.mouse_control(x, y, paused) {
                                 crate::input::Control::Pause => {
-                                    paused = !paused;
                                     if paused {
+                                        self.silence();
+                                        anchor_tick = schedule_from(self, events, playhead);
+                                        paused = false;
+                                        info("继续".to_string());
+                                    } else {
                                         let now = self.now_ms();
-                                        playhead += now as i64 - anchor_tick as i64;
+                                        playhead = (playhead + now as i64 - anchor_tick as i64)
+                                            .clamp(0, total_ms as i64);
                                         anchor_tick = now;
                                         self.clear_schedule();
-                                    } else {
-                                        anchor_tick = schedule_from(self, events, playhead);
+                                        self.silence();
+                                        paused = true;
+                                        info("暂停".to_string());
+                                        prog.finish();
                                     }
                                 }
                                 crate::input::Control::SeekPercent(p) => {
-                                    playhead = (total_ms as f64 * p).round() as i64;
-                                    anchor_tick = schedule_from(self, events, playhead);
+                                    playhead = (total_ms as f64 * p.clamp(0.0, 1.0)).round()
+                                        .clamp(0.0, total_ms as f64) as i64;
+                                    self.clear_schedule();
+                                    self.silence();
+                                    anchor_tick = if paused {
+                                        self.now_ms()
+                                    } else {
+                                        schedule_from(self, events, playhead)
+                                    };
+                                    info(format!("跳转至 {}%", (p * 100.0) as i32));
+                                    prog.finish();
                                 }
                                 crate::input::Control::Play => {
-                                    paused = false;
+                                    self.silence();
                                     anchor_tick = schedule_from(self, events, playhead);
+                                    paused = false;
+                                    info("播放".to_string());
                                 }
                                 _ => {}
                             }
@@ -1094,6 +1417,7 @@ impl SynthPlayer {
             if cur >= total_ms as i64 {
                 if looping {
                     playhead = 0;
+                    self.silence();
                     anchor_tick = schedule_from(self, events, 0);
                     info("循环播放：从头开始".to_string());
                     prog.finish();
@@ -1106,6 +1430,10 @@ impl SynthPlayer {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
+        // 无论是用户退出还是自然结束，都不要把最后一个音符/踏板
+        // 状态留在共享的 synth 中。
+        self.clear_schedule();
+        self.silence();
         input.stop();
         prog.finish();
         drop(tui);
@@ -1138,9 +1466,8 @@ impl SynthPlayer {
             return;
         }
         info("关闭音频引擎 ...".to_string());
-        for ch in 0..16 {
-            unsafe { fluid_synth_all_notes_off(self.synth, ch) };
-        }
+        self.clear_schedule();
+        self.silence();
         unsafe {
             delete_fluid_sequencer(self.sequencer);
             delete_fluid_audio_driver(self.audio_driver);
@@ -1377,6 +1704,52 @@ mod display_tests {
     fn midi_empty_tracks_use_x_placeholder() {
         let active = BTreeMap::new();
         assert_eq!(midi_tracks_text(&active, &[0, 1], None), vec!["轨道 1: x", "轨道 2: x"]);
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    #[test]
+    fn percent_conversion_matches_audio_mode_range() {
+        assert_eq!(volume_scale_from_percent(0), 0.0);
+        assert!((volume_scale_from_percent(80) - 0.8).abs() < f32::EPSILON);
+        assert!((volume_scale_from_percent(500) - 5.0).abs() < f32::EPSILON);
+        // CLI/API 输入即使越界，也不能让 FluidSynth 收到超过约定范围的增益。
+        assert!((volume_scale_from_percent(u32::MAX) - 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn percent_display_rounds_float_accumulation() {
+        // 反复按 9/0 会产生 0.599999... 之类的 f32 值；显示必须和
+        // 实际设置的 0.6 一致，而不能截断成 59%。
+        let mut scale = DEFAULT_VOLUME_SCALE;
+        for _ in 0..2 {
+            scale = (scale - 0.1).max(0.0);
+        }
+        assert_eq!(volume_percent_from_scale(scale), 60);
+    }
+
+    #[test]
+    fn default_state_is_same_value_sent_to_fluidsynth() {
+        // new() 在创建音频驱动前会把 synth gain 设为 DEFAULT_VOLUME_SCALE；
+        // 这条约束防止 UI 初始值与实际增益再次分叉。
+        assert_eq!(volume_percent_from_scale(DEFAULT_VOLUME_SCALE), 80);
+    }
+
+    #[test]
+    fn limiter_reset_discards_stale_release_gain() {
+        let mut limiter = LimiterState::new(-1.0);
+        limiter.current_gain = 0.23;
+        let mut seen = 4;
+        reset_limiter_if_requested(5, &mut seen, &mut limiter);
+        assert_eq!(seen, 5);
+        assert_eq!(limiter.current_gain, 1.0);
+        // 同一版本不能重复改写音频线程自己的包络状态。
+        limiter.current_gain = 0.61;
+        reset_limiter_if_requested(5, &mut seen, &mut limiter);
+        assert_eq!(limiter.current_gain, 0.61);
     }
 }
 

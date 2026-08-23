@@ -45,6 +45,7 @@ music_rust 是一个**音乐播放器**：简谱 TXT 和 MIDI 使用系统 **lib
 13. 📜 **自研彩色分级日志**（`log.rs`）：TRACE/DEBUG/INFO/WARN/ERROR 分级着色 + 毫秒时间戳 + 300 条环形缓冲。
 14. 🛠️ 调试模式：详细输出解析日志与每个 MIDI 事件。
 15. 🐍 配套 Python 脚本：`MIDI → 简谱 TXT` 转换器。
+16. 🧭 无参数启动选择器：浏览乐曲文件、选择 SoundFont（默认电子合成器）与简谱 GM 音色号。
 
 ## 快速开始
 
@@ -63,8 +64,8 @@ chmod +x music_rust-x86_64.AppImage
 ### Arch Linux（pkg.tar.zst）
 
 ```bash
-sudo pacman -U music_rust-2.42-1-x86_64.pkg.tar.zst
-# 自动安装依赖 fluidsynth + soundfont-fluid
+sudo pacman -U music_rust-3.20-1-x86_64.pkg.tar.zst
+# 包内已包含电子合成器 SoundFont；自动安装 fluidsynth 等运行依赖
 music 乐曲.txt
 ```
 
@@ -95,6 +96,9 @@ cargo build --release
 # 播放一首简谱 TXT（自动找系统 SoundFont）
 ./target/release/music 乐曲.txt
 
+# 无参数打开启动选择器（文件、SoundFont、简谱 GM 音色号）
+./target/release/music
+
 # 直接播放 MIDI 文件（fluidsynth 原生多轨+变速，最准确）
 ./target/release/music 歌曲.mid
 ./target/release/music -m 歌曲.mid
@@ -105,6 +109,12 @@ cargo build --release
 # 指定 SoundFont
 ./target/release/music 乐曲.txt --soundfont /path/to/piano.sf2
 
+# 使用项目根目录的电子合成器 SoundFont，并选择锯齿波主音（GM 81）
+./target/release/music 乐曲.txt --soundfont ./electronic_synth.sf2 --instrument 81
+
+# 安装 Arch 包后，随包音色会被自动发现
+music 乐曲.txt --instrument 81
+
 # 覆盖速度
 ./target/release/music 乐曲.txt --bpm 90
 ./target/release/music 歌曲.mid -b 90
@@ -113,6 +123,10 @@ cargo build --release
 # 音量
 ./target/release/music 乐曲.txt --volume 110
 ```
+
+不带任何参数运行时会打开启动选择器：从当前目录浏览可播放文件，SoundFont
+默认优先使用随程序提供的 `electronic_synth.sf2`，并可设置简谱使用的 GM 音色号
+（0–127）。选择完成后自动进入原有播放 TUI；按 `Q`/`Esc` 可取消并退出。
 
 > **两种模式**：传入 `.mid`/`.midi` 文件或使用 `-m` 参数即进入 MIDI 模式，
 > 用 fluidsynth 内置播放器原生处理多轨同步与 tempo 变化（最准确，推荐）。
@@ -124,6 +138,7 @@ cargo build --release
 | ---- | ---- |
 | `-d, --debug` | 详细调试输出（解析 + 每个 MIDI 事件） |
 | `-s, --soundfont <路径>` | 指定 SoundFont 文件 |
+| `-i, --instrument <0-127>` | 指定简谱音色的 GM Program（默认 0；例如 81 为锯齿波主音） |
 | `-m, --midi <file>` | 直接播放 MIDI 文件（fluidsynth 原生多轨+变速） |
 | `-t, --tempo <ms>` | 覆盖速度（毫秒/四分音符） |
 | `-b, --bpm <n>` | 覆盖速度（BPM） |

@@ -47,6 +47,7 @@ The original `music_release/` project was built on the Windows API (`winmm.lib`)
 13. 📜 **Custom colored leveled logger** (`log.rs`): TRACE/DEBUG/INFO/WARN/ERROR levels with colors, millisecond timestamps and a 300-entry ring buffer.
 14. 🛠️ Debug mode: detailed parse log + every MIDI event.
 15. 🐍 Companion Python script: `MIDI → jianpu TXT` converter.
+16. 🧭 No-argument startup selector for browsing files, choosing a SoundFont (electronic synth by default), and setting the jianpu GM program.
 
 ## Quick Start
 
@@ -65,8 +66,8 @@ The bundled SoundFont is loaded automatically. To use another font: `--soundfont
 ### Arch Linux (pkg.tar.zst)
 
 ```bash
-sudo pacman -U music_rust-2.42-1-x86_64.pkg.tar.zst
-# pulls in fluidsynth + soundfont-fluid automatically
+sudo pacman -U music_rust-3.20-1-x86_64.pkg.tar.zst
+# bundles the synthesizer SoundFont and pulls in FluidSynth automatically
 music 乐曲.txt
 ```
 
@@ -97,6 +98,9 @@ cargo build --release
 # Play a jianpu TXT (auto-discovers system SoundFont)
 ./target/release/music 乐曲.txt
 
+# Open the startup selector with no arguments (file, SoundFont, GM program)
+./target/release/music
+
 # Direct MIDI playback (native multitrack + tempo, most accurate)
 ./target/release/music 歌曲.mid
 ./target/release/music -m 歌曲.mid
@@ -107,6 +111,12 @@ cargo build --release
 # Specify a SoundFont
 ./target/release/music 乐曲.txt --soundfont /path/to/piano.sf2
 
+# Use the synthesizer SoundFont in the project root with Saw Lead (GM 81)
+./target/release/music 乐曲.txt --soundfont ./electronic_synth.sf2 --instrument 81
+
+# After installing the Arch package, the bundled SoundFont is found automatically
+music 乐曲.txt --instrument 81
+
 # Override tempo
 ./target/release/music 乐曲.txt --bpm 90
 ./target/release/music 歌曲.mid -b 90
@@ -115,6 +125,11 @@ cargo build --release
 # Volume
 ./target/release/music 乐曲.txt --volume 110
 ```
+
+Running without arguments opens a startup selector. It browses playable files from the
+current directory, prefers the bundled `electronic_synth.sf2`, and lets you set the GM
+program used by jianpu TXT playback (0–127). After confirmation it hands off to the
+existing playback TUI; `Q`/`Esc` cancels and exits.
 
 > **Two modes**: passing a `.mid`/`.midi` file or using `-m` enters MIDI mode, using
 > fluidsynth's built-in player for native multitrack sync and tempo changes.
@@ -126,6 +141,7 @@ cargo build --release
 | ---- | ---- |
 | `-d, --debug` | detailed debug output (parse + each MIDI event) |
 | `-s, --soundfont <path>` | specify a SoundFont file |
+| `-i, --instrument <0-127>` | GM Program for jianpu playback (default 0; e.g. 81 is Saw Lead) |
 | `-m, --midi <file>` | direct MIDI playback (native multitrack + tempo) |
 | `-t, --tempo <ms>` | override tempo (ms per quarter note) |
 | `-b, --bpm <n>` | override tempo (BPM) |
