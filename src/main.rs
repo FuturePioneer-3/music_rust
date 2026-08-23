@@ -21,8 +21,12 @@
 //! 跨平台(主要 Linux) MIDI 简谱播放器。
 //! 读取自定义简谱 TXT（支持多音轨），通过系统 libfluidsynth + SoundFont 演奏钢琴音色。
 //!
-//! 3.20：
-//!   - 新增无参数启动选择器，可选择乐曲、SoundFont 与简谱 GM 音色号
+//! 3.22：
+//!   - 新增 TXT v3.1：文件可声明初始 SoundFont/GM 音色及最多 24 条按秒切换
+//!   - 播放前严格检查 TXT 要求的全部音色；任一预置缺失即报错退出
+//!   - 新增无参数启动选择器，可选择乐曲、SoundFont 与 MIDI/简谱初始 GM 音色号
+//!   - 无参数启动器可同时加载至多 3 个 SoundFont（任意两个合计 ≤120 MB），并为
+//!     MIDI/TXT 设置至多 24 条按秒切换的 SoundFont / GM 音色规则
 //!   - 修复 MIDI/TXT 音量状态与实际合成增益不一致，以及 limiter 残留包络导致的响度滞后
 //!   - 修复音频文件暂停/跳转线程死锁、EOF 竞态和 TUI 进度条行号错位
 //!   - TUI 全面重绘（圆角边框/真彩色/平滑进度条/渐变 EQ）
@@ -36,11 +40,11 @@
 //!
 //! 选项:
 //!   -d, --debug          详细调试输出
-//!   -s, --soundfont <p>  指定 SoundFont (.sf2/.sf3) 路径
-//!   -i, --instrument <n>  简谱音色的 GM Program (0-127，默认 0)
+//!   -s, --soundfont <p>  指定 SoundFont (.sf2/.sf3) 路径（可重复，最多 3 个）
+//!   -i, --instrument <n>  MIDI/简谱初始 GM Program (0-127)
 //!   -m, --midi <file>    直接播放 MIDI 文件（fluidsynth 原生多轨+变速）
-//!   -t, --tempo <ms>     覆盖速度 (ms/四分音符)
-//!   -b, --bpm <n>        覆盖速度 (BPM)
+//!   -t, --tempo <ms>     覆盖速度 (>0 ms/四分音符)
+//!   -b, --bpm <n>        覆盖速度 (1-60000 BPM)
 //!   -v, --volume <0-500> 音量（默认 80%）
 //!   -h, --help           帮助
 //!
@@ -63,10 +67,10 @@ use std::process::exit;
 
 use log::{debug, error, info};
 use parser::{parse_file, print_first_events, print_score_summary};
-use synth::SynthPlayer;
+use synth::{find_soundfont, ProgramSwitch, SynthPlayer};
 
 /// 展示版本号（与 Cargo/Arch 包保持一致）
-pub const VERSION: &str = "3.20";
+pub const VERSION: &str = "3.22";
 
 fn print_usage() {
     println!("music_rust —— 钢琴演奏器 v{}", VERSION);
@@ -77,11 +81,11 @@ fn print_usage() {
     println!();
     println!("选项:");
     println!("  -d, --debug           详细调试输出");
-    println!("  -s, --soundfont <p>   指定 SoundFont (.sf2/.sf3) 路径");
-    println!("  -i, --instrument <n>  简谱音色的 GM Program (0-127，默认 0)");
+    println!("  -s, --soundfont <p>   指定 SoundFont (.sf2/.sf3) 路径（可重复，最多 3 个）");
+    println!("  -i, --instrument <n>  MIDI/简谱初始 GM Program (0-127)");
     println!("  -m, --midi <file>     直接播放 MIDI 文件（fluidsynth 原生多轨+变速）");
-    println!("  -t, --tempo <ms>      覆盖速度 (ms/四分音符)");
-    println!("  -b, --bpm <n>         覆盖速度 (BPM)");
+    println!("  -t, --tempo <ms>      覆盖速度 (>0 ms/四分音符)");
+    println!("  -b, --bpm <n>         覆盖速度 (1-60000 BPM)");
     println!("  -v, --volume <0-500>  音量（默认 80%，最大 500%）");
     println!("  -l, --limit <dB>      峰值限制电平 (默认 -1.0 dBFS，防止削波)");
     println!("  -h, --help            帮助");
@@ -110,8 +114,11 @@ fn print_usage() {
 struct Args {
     file: Option<String>,
     debug: bool,
-    soundfont: Option<String>,
+    soundfonts: Vec<String>,
     instrument: u8,
+    /// `-i` 或无参数启动器明确选择了 MIDI/TXT 的初始音色。
+    instrument_selected: bool,
+    program_switches: Vec<ProgramSwitch>,
     tempo: Option<u32>,
     volume: u32,
     limit_db: f32,
@@ -123,8 +130,10 @@ fn parse_args() -> Result<Args, String> {
     let mut out = Args {
         file: None,
         debug: false,
-        soundfont: None,
+        soundfonts: Vec::new(),
         instrument: 0,
+        instrument_selected: false,
+        program_switches: Vec::new(),
         tempo: None,
         volume: 80,
         limit_db: -1.0,
@@ -139,7 +148,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "-s" | "--soundfont" => {
                 let v = args.next().ok_or("--soundfont 需要一个参数")?;
-                out.soundfont = Some(v);
+                out.soundfonts.push(v);
+                if out.soundfonts.len() > synth::MAX_SOUNDFONTS {
+                    return Err(format!("最多指定 {} 个 SoundFont", synth::MAX_SOUNDFONTS));
+                }
             }
             "-i" | "--instrument" => {
                 let v = args.next().ok_or("--instrument 需要一个参数 (0-127)")?;
@@ -150,6 +162,7 @@ fn parse_args() -> Result<Args, String> {
                     return Err("音色编号超出范围 (0-127)".into());
                 }
                 out.instrument = program as u8;
+                out.instrument_selected = true;
             }
             "-m" | "--midi" => {
                 let v = args.next().ok_or("--midi 需要一个参数")?;
@@ -161,13 +174,17 @@ fn parse_args() -> Result<Args, String> {
             }
             "-t" | "--tempo" => {
                 let v = args.next().ok_or("--tempo 需要一个参数")?;
-                out.tempo = Some(v.parse().map_err(|_| "速度需为整数毫秒")?);
+                let tempo: u32 = v.parse().map_err(|_| "速度需为整数毫秒")?;
+                if tempo == 0 {
+                    return Err("速度必须大于 0 毫秒".into());
+                }
+                out.tempo = Some(tempo);
             }
             "-b" | "--bpm" => {
                 let v = args.next().ok_or("--bpm 需要一个参数")?;
                 let bpm: u32 = v.parse().map_err(|_| "BPM 需为整数")?;
-                if bpm == 0 {
-                    return Err("BPM 不能为 0".into());
+                if !(1..=60_000).contains(&bpm) {
+                    return Err("BPM 必须在 1-60000 之间".into());
                 }
                 out.tempo = Some(60_000 / bpm);
             }
@@ -222,8 +239,10 @@ fn main() {
         match launcher::select_startup() {
             Ok(Some(selection)) => {
                 args.file = Some(selection.file);
-                args.soundfont = selection.soundfont;
+                args.soundfonts = selection.soundfonts;
                 args.instrument = selection.instrument;
+                args.instrument_selected = true;
+                args.program_switches = selection.program_switches;
             }
             Ok(None) => return,
             Err(e) => {
@@ -256,10 +275,18 @@ fn main() {
     // 判断是否为 MIDI 文件（-m 参数或 .mid/.midi 扩展名）
     let is_midi = args.midi || is_midi_file(&file);
 
+    let soundfonts = match configured_soundfonts(&args.soundfonts) {
+        Ok(paths) => paths,
+        Err(e) => {
+            error(format!("SoundFont 配置无效: {}", e));
+            exit(1);
+        }
+    };
+
     if is_midi {
         // ---- MIDI 模式：fluidsynth 原生播放器 ----
         // 初始化合成器（tempo_ms 仅占位，MIDI 播放器自主处理速度）
-        let mut player = match SynthPlayer::new(args.soundfont.as_deref(), 500, args.debug, args.limit_db) {
+        let mut player = match SynthPlayer::new_with_soundfonts(&soundfonts, 500, args.debug, args.limit_db) {
             Ok(p) => p,
             Err(e) => {
                 error(format!("音频引擎初始化失败: {}", e));
@@ -278,8 +305,19 @@ fn main() {
         }
 
         let start = std::time::Instant::now();
+        if !args.program_switches.is_empty() {
+            info(format!("MIDI 中途音色切换: {} 条", args.program_switches.len()));
+        }
         // 调试模式禁用进度条；交互控制始终启用（终端可用时）
-        match player.play_midi(&file, bpm_override, !args.debug, true, total_ms) {
+        match player.play_midi(
+            &file,
+            bpm_override,
+            !args.debug,
+            true,
+            total_ms,
+            args.instrument_selected.then_some((0, args.instrument)),
+            &args.program_switches,
+        ) {
             Ok(()) => {
                 info(format!("演奏完成，用时 {:.2}s", start.elapsed().as_secs_f64()));
             }
@@ -306,8 +344,32 @@ fn main() {
     print_score_summary(&score);
     print_first_events(&score, 20);
 
+    // TXT v3.1 的音色计划属于乐谱内容，确保转换后的文件无需再次手工输入
+    // 就能复现；v3.0 及旧格式继续沿用启动选择器/命令行配置。
+    let (initial_soundfont, initial_instrument, program_switches) =
+        if let Some(plan) = &score.program_plan {
+            let switches = plan
+                .switches
+                .iter()
+                .map(|switch_| ProgramSwitch {
+                    at_ms: switch_.at_ms,
+                    soundfont: switch_.soundfont,
+                    instrument: switch_.instrument,
+                })
+                .collect::<Vec<_>>();
+            info(format!(
+                "TXT v3.1 音色计划: 初始 SoundFont #{} / GM Program {}，中途切换 {} 条",
+                plan.initial_soundfont + 1,
+                plan.initial_instrument,
+                switches.len()
+            ));
+            (plan.initial_soundfont, plan.initial_instrument, switches)
+        } else {
+            (0, args.instrument, args.program_switches.clone())
+        };
+
     // 初始化合成器
-    let mut player = match SynthPlayer::new(args.soundfont.as_deref(), score.tempo_ms, args.debug, args.limit_db) {
+    let mut player = match SynthPlayer::new_with_soundfonts(&soundfonts, score.tempo_ms, args.debug, args.limit_db) {
         Ok(p) => p,
         Err(e) => {
             error(format!("音频引擎初始化失败: {}", e));
@@ -316,11 +378,36 @@ fn main() {
     };
     player.set_volume_percent(args.volume);
 
-    // 设置每个音轨的乐器（默认钢琴 GM Program 0，可由 --instrument 覆盖）
-    for track in &score.tracks {
-        player.set_instrument(track.channel as i32, args.instrument);
+    // 定时 program-select 本身是异步事件，不能反馈预置缺失；在进入 TUI
+    // 之前同步验证全部要求，任何缺失都立即关闭引擎并退出。
+    if let Err(err) = player.validate_program_requirements(
+        initial_soundfont,
+        initial_instrument,
+        &program_switches,
+    ) {
+        error(format!("TXT 音色检查失败: {}", err));
+        player.shutdown();
+        exit(1);
     }
-    info(format!("简谱音色: GM Program {}", args.instrument));
+
+    // 设置每个音轨的初始乐器。v3.1 使用文件内要求；旧格式默认 GM 0，
+    // 并可由 --instrument 或无参数启动器覆盖。
+    for track in &score.tracks {
+        if let Err(err) = player.set_soundfont_instrument(
+            track.channel as i32,
+            initial_soundfont,
+            initial_instrument,
+        ) {
+            error(format!("设置简谱音色失败: {}", err));
+            player.shutdown();
+            exit(1);
+        }
+    }
+    info(format!(
+        "简谱初始音色: SoundFont #{} / GM Program {}",
+        initial_soundfont + 1,
+        initial_instrument
+    ));
 
     // 收集全部事件（已按 at_ms 排序）
     let mut events: Vec<parser::ScheduledNote> = Vec::new();
@@ -330,14 +417,28 @@ fn main() {
     events.sort_by(|a, b| {
         a.at_ms
             .cmp(&b.at_ms)
-            .then_with(|| b.on.cmp(&a.on))
+            .then_with(|| a.on.cmp(&b.on))
     });
     info(format!("已收集 {} 个 MIDI 事件", events.len()));
+    if !program_switches.is_empty() {
+        info(format!("简谱中途音色切换: {} 条", program_switches.len()));
+    }
 
     // 开始交互式播放（调试模式禁用进度条）
     info(format!("开始演奏（总时长约 {}s）...", score.total_ms / 1000));
     let start = std::time::Instant::now();
-    player.play_events_interactive(&events, score.total_ms, !args.debug);
+    if let Err(err) = player.play_events_interactive(
+        &events,
+        score.total_ms,
+        !args.debug,
+        initial_soundfont,
+        initial_instrument,
+        &program_switches,
+    ) {
+        error(format!("简谱播放失败: {}", err));
+        player.shutdown();
+        exit(1);
+    }
     let elapsed = start.elapsed();
     info(format!("演奏完成，用时 {:.2}s", elapsed.as_secs_f64()));
 
@@ -349,6 +450,18 @@ fn main() {
 fn is_midi_file(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.ends_with(".mid") || lower.ends_with(".midi")
+}
+
+fn configured_soundfonts(paths: &[String]) -> Result<Vec<String>, String> {
+    let paths = if paths.is_empty() {
+        vec![find_soundfont(None).ok_or_else(|| {
+            "未找到任何 SoundFont (.sf2/.sf3)，请使用 --soundfont 指定路径".to_string()
+        })?]
+    } else {
+        paths.to_vec()
+    };
+    synth::validate_soundfont_paths(&paths)?;
+    Ok(paths)
 }
 
 fn is_audio_file(path: &str) -> bool {
@@ -451,7 +564,7 @@ fn midi_total_ms(path: &str) -> Option<u32> {
     }
     // 读取 header: MThd + len + format + ntrks + division
     let division = u16::from_be_bytes([data[12], data[13]]);
-    if division == 0 {
+    if division == 0 || division & 0x8000 != 0 {
         return None;
     }
     // 遍历轨道，收集 tempo 事件和最大 tick
@@ -488,20 +601,22 @@ fn midi_total_ms(path: &str) -> Option<u32> {
         while pos < end {
             let dt = read_varlen(&data, &mut pos)?;
             tick += dt;
-            let status = *data.get(pos)?;
+            let first = *data.get(pos)?;
             pos += 1;
-            if status < 0x80 {
+            if first < 0x80 {
                 // running status
                 let s = running?;
                 let msg = s & 0xf0;
                 match msg {
-                    0x80 | 0x90 | 0xa0 | 0xb0 | 0xe0 => { pos += 2; }
-                    0xc0 | 0xd0 => { pos += 1; }
+                    // first data byte was already consumed above.
+                    0x80 | 0x90 | 0xa0 | 0xb0 | 0xe0 => { pos += 1; }
+                    0xc0 | 0xd0 => {}
                     _ => {}
                 }
                 max_tick = max_tick.max(tick);
                 continue;
             }
+            let status = first;
             running = Some(status);
             match status {
                 0xff => {

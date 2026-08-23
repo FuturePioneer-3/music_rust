@@ -25,7 +25,7 @@ music_rust is a **terminal music player** with three playback engines:
 
 | Mode | Input | Engine |
 | ---- | ----- | ------ |
-| 🎼 **Score mode** | jianpu TXT (v3 / v2 / legacy v1) | system **libfluidsynth** + SoundFont, millisecond-precise sequencer |
+| 🎼 **Score mode** | jianpu TXT (v3.1 / v3.0 / v2 / legacy v1) | system **libfluidsynth** + SoundFont, millisecond-precise sequencer |
 | 🎵 **MIDI mode** | `.mid` / `.midi` | fluidsynth native player (multitrack sync + tempo map, most accurate) |
 | 📁 **Audio file mode** | WAV / MP3 / FLAC / OGG / Opus / AAC / M4A / WMA | C/FFmpeg decoder + ALSA output, album art & metadata rendering |
 
@@ -34,28 +34,29 @@ This project is fully rewritten in **Rust** and talks directly to the system `li
 supporting most Linux distributions. Run it with **no arguments** to open an interactive startup
 selector; run it with a file to start playing immediately.
 
-## What's New in v3.20
+## What's New in v3.22
 
-- 🧭 **No-argument startup selector**: browse playable files from the current directory, pick a
-  SoundFont, and choose the GM program (0–127) used for jianpu playback — then hand off to the TUI.
-- 🎛️ **Bundled `electronic_synth.sf2` synthesizer SoundFont**: shipped in the project root and in
-  the Arch package (`/usr/share/music_rust/soundfonts/`), auto-discovered at startup.
-- 🎚️ New `-i, --instrument <0-127>` option selects any GM program for score playback
-  (default 0 = Acoustic Grand Piano; e.g. 81 = Saw Lead).
-- 🔧 Fixed volume-state vs. synth-gain mismatch in MIDI/TXT modes and limiter-envelope loudness lag.
-- 🔧 Fixed audio-file pause/seek thread deadlock, EOF race and TUI progress-bar row misalignment.
+- 📄 **TXT v3.1** embeds its initial SoundFont/GM program and up to 24 timed timbre switches in
+  the score, so a converted file carries its complete playback plan.
+- 🛡️ Before playback, Rust verifies every SoundFont number and requested preset. A missing
+  SoundFont or GM preset is reported immediately and playback exits instead of silently substituting it.
+- 🐍 The MIDI converter now emits TXT v3.1 by default and opens an independent curses TUI
+  when run without arguments; its existing CLI remains compatible and adds `--initial-soundfont`,
+  `--instrument`, and repeatable `--switch` options.
+- 🎚️ TXT-embedded switches are global across all TXT channels, remain correct after seeking or
+  looping, and use stable file order when several switches occur at the same millisecond.
 
-Recent milestones: **v3.1** added an all-assembly WAV fast path (plain WAV files never touch
-FFmpeg); **v3.0** introduced the absolute-tick TXT v3 format with a global tempo map.
+Recent milestones: **v3.21** added multi-SoundFont loading and timed MIDI/TXT switching;
+**v3.0** introduced the absolute-tick TXT v3.0 format with a global tempo map.
 
 ## Key Features
 
 1. 💯 **Pure Rust** core, no Windows dependencies; audio hot paths in C and hand-written x86-64 SSE2 assembly.
-2. 🧭 **Startup selector** (no arguments): file browser, SoundFont picker, GM program input; `Q`/`Esc` cancels.
-3. 🎹 Plays custom jianpu TXT with any SoundFont timbre; GM instrument selectable via `--instrument`.
+2. 🧭 **Startup selector** (no arguments): file browser, multi-SoundFont picker, GM program input and timed switch editor; `Q`/`Esc` cancels.
+3. 🎹 Plays custom jianpu TXT and MIDI with any selected SoundFont timbre; timed switches are supported in both modes.
 4. 🎼 **Direct MIDI playback** (`-m` or `.mid` extension): fluidsynth-native multitrack sync + tempo changes.
-5. 📄 **TXT v3 format**: absolute tick events + one global tempo map; line breaks/rests/order never shift timing, original MIDI track IDs preserved.
-6. 📜 Fully compatible with legacy formats: v2 multi-track `T` lines and the original v1 two-line left/right-hand groups.
+5. 📄 **TXT v3.1 format**: v3.0 absolute tick events and global tempo map, plus an embedded initial timbre and timed-switch plan.
+6. 📜 Fully compatible with TXT v3.0, v2 multi-track `T` lines, and the original v1 two-line left/right-hand format.
 7. ⏱️ `fluid_sequencer` millisecond-precise event scheduling; seek/loop/pause exact to the millisecond.
 8. 📊 **Dynamic progress bar**: percentage, elapsed/total time, remaining time.
 9. 🎮 **Interactive controls (mpv-like)**: arrow-key seek, space pause, R loop, Q quit, `9`/`0` volume, mouse click on the progress bar.
@@ -65,7 +66,7 @@ FFmpeg); **v3.0** introduced the absolute-tick TXT v3 format with a global tempo
 13. ⚙️ **SSE2 assembly audio core** (`src/audio_dsp.S`, `src/music_asm.S`): per-sample volume ramping + saturated clamping (no pops on volume/pause/seek), peak limiting and the 16-band Goertzel spectrum (4 lanes in parallel).
 14. 🔇 **Peak limiter (default -1dBFS)**: prevents clipping/buzz from overlapping notes.
 15. 📜 **Custom colored leveled logger** (`log.rs`): TRACE/DEBUG/INFO/WARN/ERROR with colors, millisecond timestamps and a 300-entry ring buffer.
-16. 🐍 Companion pure-Python converter: `MIDI → jianpu TXT` (v3 by default).
+16. 🐍 Companion pure-Python converter: `MIDI → jianpu TXT` (TXT v3.1 by default), with an independent no-argument curses TUI and a compatible CLI.
 
 ## Quick Start
 
@@ -92,11 +93,15 @@ The bundled SoundFont is loaded automatically. To use another font: `--soundfont
 Download `music_rust-<version>-1-x86_64.pkg.tar.zst` from the latest release, then:
 
 ```bash
-sudo pacman -U music_rust-3.20-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-3.22-1-x86_64.pkg.tar.zst
 # bundles the electronic-synth SoundFont and pulls in FluidSynth automatically
 music 乐曲.txt
 music                # or open the startup selector
+music-convert        # open the independent MIDI → TXT converter TUI
 ```
+
+The package installs the converter as `/usr/bin/music-convert`. It uses only the Python standard
+library (including curses); no pip or other third-party Python packages are required.
 
 ### Build from Source
 
@@ -109,7 +114,7 @@ cargo build --release
 
 **Runtime dependencies**: `libfluidsynth.so` + any SoundFont file for scores/MIDI;
 FFmpeg libraries (`libavformat`/`libavcodec`/`libavutil`/`libswresample`) + ALSA (`libasound`)
-for audio files.
+for audio files. The optional converter needs Python 3 but no packages beyond its standard library.
 
 | Distro | Install command |
 | ------ | -------- |
@@ -158,9 +163,18 @@ music 乐曲.txt --instrument 81
 ./target/release/music 乐曲.txt --volume 110
 ```
 
+In the no-argument selector, open **Timed switches** with `Enter`: press `A` to add a rule, enter
+**seconds → SoundFont number (starting at 1) → GM program**, use `Tab`/`Enter` to move between fields,
+then press Right Arrow to save. Up to 24 rules apply to both MIDI and jianpu TXT. In the SoundFont list,
+use `Enter`/Space to check fonts and Right Arrow to confirm; it accepts up to 3 fonts, with each font and every pair totaling no more than 120 MB.
+For a TXT v3.1 score that embeds a timbre plan, the file's plan replaces these launcher rules.
+
 **SoundFont discovery order**: `--soundfont` path → packaged font
 (`/usr/share/music_rust/soundfonts/electronic_synth.sf2`) → `./electronic_synth.sf2` →
 common system paths (FluidR3, GeneralUser, MS Basic, …) → `~/.local/share/soundfonts`.
+Direct MIDI playback keeps the file's per-channel programs unless `--instrument` is supplied.
+Choosing a GM program in the no-argument selector, or explicitly passing `--instrument`, overrides
+all MIDI channels from time zero.
 The startup selector lists every candidate it finds and lets you pick one.
 
 **Mode selection**: `.mid`/`.midi` (or `-m`) → MIDI mode; `.wav`/`.mp3`/`.flac`/`.ogg`/`.opus`/
@@ -172,11 +186,11 @@ the active mode.
 | Option | Description |
 | ---- | ---- |
 | `-d, --debug` | detailed debug output (parse + each MIDI event) |
-| `-s, --soundfont <path>` | specify a SoundFont (.sf2/.sf3) file |
-| `-i, --instrument <0-127>` | GM program for jianpu playback (default 0; e.g. 81 = Saw Lead) |
+| `-s, --soundfont <path>` | specify a SoundFont (.sf2/.sf3) file; repeat up to 3 times (each font and every pair must total ≤120 MB) |
+| `-i, --instrument <0-127>` | override the initial MIDI/score GM program; an embedded TXT v3.1 plan takes precedence (e.g. 81 = Saw Lead) |
 | `-m, --midi <file>` | direct MIDI playback (native multitrack + tempo) |
-| `-t, --tempo <ms>` | override tempo (ms per quarter note) |
-| `-b, --bpm <n>` | override tempo (BPM) |
+| `-t, --tempo <ms>` | override tempo (>0 ms per quarter note) |
+| `-b, --bpm <n>` | override tempo (1–60000 BPM) |
 | `-v, --volume <0-500>` | volume (default 80%; 0% is mute) |
 | `-l, --limit <dB>` | peak limiter level (default `-1.0` dBFS, prevents clipping) |
 | `-h, --help` | help |
@@ -245,15 +259,32 @@ Customize the target with `--limit`, e.g. more conservative `-6 dBFS` or more ag
 ./target/release/music 乐曲.txt --limit -6
 ```
 
-## TXT v3 Format (Recommended)
+## TXT v3.1 Format (Recommended)
 
-v3 replaces the old line-oriented timing model with **absolute tick events** and one global tempo map.
-Line breaks, rests, and track output order no longer affect timing, and original MIDI track IDs are preserved.
+TXT v3.1 extends v3.0's **absolute tick events** and global tempo map with a playback-ready timbre
+plan. Its three new records are written in this form:
 
 ```text
-#MUSIC_RUST 3
+#MUSIC_RUST 3.1
+@INSTRUMENT <1-based SoundFont 1..3> <GM 0..127>
+@SWITCH <nonnegative seconds> <SF number> <GM>
+```
+
+`@INSTRUMENT` selects the initial SoundFont and GM program. `@SWITCH` changes both at the stated
+nonnegative time; decimal seconds are accepted and normalized to milliseconds. A file may contain
+up to 24 `@SWITCH` records. Each switch is global to every TXT channel, and seeking or looping
+reconstructs the selection that should be active at the destination. If several records normalize
+to the same millisecond, their file order is preserved and the last one takes effect.
+
+Complete example:
+
+```text
+#MUSIC_RUST 3.1
 #TITLE Example
 #PPQ 480
+@INSTRUMENT 1 80
+@SWITCH 2.5 1 81
+@SWITCH 5 2 40
 @TEMPO 0 500000       # tick, microseconds per quarter note (120 BPM)
 @TEMPO 1920 666667    # switch to ~90 BPM from tick 1920
 @TRACK 0 0 "Melody"   # original MIDI track ID, MIDI channel, name
@@ -263,23 +294,37 @@ Line breaks, rests, and track output order no longer affect timing, and original
 @NOTE 3 0 960 48 80
 ```
 
-Field conventions:
+Field and playback conventions:
 
-- `#PPQ` is the tick resolution, usually equal to the MIDI file's division.
-- `@TEMPO` applies globally to all tracks; exact microseconds per quarter, no rounded BPM.
-- Silence is simply the gap between absolute events.
-- MIDI keys 0–127, velocities 1–127.
+- SoundFont numbers are 1-based indices into the 1–3 loaded SoundFonts; GM programs are 0–127.
+- If omitted in a v3.1 file, the initial selection is SoundFont 1 / GM 0. Automatic discovery
+  prioritizes the bundled `electronic_synth.sf2` as SoundFont 1, so the default remains the electronic font.
+- A v3.1 file's embedded initial selection and switch plan take precedence over the no-argument
+  launcher's timbre settings and `--instrument`. SoundFont paths are still supplied by discovery,
+  the launcher, or repeated `--soundfont` arguments.
+- Before scheduling any note, Rust checks that every referenced SoundFont is loaded and that every
+  requested GM preset exists in that font. If either is missing, it reports the requirement and exits.
+- `#PPQ` is the tick resolution, usually equal to the MIDI file's division. `@TEMPO` applies globally
+  to all tracks and stores exact microseconds per quarter note; silence is the gap between absolute events.
+- MIDI keys are 0–127 and velocities are 1–127.
 
-The converter emits v3 by default:
+The converter emits TXT v3.1 by default:
 
 ```bash
-python3 convert/convert.py song.mid -o song.v3.txt
+python3 convert/convert.py song.mid -o song.v31.txt
+python3 convert/convert.py song.mid --initial-soundfont 2 --instrument 40
+python3 convert/convert.py song.mid --switch 5:81 --switch 12.5:2:40
 python3 convert/convert.py song.mid --bpm 90       # scale the complete tempo map
 python3 convert/convert.py song.mid --track 2,5    # select original MIDI track IDs
 ```
 
-Use `--v2` for the older readable `T` format or `--legacy` for the original two-line format.
-The player continues to read both older formats.
+In `seconds:program`, the switch uses `--initial-soundfont`; use `seconds:SF:program` to choose a
+different SoundFont. Use `--v2` for the readable `T` format or `--legacy` for the original two-line
+format. Those formats cannot store non-default timbre settings, so the converter rejects their use
+with a non-default `--initial-soundfont`, `--instrument`, or any `--switch`.
+
+TXT v3.0 (`#MUSIC_RUST 3`), v2, and legacy v1 files remain fully supported. v3.0 retains the same
+absolute timing and tempo-map behavior but obtains its timbre plan from the launcher/command line.
 
 ## TXT Format (v2 Compatibility)
 
@@ -357,15 +402,33 @@ The original Windows version's two-line-per-group left/right hand format is stil
 
 ## MIDI → TXT Converter
 
+Run the converter **without arguments** to open its own curses setup screen. This interface is
+separate from the player's startup selector and playback TUI, so it does not alter the main TUI:
+
 ```bash
-python3 convert/convert.py 歌曲.mid              # default output 歌曲.txt (v3 format)
-python3 convert/convert.py 歌曲.mid -o 输出.txt  # specify output
-python3 convert/convert.py 歌曲.mid --bpm 100    # specify tempo
-python3 convert/convert.py 歌曲.mid --track 0,1  # select original MIDI tracks 0 and 1
-python3 convert/convert.py 歌曲.mid              # interactively enter a velocity multiplier
-python3 convert/convert.py 歌曲.mid --velocity-scale 1.25
-python3 convert/convert.py 歌曲.mid --v2       # output readable legacy T format
-python3 convert/convert.py 歌曲.mid --legacy     # output legacy two-line format
+python3 convert/convert.py   # source tree
+music-convert               # installed Arch package
+```
+
+The converter TUI lets you choose the input MIDI file and output TXT path, edit the basic conversion
+options, set the initial SoundFont number and GM program, add/edit up to 24 timed SoundFont/program
+switches, and follow conversion status and the final success/error result in the same screen.
+
+Supplying a MIDI path continues to use the existing non-interactive command line; all previous CLI
+options and scripts remain compatible. The packaged `music-convert` command accepts the same options
+as `python3 convert/convert.py`:
+
+```bash
+music-convert 歌曲.mid              # default output 歌曲.txt (TXT v3.1)
+music-convert 歌曲.mid -o 输出.txt  # specify output
+music-convert 歌曲.mid --bpm 100    # specify tempo
+music-convert 歌曲.mid --track 0,1  # select original MIDI tracks 0 and 1
+music-convert 歌曲.mid --initial-soundfont 2 --instrument 40
+music-convert 歌曲.mid --switch 5:81 --switch 12.5:2:40
+music-convert 歌曲.mid              # interactively enter a velocity multiplier
+music-convert 歌曲.mid --velocity-scale 1.25
+music-convert 歌曲.mid --v2         # output readable legacy T format
+music-convert 歌曲.mid --legacy     # output legacy two-line format
 ```
 
 ### Converter Options
@@ -373,7 +436,7 @@ python3 convert/convert.py 歌曲.mid --legacy     # output legacy two-line form
 | Option | Description |
 | ---- | ---- |
 | `-o, --output` | output file (default same-name `.txt`) |
-| `-b, --bpm` | override tempo |
+| `-b, --bpm` | override tempo (1–60000 BPM) |
 | `--track` | only convert specific tracks (`0,1,2`) |
 | `--quantize <tick>` | quantization step (recommend 30 to remove tiny timing jitter) |
 | `--max-tracks <n>` | max number of tracks |
@@ -382,16 +445,22 @@ python3 convert/convert.py 歌曲.mid --legacy     # output legacy two-line form
 | `--velocity-scale <x>` | multiply MIDI velocity; prompts interactively when omitted |
 | `--keep-empty` | keep empty tracks |
 | `--no-chord` | do not merge chords |
-| `--v2` | output the older readable multitrack T format |
-| `--legacy` | output legacy v1/v2 format |
+| `--initial-soundfont <1..3>` | initial 1-based SoundFont number (default 1) |
+| `--instrument <0..127>` | initial GM program (default 0) |
+| `--switch <seconds:program>` | timed program switch on the initial SoundFont; repeat up to 24 times |
+| `--switch <seconds:SF:program>` | timed SoundFont/program switch; may be mixed and repeated up to 24 times total |
+| `--v2` | output the older readable multitrack T format; accepts only default timbre configuration |
+| `--legacy` | output legacy v1/v2 format; accepts only default timbre configuration |
 
 > The converter is pure Python standard library, no third-party deps, supports standard MIDI (SMF type 0/1/2).
-> In an interactive terminal, omitting `--velocity-scale` prompts for any positive multiplier (for example `0.5`, `1.25`, or `2`). Values are clamped to MIDI 1–127. v3 preserves velocity; v2/legacy notation has no velocity field.
+> In an interactive terminal, omitting `--velocity-scale` prompts for any positive multiplier (for example `0.5`, `1.25`, or `2`). Values are clamped to MIDI 1–127. TXT v3.1 preserves velocity; v2/legacy notation has no velocity field. `--v2` and `--legacy` reject any non-default timbre configuration because those formats cannot represent it.
+> For type-0 and other single-physical-track/multi-channel files, v3.1 splits channels into independent `@TRACK` records instead of folding every note onto the first channel. Without `--drum`, percussion channel 10 (internal ch9) is filtered per event.
+> The converter explicitly rejects SMPTE time-division MIDI; convert it to PPQ first so absolute-tick timing cannot be misinterpreted.
 
 ### Dynamic BPM (Mid-song Tempo Change)
 
 The converter collects tempo events from all MIDI tracks and writes a global `@TEMPO tick us_per_quarter`
-map in v3. The player converts absolute ticks using that map, so tempo changes cannot drift between tracks.
+map in TXT v3.1. The player converts absolute ticks using that map, so tempo changes cannot drift between tracks.
 `--bpm` scales the complete tempo map. The older `--v2` output retains `#BPM` compatibility behavior:
 
 ```

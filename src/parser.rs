@@ -19,7 +19,8 @@
 //! 简谱(TXT)解析器 —— 改进版：支持多音轨
 //!
 //! v3 文件使用 `#MUSIC_RUST 3` 标记、全局 `@TEMPO` 表和绝对 `@NOTE` 事件；
-//! v1/v2 的行式简谱格式仍由下面的兼容解析器处理。
+//! v3.1 在此基础上增加文件内嵌的初始音色与按秒切换规则；v1/v2 的
+//! 行式简谱格式仍由下面的兼容解析器处理。
 //!
 //! ## 格式说明
 //!
@@ -68,13 +69,35 @@ pub struct ScheduledNote {
     pub channel: u8,
 }
 
-/// 一个音轨的所有事件（已排序，note-on 先于同时间 note-off）
+/// 一个音轨的所有事件（已排序，同时间 note-off 先于 note-on）
 #[derive(Debug, Clone, Default)]
 pub struct Track {
     pub name: String,
     pub channel: u8,
     pub events: Vec<ScheduledNote>,
 }
+
+/// TXT v3.1 中的一条定时音色切换。
+///
+/// `soundfont` 在内存中使用 0-based 下标；文本文件中使用更适合人工编辑的
+/// 1-based 编号。音色均指 GM bank 0 的 Program 0--127。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScoreProgramSwitch {
+    pub at_ms: u32,
+    pub soundfont: usize,
+    pub instrument: u8,
+}
+
+/// TXT v3.1 自带的完整音色要求。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreProgramPlan {
+    pub initial_soundfont: usize,
+    pub initial_instrument: u8,
+    pub switches: Vec<ScoreProgramSwitch>,
+}
+
+/// TXT v3.1 与启动选择器保持一致，最多允许 24 条中途切换。
+pub const MAX_SCORE_PROGRAM_SWITCHES: usize = 24;
 
 /// 解析结果
 #[derive(Debug, Default)]
@@ -83,6 +106,8 @@ pub struct Score {
     pub tracks: Vec<Track>,
     pub title: String,
     pub total_ms: u32,
+    /// 仅 TXT v3.1 携带；v3.0/v2/v1 继续使用命令行或启动选择器的设置。
+    pub program_plan: Option<ScoreProgramPlan>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,11 +343,26 @@ pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, Strin
     let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
 
     // v3 使用绝对 tick 和全局 tempo 表，必须在旧版行式解析前单独处理。
-    if lines.iter().any(|l| {
-        let t = l.trim().to_ascii_uppercase();
-        t == "#MUSIC_RUST 3" || t == "#FORMAT 3" || t.starts_with("#MUSIC_RUST 3 ")
-    }) {
-        return parse_v3_format(&lines, force_tempo);
+    // 版本号做完整匹配，避免把未来的 3.10 误当作 3.1。
+    let declared_format = lines.iter().find_map(|line| {
+        let value = line
+            .trim()
+            .trim_start_matches('\u{feff}')
+            .to_ascii_uppercase();
+        value
+            .strip_prefix("#MUSIC_RUST ")
+            .or_else(|| value.strip_prefix("#FORMAT "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+    });
+    if let Some(version) = declared_format {
+        match version.as_str() {
+            "3" | "3.0" => return parse_v3_format(&lines, force_tempo, false),
+            "3.1" => return parse_v3_format(&lines, force_tempo, true),
+            // 旧式行格式曾允许把版本写在注释中，继续交给兼容解析器。
+            "1" | "2" => {}
+            _ => return Err(format!("不支持的 MUSIC_RUST TXT 格式版本: {}", version)),
+        }
     }
 
     let mut tempo_ms = force_tempo.unwrap_or(500);
@@ -395,6 +435,7 @@ pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, Strin
         title,
         tracks: Vec::new(),
         total_ms: 0,
+        program_plan: None,
     };
 
     if has_track_header {
@@ -414,12 +455,13 @@ pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, Strin
     }
     score.total_ms = max_end;
 
-    // 排序事件：同一时刻先发 note-on，再发 note-off，避免音符衔接出现空洞。
+    // 排序事件：同一时刻先发 note-off，再发 note-on。相邻两个同键音符
+    // 若反过来排，新音刚启动就会被前一个音符的 note-off 立即关闭。
     for t in &mut score.tracks {
         t.events.sort_by(|a, b| {
             a.at_ms
                 .cmp(&b.at_ms)
-                .then_with(|| b.on.cmp(&a.on)) // 同时刻 note-on 先于 note-off
+                .then_with(|| a.on.cmp(&b.on))
         });
     }
 
@@ -438,9 +480,20 @@ pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, Strin
 /// @NOTE 0 0 480 60 96   # track id, start tick, duration tick, key, velocity
 /// ```
 ///
+/// v3.1 把首行改为 `#MUSIC_RUST 3.1`，并可增加：
+///
+/// ```text
+/// @INSTRUMENT 1 80      # 初始 SoundFont（1-based）与 GM Program
+/// @SWITCH 12.5 1 81    # 第 12.5 秒切换 SoundFont / GM Program
+/// ```
+///
 /// 音符使用绝对 tick，不依赖空格、换行或简谱时值后缀；tempo 只定义一次，
 /// 对所有音轨全局生效，因此不会出现各轨道变速点错位的问题。
-fn parse_v3_format(lines: &[String], force_tempo: Option<u32>) -> Result<Score, String> {
+fn parse_v3_format(
+    lines: &[String],
+    force_tempo: Option<u32>,
+    is_v31: bool,
+) -> Result<Score, String> {
     #[derive(Clone)]
     struct TrackDef { id: u32, channel: u8, name: String }
     #[derive(Clone, Copy)]
@@ -451,9 +504,82 @@ fn parse_v3_format(lines: &[String], force_tempo: Option<u32>) -> Result<Score, 
     let mut tempos: Vec<(u64, u64)> = Vec::new();
     let mut tracks: Vec<TrackDef> = Vec::new();
     let mut notes: Vec<NoteDef> = Vec::new();
+    let mut initial_program: Option<(usize, u8)> = None;
+    let mut program_switches: Vec<ScoreProgramSwitch> = Vec::new();
+
+    fn parse_soundfont_number(value: Option<&str>, line_no: usize, label: &str) -> Result<usize, String> {
+        let number = value
+            .ok_or_else(|| format!("v3.1 第{}行缺少 {} SoundFont 编号", line_no, label))?
+            .parse::<usize>()
+            .map_err(|_| format!("v3.1 第{}行 SoundFont 编号无效", line_no))?;
+        if !(1..=3).contains(&number) {
+            return Err(format!(
+                "v3.1 第{}行 SoundFont 编号必须是 1-3",
+                line_no
+            ));
+        }
+        Ok(number - 1)
+    }
+
+    fn parse_program(value: Option<&str>, line_no: usize, label: &str) -> Result<u8, String> {
+        let program = value
+            .ok_or_else(|| format!("v3.1 第{}行缺少 {} GM 音色号", line_no, label))?
+            .parse::<u16>()
+            .map_err(|_| format!("v3.1 第{}行 GM 音色号无效", line_no))?;
+        if program > 127 {
+            return Err(format!("v3.1 第{}行 GM 音色号必须是 0-127", line_no));
+        }
+        Ok(program as u8)
+    }
+
+    fn parse_switch_seconds(value: Option<&str>, line_no: usize) -> Result<u32, String> {
+        let raw = value.ok_or_else(|| format!("v3.1 第{}行缺少切换秒数", line_no))?;
+        let raw = raw.strip_prefix('+').unwrap_or(raw);
+        if raw.starts_with('-') {
+            return Err(format!("v3.1 第{}行切换秒数必须是非负数", line_no));
+        }
+        let mut pieces = raw.split('.');
+        let whole_text = pieces.next().unwrap_or("");
+        let fraction = pieces.next().unwrap_or("");
+        if pieces.next().is_some()
+            || (whole_text.is_empty() && fraction.is_empty())
+            || !whole_text.chars().all(|c| c.is_ascii_digit())
+            || !fraction.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(format!("v3.1 第{}行切换秒数无效", line_no));
+        }
+        let whole = if whole_text.is_empty() {
+            0u64
+        } else {
+            whole_text
+                .parse::<u64>()
+                .map_err(|_| format!("v3.1 第{}行切换时间超出范围", line_no))?
+        };
+
+        // 精确量化到毫秒，第四位小数按 ROUND_HALF_UP 四舍五入；这样与
+        // Python 转换器完全一致，也避开接近 u32 上限时的 f64 误差。
+        let mut fraction_ms = 0u64;
+        let mut digits = fraction.bytes();
+        for factor in [100u64, 10, 1] {
+            if let Some(digit) = digits.next() {
+                fraction_ms += (digit - b'0') as u64 * factor;
+            }
+        }
+        if digits.next().is_some_and(|digit| digit >= b'5') {
+            fraction_ms += 1;
+        }
+        let milliseconds = whole
+            .checked_mul(1000)
+            .and_then(|value| value.checked_add(fraction_ms))
+            .ok_or_else(|| format!("v3.1 第{}行切换时间超出范围", line_no))?;
+        if milliseconds > u32::MAX as u64 {
+            return Err(format!("v3.1 第{}行切换时间超出范围", line_no));
+        }
+        Ok(milliseconds as u32)
+    }
 
     for (line_no, raw) in lines.iter().enumerate() {
-        let line = raw.trim();
+        let line = raw.trim().trim_start_matches('\u{feff}');
         if line.is_empty() { continue; }
         if let Some(rest) = line.strip_prefix('#') {
             let rest = rest.trim();
@@ -472,6 +598,48 @@ fn parse_v3_format(lines: &[String], force_tempo: Option<u32>) -> Result<Score, 
         let mut fields = line.split_whitespace();
         let kind = fields.next().unwrap_or("").to_ascii_uppercase();
         match kind.as_str() {
+            "@INSTRUMENT" | "INSTRUMENT" => {
+                if !is_v31 {
+                    return Err(format!(
+                        "v3 第{}行 @INSTRUMENT 仅能用于 #MUSIC_RUST 3.1",
+                        line_no + 1
+                    ));
+                }
+                if initial_program.is_some() {
+                    return Err(format!("v3.1 第{}行重复设置初始音色", line_no + 1));
+                }
+                let soundfont = parse_soundfont_number(fields.next(), line_no + 1, "初始")?;
+                let instrument = parse_program(fields.next(), line_no + 1, "初始")?;
+                if fields.next().is_some_and(|field| !field.starts_with('#')) {
+                    return Err(format!("v3.1 第{}行 @INSTRUMENT 字段过多", line_no + 1));
+                }
+                initial_program = Some((soundfont, instrument));
+            }
+            "@SWITCH" | "SWITCH" => {
+                if !is_v31 {
+                    return Err(format!(
+                        "v3 第{}行 @SWITCH 仅能用于 #MUSIC_RUST 3.1",
+                        line_no + 1
+                    ));
+                }
+                if program_switches.len() >= MAX_SCORE_PROGRAM_SWITCHES {
+                    return Err(format!(
+                        "v3.1 最多允许 {} 条中途音色切换",
+                        MAX_SCORE_PROGRAM_SWITCHES
+                    ));
+                }
+                let at_ms = parse_switch_seconds(fields.next(), line_no + 1)?;
+                let soundfont = parse_soundfont_number(fields.next(), line_no + 1, "切换")?;
+                let instrument = parse_program(fields.next(), line_no + 1, "切换")?;
+                if fields.next().is_some_and(|field| !field.starts_with('#')) {
+                    return Err(format!("v3.1 第{}行 @SWITCH 字段过多", line_no + 1));
+                }
+                program_switches.push(ScoreProgramSwitch {
+                    at_ms,
+                    soundfont,
+                    instrument,
+                });
+            }
             "@TEMPO" | "TEMPO" => {
                 let tick = fields.next().ok_or_else(|| format!("v3 第{}行缺少 tempo tick", line_no + 1))?
                     .parse::<u64>().map_err(|_| format!("v3 第{}行 tempo tick 无效", line_no + 1))?;
@@ -514,6 +682,9 @@ fn parse_v3_format(lines: &[String], force_tempo: Option<u32>) -> Result<Score, 
     }
 
     if tracks.is_empty() { return Err("v3 文件没有 @TRACK".into()); }
+    // 人工编写的文件可以不按时间排列；稳定排序保留相同毫秒的书写顺序，
+    // 因而同一时刻最后一条仍是最终生效音色。
+    program_switches.sort_by_key(|switch_| switch_.at_ms);
     if tempos.is_empty() { tempos.push((0, 500_000)); }
     tempos.sort_by_key(|(tick, _)| *tick);
     // 同一 tick 的 tempo 以后出现者覆盖前者，符合 MIDI 事件顺序。
@@ -568,12 +739,26 @@ fn parse_v3_format(lines: &[String], force_tempo: Option<u32>) -> Result<Score, 
         track.events.push(ScheduledNote { at_ms: end_ms.max(start_ms.saturating_add(1)), key: note.key, vel: note.vel, on: false, channel: track.channel });
     }
     for track in &mut score_tracks {
-        track.events.sort_by(|a, b| a.at_ms.cmp(&b.at_ms).then_with(|| b.on.cmp(&a.on)));
+        track.events.sort_by(|a, b| a.at_ms.cmp(&b.at_ms).then_with(|| a.on.cmp(&b.on)));
     }
     let total_ms = score_tracks.iter().flat_map(|t| t.events.iter()).map(|e| e.at_ms).max().unwrap_or(0);
     let tempo_ms = (target_us / 1000).max(1).min(u32::MAX as u64) as u32;
     info(format!("v3 解析完成：{} 个音轨，{} 个绝对事件", score_tracks.len(), score_tracks.iter().map(|t| t.events.len()).sum::<usize>()));
-    Ok(Score { tempo_ms, tracks: score_tracks, title, total_ms })
+    let program_plan = is_v31.then(|| {
+        let (initial_soundfont, initial_instrument) = initial_program.unwrap_or((0, 0));
+        ScoreProgramPlan {
+            initial_soundfont,
+            initial_instrument,
+            switches: program_switches,
+        }
+    });
+    Ok(Score {
+        tempo_ms,
+        tracks: score_tracks,
+        title,
+        total_ms,
+        program_plan,
+    })
 }
 
 /// 旧版格式：行与行按时间顺序推进；两行一组=左右手同时。
@@ -939,5 +1124,87 @@ mod tests {
         // 原始 120 BPM 被整体压到 240 BPM，变速比例仍保持 1:2。
         assert_eq!(score.tempo_ms, 250);
         assert_eq!(score.total_ms, 750);
+    }
+
+    #[test]
+    fn test_v31_embeds_initial_program_and_stable_timed_switches() {
+        let text = "#MUSIC_RUST 3.1\n#PPQ 480\n@INSTRUMENT 2 81 # initial\n@SWITCH 5.25 2 40 # later\n@SWITCH 1 1 80\n@SWITCH 1.000 3 41\n@TEMPO 0 500000\n@TRACK 0 0 P\n@NOTE 0 0 480 60 96\n";
+        let score = parse_str(text, None).unwrap();
+        let plan = score.program_plan.unwrap();
+        assert_eq!(plan.initial_soundfont, 1);
+        assert_eq!(plan.initial_instrument, 81);
+        assert_eq!(plan.switches.len(), 3);
+        assert_eq!(plan.switches[0].at_ms, 1000);
+        assert_eq!(plan.switches[0].soundfont, 0);
+        assert_eq!(plan.switches[0].instrument, 80);
+        // 相同毫秒保持文件顺序，后写的 GM 41 最终生效。
+        assert_eq!(plan.switches[1].at_ms, 1000);
+        assert_eq!(plan.switches[1].soundfont, 2);
+        assert_eq!(plan.switches[1].instrument, 41);
+        assert_eq!(plan.switches[2].at_ms, 5250);
+    }
+
+    #[test]
+    fn test_v31_defaults_to_first_electronic_soundfont_program_zero() {
+        let text = "#FORMAT 3.1\n#PPQ 480\n@TEMPO 0 500000\n@TRACK 0 0 P\n@NOTE 0 0 480 60 96\n";
+        let score = parse_str(text, None).unwrap();
+        let plan = score.program_plan.unwrap();
+        assert_eq!(plan.initial_soundfont, 0);
+        assert_eq!(plan.initial_instrument, 0);
+        assert!(plan.switches.is_empty());
+    }
+
+    #[test]
+    fn test_v31_switch_seconds_round_exactly_to_u32_milliseconds() {
+        let text = "#MUSIC_RUST 3.1\n@SWITCH .0005 1 1\n@SWITCH 4294967.295 1 2\n@TRACK 0 0 P\n";
+        let score = parse_str(text, None).unwrap();
+        let switches = score.program_plan.unwrap().switches;
+        assert_eq!(switches[0].at_ms, 1);
+        assert_eq!(switches[1].at_ms, u32::MAX);
+
+        let overflow = "#MUSIC_RUST 3.1\n@SWITCH 4294967.2955 1 1\n@TRACK 0 0 P\n";
+        assert!(parse_str(overflow, None)
+            .unwrap_err()
+            .contains("超出范围"));
+    }
+
+    #[test]
+    fn test_v31_adjacent_same_key_retriggers_after_note_off() {
+        let text = "#MUSIC_RUST 3.1\n#PPQ 480\n@TEMPO 0 500000\n@TRACK 0 0 P\n@NOTE 0 0 480 60 96\n@NOTE 0 480 480 60 96\n";
+        let score = parse_str(text, None).unwrap();
+        let boundary: Vec<_> = score.tracks[0]
+            .events
+            .iter()
+            .filter(|event| event.at_ms == 500)
+            .collect();
+        assert_eq!(boundary.len(), 2);
+        assert!(!boundary[0].on, "旧音的 note-off 必须先执行");
+        assert!(boundary[1].on, "新音的 note-on 必须后执行");
+    }
+
+    #[test]
+    fn test_v31_rejects_invalid_or_excess_program_requirements() {
+        let bad_program = "#MUSIC_RUST 3.1\n@INSTRUMENT 1 128\n@TRACK 0 0 P\n";
+        assert!(parse_str(bad_program, None)
+            .unwrap_err()
+            .contains("0-127"));
+
+        let mut too_many = String::from(
+            "#MUSIC_RUST 3.1\n@INSTRUMENT 1 0\n@TEMPO 0 500000\n@TRACK 0 0 P\n",
+        );
+        for index in 0..=MAX_SCORE_PROGRAM_SWITCHES {
+            too_many.push_str(&format!("@SWITCH {} 1 0\n", index));
+        }
+        assert!(parse_str(&too_many, None)
+            .unwrap_err()
+            .contains("最多允许 24 条"));
+
+        let old_v3 = "#MUSIC_RUST 3\n@INSTRUMENT 1 0\n@TRACK 0 0 P\n";
+        assert!(parse_str(old_v3, None)
+            .unwrap_err()
+            .contains("仅能用于 #MUSIC_RUST 3.1"));
+        assert!(parse_str("#MUSIC_RUST 3.2\n", None)
+            .unwrap_err()
+            .contains("不支持"));
     }
 }

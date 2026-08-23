@@ -21,14 +21,15 @@
 MIDI → 简谱TXT 转换器
 music_rust 钢琴演奏器配套工具
 
-将标准 MIDI 文件 (.mid/.midi) 转换为 music_rust v3 绝对事件 TXT。
+将标准 MIDI 文件 (.mid/.midi) 转换为 music_rust v3.1 绝对事件 TXT。
 
 用法:
+    python3 convert.py                         # 打开独立转换界面
     python3 convert.py 输入.mid [-o 输出.txt] [选项]
 
 选项:
     -o, --output <文件>   输出文件 (默认: 输入同名.txt)
-    -b, --bpm <n>        覆盖速度 (BPM)
+    -b, --bpm <n>        覆盖速度 (BPM，1..60000)
     --track <编号...>     只转换指定音轨 (从0开始, 逗号分隔)
     --quantize <tick>    量化粒度 (默认 0=关闭, 建议 30)
     --max-tracks <n>     最多转换多少音轨 (默认全部非打击乐)
@@ -37,6 +38,13 @@ music_rust 钢琴演奏器配套工具
     --velocity-scale <x> 力度倍率；交互终端未指定时会询问 (默认 1.0)
     --keep-empty         保留空白音轨
     --no-chord           不合并和弦 (每个音单独token)
+    --initial-soundfont <1..3>
+                         初始 SoundFont 编号 (默认 1)
+    --instrument <0..127>
+                         初始 GM 音色号 (默认 0)
+    --switch <秒:音色>  在指定时间切换音色，可重复使用
+    --switch <秒:SF:音色>
+                         切换 SoundFont 和音色，最多 24 条
     --v2                 输出旧版可读多音轨 T 格式
     --legacy             输出最旧的 v1/v2 两行一组格式
 
@@ -52,7 +60,10 @@ import math
 import os
 import struct
 import sys
+import textwrap
 from collections import defaultdict
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -72,6 +83,12 @@ MAX_MIDI = 108  # C8
 
 # 用于检测"打击乐通道"的通道号 (GM 规定 ch9 是打击乐)
 PERCUSSION_CHANNEL = 9
+
+# TXT v3.1 音色元数据限制，与 music_rust 播放端保持一致。
+MAX_SOUNDFONTS = 3
+MAX_PROGRAM_SWITCHES = 24
+# Rust 播放时间线的 ProgramSwitch.at_ms 为 u32。
+MAX_SWITCH_MILLISECONDS = (1 << 32) - 1
 
 # ---------------------------------------------------------------------------
 # MIDI 解析器
@@ -132,22 +149,24 @@ def parse_midi(path):
     hlen = struct.unpack('>I', data[4:8])[0]
     if hlen < 6:
         raise MidiError("MThd 长度异常")
+    header_end = 8 + hlen
+    if header_end > len(data):
+        raise MidiError("MThd 头截断")
     fmt, ntrks, division = struct.unpack('>HHH', data[8:14])
 
     # SMF type 0: 单轨; type 1: 多轨同步; type 2: 多轨独立
     if fmt > 2:
         raise MidiError(f"不支持的 SMF 类型: {fmt}")
 
+    if division == 0:
+        raise MidiError("MIDI PPQ 不能为 0")
     if division & 0x8000:
-        # SMPTE 格式 (frames/sec * ticks/frame)
-        fps = -((division >> 8) & 0xff)
-        ticks_per_frame = division & 0xff
-        division = fps * ticks_per_frame
-        # 这种情况 tick 数不可直接用毫秒，这里按保守处理
-        # 实际 SMPTE 中 division 负数表示 (fps 为负值)
-        division = abs(division)
+        # v3.1 当前以 PPQ + tempo map 表达时间，不能无损表示 SMPTE division。
+        # 明确拒绝，避免把二补数帧率字节误当成 PPQ 后生成“看似可播、实际
+        # 时间全错”的 TXT。
+        raise MidiError("暂不支持 SMPTE time-division MIDI；请先转换为 PPQ MIDI")
 
-    pos = 14
+    pos = header_end
     tracks = []
     for _ in range(ntrks):
         if pos + 8 > len(data):
@@ -156,6 +175,8 @@ def parse_midi(path):
             raise MidiError(f"缺少 MTrk 头 (位置 {pos})")
         tlen = struct.unpack('>I', data[pos + 4:pos + 8])[0]
         pos += 8
+        if pos + tlen > len(data):
+            raise MidiError("MIDI 轨道数据截断")
         track_data = data[pos:pos + tlen]
         pos += tlen
         tracks.append(track_data)
@@ -220,28 +241,33 @@ def parse_midi(path):
                     break
                 mtype = tdata[p]
                 p += 1
-                try:
-                    mlen, p = _read_varlen(tdata, p)
-                except Exception:
-                    break
+                mlen, p = _read_varlen(tdata, p)
+                if p + mlen > len(tdata):
+                    raise MidiError(f"轨道{trk_idx} 在 tick {tick} 的 meta 数据截断")
                 meta_data = tdata[p:p + mlen]
                 p += mlen
                 if mtype == 0x03:  # Track name
                     track.name = meta_data.decode('latin-1', errors='replace')
                 elif mtype == 0x51:  # Tempo (us per quarter)
-                    if mlen >= 3:
-                        us = (meta_data[0] << 16) | (meta_data[1] << 8) | meta_data[2]
-                        track.tempo_events.append((tick, us))
+                    if mlen != 3 or len(meta_data) != 3:
+                        raise MidiError(
+                            f"轨道{trk_idx} 在 tick {tick} 的 tempo 元事件长度必须为 3"
+                        )
+                    us = (meta_data[0] << 16) | (meta_data[1] << 8) | meta_data[2]
+                    if us == 0:
+                        raise MidiError(
+                            f"轨道{trk_idx} 在 tick {tick} 的 tempo 值不能为 0"
+                        )
+                    track.tempo_events.append((tick, us))
                 elif mtype == 0x2f:  # End of track
                     break
                 # 其它 meta 忽略
                 running_status = None
             elif msg_type == 0xf0 or msg_type == 0xf7:  # SysEx
                 # SysEx: 读取 varlen 长度
-                try:
-                    slen, p = _read_varlen(tdata, p)
-                except Exception:
-                    slen = 0
+                slen, p = _read_varlen(tdata, p)
+                if p + slen > len(tdata):
+                    raise MidiError(f"轨道{trk_idx} 在 tick {tick} 的 SysEx 数据截断")
                 p += slen
                 # running status 重置
                 running_status = None
@@ -461,8 +487,12 @@ def build_tempo_timeline(tracks):
     收集全部轨道并按 tick 合并可避免丢失变速事件。
     """
     by_tick = {}
-    for track in tracks:
+    for track_index, track in enumerate(tracks):
         for tick, us in track.tempo_events:
+            if not isinstance(us, int) or us <= 0:
+                raise MidiError(
+                    f"音轨 {track_index} 在 tick {tick} 的 tempo 必须是大于 0 的整数"
+                )
             by_tick[tick] = us
     timeline = sorted(by_tick.items())
     # 归一化：确保 tick=0 时有 tempo（无则用默认）
@@ -523,11 +553,10 @@ def convert(midi_path, out_path, opts):
         # 先按原始 MIDI 索引筛选，再做其它过滤；--track 永远引用原始轨道号。
         if opts.track_list is not None and idx not in opts.track_list:
             continue
-        # 过滤打击乐
+        # 过滤打击乐。type-0 MIDI 常把多个通道塞进同一物理轨道；必须逐事件
+        # 去掉 ch9，不能只在整轨“全是打击乐”时才过滤，否则鼓点会混进旋律。
         if not opts.drum:
-            # 检查是否打击乐轨 (大部分音符在 ch9)
-            if t.events and all(ev.channel == PERCUSSION_CHANNEL for ev in t.events):
-                continue
+            t.events = [ev for ev in t.events if ev.channel != PERCUSSION_CHANNEL]
         # 过滤低力度
         if opts.min_vel:
             t.events = [ev for ev in t.events if ev.velocity >= opts.min_vel]
@@ -543,6 +572,7 @@ def convert(midi_path, out_path, opts):
 
     # 按轨转简谱
     lines = []
+    output_track_count = len(out_tracks)
     if opts.legacy:
         legacy_tracks = [(name, events) for _idx, name, events in out_tracks]
         lines.extend([f"#TITLE {os.path.splitext(os.path.basename(midi_path))[0]}", f"#BPM {bpm}", ""])
@@ -554,13 +584,15 @@ def convert(midi_path, out_path, opts):
         for name, events in v2_tracks:
             _convert_track_to_lines(name, events, division, opts, lines, tempo_timeline, initial_tempo_ms, global_start)
     else:
-        _convert_v3(out_tracks, division, tempo_timeline, midi_path, lines)
+        output_track_count = _convert_v3(
+            out_tracks, division, tempo_timeline, midi_path, lines, opts
+        )
 
     # 写入
     content = '\n'.join(lines)
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(content)
-    return len(out_tracks)
+    return output_track_count
 
 
 def _quote_track_name(name):
@@ -568,28 +600,79 @@ def _quote_track_name(name):
     return '"' + name.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def _convert_v3(out_tracks, division, tempo_timeline, midi_path, lines):
-    """输出 v3：绝对 tick 音符 + 单一全局 tempo 表。
+def _format_switch_seconds(at_ms):
+    """把整数毫秒写成无浮点误差的简洁秒数。"""
+    whole, fraction = divmod(at_ms, 1000)
+    if not fraction:
+        return str(whole)
+    return f"{whole}.{fraction:03d}".rstrip('0')
 
-    每个 MIDI 轨道保留原始索引，音符不再通过简谱 token 的顺序和休止符重建时间，
-    因而不会出现轨道错位、短音符被拉长或变速点漂移。
+
+def _expand_v3_tracks_by_channel(out_tracks):
+    """把一个物理 MIDI 轨中的多个通道拆成独立 TXT 轨。
+
+    TXT 的 `@TRACK` 保存唯一通道，而 `@NOTE` 本身没有 channel 字段。普通
+    单通道轨继续使用原始 MIDI track id；多通道轨的第一个通道也保留该 id，
+    其余通道从所有原始 id 之后分配，避免与后续物理轨冲突。
     """
+    reserved_ids = {source_idx for source_idx, _name, _events in out_tracks}
+    next_id = max(reserved_ids, default=-1) + 1
+    expanded = []
+
+    for source_idx, name, events in out_tracks:
+        by_channel = defaultdict(list)
+        for event in events:
+            by_channel[event.channel].append(event)
+        if not by_channel:
+            by_channel[0] = []
+
+        channels = sorted(by_channel)
+        for position, channel in enumerate(channels):
+            if position == 0:
+                track_id = source_idx
+            else:
+                while next_id in reserved_ids:
+                    next_id += 1
+                track_id = next_id
+                reserved_ids.add(track_id)
+                next_id += 1
+            track_name = name if len(channels) == 1 else f"{name} [ch{channel + 1}]"
+            expanded.append((track_id, channel, track_name, by_channel[channel]))
+    return expanded
+
+
+def _convert_v3(out_tracks, division, tempo_timeline, midi_path, lines, opts):
+    """输出 v3.1：音色元数据 + 绝对 tick 音符 + 全局 tempo 表。
+
+    单通道 MIDI 轨保留原始索引；同一物理轨内的多个通道会拆成独立 TXT 轨，
+    避免 type-0 MIDI 被折叠到首通道。音符不再通过简谱 token 的顺序和休止符
+    重建时间，因而不会出现轨道错位、短音符被拉长或变速点漂移。
+    """
+    initial_soundfont = getattr(opts, 'initial_soundfont', 1)
+    instrument = getattr(opts, 'instrument', 0)
+    program_switches = getattr(opts, 'program_switches', [])
     lines.extend([
-        "#MUSIC_RUST 3",
+        "#MUSIC_RUST 3.1",
         f"#TITLE {os.path.splitext(os.path.basename(midi_path))[0]}",
         f"#PPQ {division}",
+        f"@INSTRUMENT {initial_soundfont} {instrument}",
     ])
+    for at_ms, soundfont, switch_instrument in program_switches:
+        lines.append(
+            f"@SWITCH {_format_switch_seconds(at_ms)} {soundfont} {switch_instrument}"
+        )
     for tick, us in tempo_timeline:
         lines.append(f"@TEMPO {tick} {us}")
     lines.append("")
-    for source_idx, name, events in out_tracks:
-        channel = events[0].channel if events else 0
-        lines.append(f"@TRACK {source_idx} {channel} {_quote_track_name(name)}")
+    expanded_tracks = _expand_v3_tracks_by_channel(out_tracks)
+    for track_id, channel, name, events in expanded_tracks:
+        lines.append(f"@TRACK {track_id} {channel} {_quote_track_name(name)}")
         for event in sorted(events, key=lambda e: (e.start, e.note, e.end or e.start)):
             if event.end is None or event.end <= event.start:
                 continue
-            lines.append(f"@NOTE {source_idx} {event.start} {event.end - event.start} {event.note} {event.velocity}")
+            lines.append(f"@NOTE {track_id} {event.start} {event.end - event.start} {event.note} {event.velocity}")
         lines.append("")
+    return len(expanded_tracks)
 
 
 def _track_lead_rests(events, division, tempo_timeline, initial_tempo_ms, global_start):
@@ -847,7 +930,682 @@ def _chord_to_token(chord_events, division, opts, tempo_timeline=None, initial_t
 # 主程序
 # ---------------------------------------------------------------------------
 
-def main():
+def _bounded_int(name, minimum, maximum):
+    """创建供 argparse 使用的整数范围校验器。"""
+    def parse(value):
+        try:
+            number = int(value, 10)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{name}必须是整数") from exc
+        if not minimum <= number <= maximum:
+            raise argparse.ArgumentTypeError(
+                f"{name}必须在 {minimum}..{maximum} 之间"
+            )
+        return number
+    return parse
+
+
+def _parse_switches(specs, initial_soundfont):
+    """解析 --switch，转为毫秒并按时间稳定排序。"""
+    if len(specs) > MAX_PROGRAM_SWITCHES:
+        raise ValueError(f"--switch 最多可以指定 {MAX_PROGRAM_SWITCHES} 条")
+
+    switches = []
+    for spec in specs:
+        parts = [part.strip() for part in spec.split(':')]
+        if len(parts) == 2:
+            seconds_text, instrument_text = parts
+            soundfont_text = str(initial_soundfont)
+        elif len(parts) == 3:
+            seconds_text, soundfont_text, instrument_text = parts
+        else:
+            raise ValueError(
+                f"--switch '{spec}' 格式错误，应为 秒:音色 或 秒:SF编号:音色"
+            )
+
+        try:
+            seconds = Decimal(seconds_text)
+        except InvalidOperation as exc:
+            raise ValueError(f"--switch '{spec}' 的秒数无效") from exc
+        if not seconds.is_finite() or seconds < 0:
+            raise ValueError(f"--switch '{spec}' 的秒数必须是非负有限数")
+        latest_roundable = (
+            Decimal(MAX_SWITCH_MILLISECONDS) + Decimal('0.5')
+        ) / Decimal(1000)
+        if seconds >= latest_roundable:
+            raise ValueError(f"--switch '{spec}' 的时间超出可表示范围")
+
+        try:
+            soundfont = int(soundfont_text, 10)
+            instrument = int(instrument_text, 10)
+        except ValueError as exc:
+            raise ValueError(f"--switch '{spec}' 的 SF 编号和音色号必须是整数") from exc
+        if not 1 <= soundfont <= MAX_SOUNDFONTS:
+            raise ValueError(
+                f"--switch '{spec}' 的 SF 编号必须在 1..{MAX_SOUNDFONTS} 之间"
+            )
+        if not 0 <= instrument <= 127:
+            raise ValueError(f"--switch '{spec}' 的音色号必须在 0..127 之间")
+
+        # Decimal 避免二进制浮点偏差；超过毫秒的小数按四舍五入归一。
+        at_ms = int((seconds * 1000).to_integral_value(rounding=ROUND_HALF_UP))
+        if at_ms > MAX_SWITCH_MILLISECONDS:
+            raise ValueError(f"--switch '{spec}' 的时间超出可表示范围")
+        switches.append((at_ms, soundfont, instrument))
+
+    # Python 排序稳定，同一毫秒的记录保持命令行输入顺序。
+    switches.sort(key=lambda item: item[0])
+    return switches
+
+
+# ---------------------------------------------------------------------------
+# 无参数 curses 转换界面
+# ---------------------------------------------------------------------------
+
+TUI_FORMATS = ('v3.1', 'v2', 'legacy')
+TUI_FIELDS = (
+    ('midi', 'MIDI 文件', 'path', '回车输入，P 浏览'),
+    ('output', '输出 TXT', 'path', '留空时使用 MIDI 同名 .txt'),
+    ('format', '输出格式', 'format', 'v3.1 可保存音色切换'),
+    ('bpm', 'BPM 覆盖', 'text', '留空时保留 MIDI 速度'),
+    ('velocity_scale', '力度倍率', 'text', '大于 0，默认 1.0'),
+    ('track', '音轨编号', 'text', '例如 0,2,5；留空为全部'),
+    ('quantize', '量化 tick', 'text', '0 表示关闭'),
+    ('max_tracks', '最多音轨', 'text', '留空为不限制'),
+    ('drum', '包含打击乐', 'bool', '是/否'),
+    ('min_vel', '最低力度', 'text', '0..127'),
+    ('keep_empty', '保留空轨', 'bool', '是/否'),
+    ('no_chord', '不合并和弦', 'bool', '是/否'),
+    ('initial_soundfont', '初始 SF 编号', 'text', '1..3，v3.1 专用'),
+    ('instrument', '初始 GM 音色', 'text', '0..127，v3.1 专用'),
+)
+
+
+@dataclass
+class ConverterTuiState:
+    """独立转换界面的可编辑数据，不与 Rust 主 TUI 共享状态。"""
+
+    midi: str = ''
+    output: str = ''
+    format: str = 'v3.1'
+    bpm: str = ''
+    velocity_scale: str = '1.0'
+    track: str = ''
+    quantize: str = '0'
+    max_tracks: str = ''
+    drum: bool = False
+    min_vel: str = '0'
+    keep_empty: bool = False
+    no_chord: bool = False
+    initial_soundfont: str = '1'
+    instrument: str = '0'
+    switches: list = field(default_factory=list)
+
+
+def _parse_tui_int(value, label, minimum=None, maximum=None, optional=False):
+    text = value.strip()
+    if optional and not text:
+        return None
+    try:
+        number = int(text, 10)
+    except ValueError as exc:
+        raise ValueError(f"{label}必须是整数") from exc
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{label}不能小于 {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{label}不能大于 {maximum}")
+    return number
+
+
+def _build_tui_job(state):
+    """校验 TUI 表单，返回 (midi_path, output_path, argparse.Namespace)。"""
+    midi_path = os.path.abspath(os.path.expanduser(state.midi.strip()))
+    if not state.midi.strip():
+        raise ValueError('请先选择或输入 MIDI 文件')
+    if not os.path.isfile(midi_path):
+        raise ValueError(f"找不到 MIDI 文件: {midi_path}")
+    if not midi_path.lower().endswith(('.mid', '.midi')):
+        raise ValueError('输入文件必须是 .mid 或 .midi')
+
+    output_text = state.output.strip()
+    if output_text:
+        output_path = os.path.abspath(os.path.expanduser(output_text))
+    else:
+        output_path = os.path.splitext(midi_path)[0] + '.txt'
+    if os.path.normcase(output_path) == os.path.normcase(midi_path):
+        raise ValueError('输出文件不能覆盖输入 MIDI')
+    output_dir = os.path.dirname(output_path) or os.getcwd()
+    if not os.path.isdir(output_dir):
+        raise ValueError(f"输出目录不存在: {output_dir}")
+
+    if state.format not in TUI_FORMATS:
+        raise ValueError('输出格式无效')
+    bpm = _parse_tui_int(state.bpm, 'BPM', 1, 60_000, optional=True)
+    quantize = _parse_tui_int(state.quantize, '量化 tick', 0)
+    max_tracks = _parse_tui_int(state.max_tracks, '最多音轨', 1, optional=True)
+    min_vel = _parse_tui_int(state.min_vel, '最低力度', 0, 127)
+    initial_soundfont = _parse_tui_int(state.initial_soundfont, '初始 SF 编号', 1, 3)
+    instrument = _parse_tui_int(state.instrument, '初始 GM 音色', 0, 127)
+
+    try:
+        velocity_scale = float(state.velocity_scale.strip())
+    except ValueError as exc:
+        raise ValueError('力度倍率必须是数字') from exc
+    if not math.isfinite(velocity_scale) or velocity_scale <= 0:
+        raise ValueError('力度倍率必须是大于 0 的有限数字')
+
+    track_list = None
+    if state.track.strip():
+        try:
+            track_list = [int(item.strip(), 10) for item in state.track.split(',')]
+        except ValueError as exc:
+            raise ValueError('音轨编号应为逗号分隔的非负整数') from exc
+        if not track_list or any(index < 0 for index in track_list):
+            raise ValueError('音轨编号应为逗号分隔的非负整数')
+
+    program_switches = list(state.switches)
+    if len(program_switches) > MAX_PROGRAM_SWITCHES:
+        raise ValueError(f"定时切换最多 {MAX_PROGRAM_SWITCHES} 条")
+    program_switches.sort(key=lambda item: item[0])
+    for at_ms, soundfont, switch_instrument in program_switches:
+        if not isinstance(at_ms, int) or not 0 <= at_ms <= MAX_SWITCH_MILLISECONDS:
+            raise ValueError('定时切换的时间超出可表示范围')
+        if not 1 <= soundfont <= MAX_SOUNDFONTS:
+            raise ValueError('定时切换的 SF 编号必须在 1..3 之间')
+        if not 0 <= switch_instrument <= 127:
+            raise ValueError('定时切换的 GM 音色必须在 0..127 之间')
+
+    legacy = state.format == 'legacy'
+    v2 = state.format == 'v2'
+    if (v2 or legacy) and (
+        initial_soundfont != 1 or instrument != 0 or program_switches
+    ):
+        raise ValueError('v2/legacy 无法保存音色配置；请选择 v3.1 或清空音色切换')
+
+    opts = argparse.Namespace(
+        bpm=bpm,
+        track=state.track.strip() or None,
+        track_list=track_list,
+        quantize=quantize,
+        max_tracks=max_tracks,
+        drum=state.drum,
+        min_vel=min_vel,
+        velocity_scale=velocity_scale,
+        keep_empty=state.keep_empty,
+        no_chord=state.no_chord,
+        initial_soundfont=initial_soundfont,
+        instrument=instrument,
+        program_switches=program_switches,
+        switch=[],
+        v2=v2,
+        legacy=legacy,
+    )
+    return midi_path, output_path, opts
+
+
+def _safe_addstr(screen, y, x, value, attr=0):
+    """在终端边界内写文字，窗口缩放时不抛 curses.error。"""
+    try:
+        height, width = screen.getmaxyx()
+        if y < 0 or y >= height or x < 0 or x >= width - 1:
+            return
+        # curses 按显示列计算宽度，Python 切片按字符计算；多留一列
+        # 并捕获边界错误，可兼容中文宽字符。
+        screen.addstr(y, x, str(value)[:max(0, width - x - 1)], attr)
+    except Exception:
+        pass
+
+
+def _set_cursor_visible(visible):
+    try:
+        import curses
+        curses.curs_set(1 if visible else 0)
+    except Exception:
+        pass
+
+
+def _prompt_text(screen, title, initial='', allow_empty=True):
+    """单行文本输入框；回车确认，Esc 取消。"""
+    import curses
+
+    value = str(initial)
+    _set_cursor_visible(True)
+    try:
+        while True:
+            screen.erase()
+            height, width = screen.getmaxyx()
+            _safe_addstr(screen, 1, 2, title, curses.A_BOLD)
+            _safe_addstr(screen, 3, 2, '回车确认  Esc 取消  Ctrl+U 清空', curses.A_DIM)
+            available = max(1, width - 6)
+            shown = value[-available:]
+            _safe_addstr(screen, 5, 2, '> ' + shown, curses.A_REVERSE)
+            if height > 7:
+                _safe_addstr(screen, 7, 2, f'字符数: {len(value)}', curses.A_DIM)
+            try:
+                screen.move(min(5, height - 1), min(4 + len(shown), max(0, width - 2)))
+            except Exception:
+                pass
+            screen.refresh()
+            key = screen.get_wch()
+            if key in ('\n', '\r') or key == curses.KEY_ENTER:
+                if value or allow_empty:
+                    return value
+                continue
+            if key == '\x1b' or key == 27:
+                return None
+            if key in ('\x08', '\x7f') or key in (curses.KEY_BACKSPACE, 127, 8):
+                value = value[:-1]
+            elif key == '\x15':  # Ctrl+U
+                value = ''
+            elif key == '\x17':  # Ctrl+W
+                value = value.rstrip()
+                value = value[:value.rfind(' ') + 1] if ' ' in value else ''
+            elif isinstance(key, str) and key.isprintable() and len(value) < 4096:
+                value += key
+    finally:
+        _set_cursor_visible(False)
+
+
+def _message_dialog(screen, title, message, error=False):
+    """显示明确的成功/错误对话框。"""
+    import curses
+
+    screen.erase()
+    height, width = screen.getmaxyx()
+    color = curses.color_pair(3 if error else 2) | curses.A_BOLD
+    _safe_addstr(screen, 1, 2, title, color)
+    line_width = max(20, width - 6)
+    wrapped = []
+    for paragraph in str(message).splitlines() or ['']:
+        wrapped.extend(textwrap.wrap(paragraph, line_width) or [''])
+    for index, line in enumerate(wrapped[:max(1, height - 6)]):
+        _safe_addstr(screen, 3 + index, 2, line)
+    _safe_addstr(screen, height - 2, 2, '按回车或 Esc 返回', curses.A_DIM)
+    screen.refresh()
+    while True:
+        key = screen.get_wch()
+        if key in ('\n', '\r', '\x1b') or key in (curses.KEY_ENTER, 27):
+            return
+
+
+def _midi_entries(directory):
+    """列出目录与 MIDI 文件，供 TUI 文件选择器使用。"""
+    dirs = []
+    files = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    dirs.append((entry.name + '/', entry.path, True))
+                elif entry.is_file() and entry.name.lower().endswith(('.mid', '.midi')):
+                    files.append((entry.name, entry.path, False))
+            except OSError:
+                continue
+    dirs.sort(key=lambda item: item[0].casefold())
+    files.sort(key=lambda item: item[0].casefold())
+    parent = os.path.dirname(directory)
+    result = []
+    if parent != directory:
+        result.append(('../  [上级目录]', parent, True))
+    return result + dirs + files
+
+
+def _pick_midi_file(screen, initial=''):
+    """只显示目录和 .mid/.midi 的简洁文件选择器。"""
+    import curses
+
+    expanded = os.path.abspath(os.path.expanduser(initial)) if initial else os.getcwd()
+    if os.path.isdir(expanded):
+        directory = expanded
+    else:
+        directory = os.path.dirname(expanded)
+        if not os.path.isdir(directory):
+            directory = os.getcwd()
+    selected = 0
+    scroll = 0
+    notice = ''
+    while True:
+        try:
+            entries = _midi_entries(directory)
+        except OSError as exc:
+            notice = f'无法读取目录: {exc}'
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                entries = []
+            else:
+                directory = parent
+                selected = scroll = 0
+                continue
+        selected = max(0, min(selected, max(0, len(entries) - 1)))
+        screen.erase()
+        height, width = screen.getmaxyx()
+        _safe_addstr(screen, 0, 2, '选择 MIDI 文件', curses.A_BOLD | curses.color_pair(1))
+        _safe_addstr(screen, 1, 2, directory, curses.A_DIM)
+        available = max(1, height - 6)
+        if selected < scroll:
+            scroll = selected
+        if selected >= scroll + available:
+            scroll = selected - available + 1
+        visible = entries[scroll:scroll + available]
+        if not visible:
+            _safe_addstr(screen, 3, 4, '（本目录没有 MIDI 文件）', curses.A_DIM)
+        for row, (label, _path, is_dir) in enumerate(visible, start=3):
+            index = scroll + row - 3
+            attr = curses.A_REVERSE if index == selected else 0
+            if is_dir:
+                attr |= curses.color_pair(1)
+            _safe_addstr(screen, row, 3, label, attr)
+        if notice:
+            _safe_addstr(screen, height - 3, 2, notice, curses.color_pair(3))
+        _safe_addstr(screen, height - 2, 2, '↑↓ 选择  Enter 打开/确认  M 手动输入  Backspace 上级  Esc 取消', curses.A_DIM)
+        screen.refresh()
+        key = screen.get_wch()
+        if key in ('\x1b', 'q', 'Q') or key == 27:
+            return None
+        if key in (curses.KEY_UP, 'k', 'K') and entries:
+            selected = (selected - 1) % len(entries)
+        elif key in (curses.KEY_DOWN, 'j', 'J') and entries:
+            selected = (selected + 1) % len(entries)
+        elif key in ('\x08', '\x7f') or key in (curses.KEY_BACKSPACE, 127, 8):
+            parent = os.path.dirname(directory)
+            if parent != directory:
+                directory = parent
+                selected = scroll = 0
+        elif key in ('m', 'M'):
+            manual = _prompt_text(screen, '输入 MIDI 文件路径', initial)
+            if manual is not None:
+                path = os.path.abspath(os.path.expanduser(manual.strip()))
+                if os.path.isfile(path):
+                    return path
+                notice = f'找不到文件: {path}'
+        elif (key in ('\n', '\r') or key == curses.KEY_ENTER) and entries:
+            _label, path, is_dir = entries[selected]
+            if is_dir:
+                directory = os.path.abspath(path)
+                selected = scroll = 0
+            else:
+                return os.path.abspath(path)
+
+
+def _tui_field_value(state, name):
+    value = getattr(state, name)
+    if isinstance(value, bool):
+        return '是' if value else '否'
+    if name == 'output' and not value:
+        return '（自动：MIDI 同名 .txt）'
+    if name in ('bpm', 'track', 'max_tracks') and not value:
+        return '（自动）'
+    return str(value)
+
+
+def _draw_tui(screen, state, page, selected, scroll, status='', status_error=False):
+    import curses
+
+    screen.erase()
+    height, width = screen.getmaxyx()
+    if height < 15 or width < 55:
+        _safe_addstr(screen, 1, 2, '终端窗口太小', curses.A_BOLD | curses.color_pair(3))
+        _safe_addstr(screen, 3, 2, '请调整到至少 55 列 × 15 行；按 Q 退出。')
+        screen.refresh()
+        return scroll
+
+    _safe_addstr(screen, 0, 2, 'music_rust  MIDI → TXT 转换器', curses.A_BOLD | curses.color_pair(1))
+    settings_tab = '[ 转换设置 ]' if page == 0 else '  转换设置  '
+    switches_tab = '[ 定时切换 ]' if page == 1 else '  定时切换  '
+    _safe_addstr(screen, 1, 2, f'{settings_tab}    {switches_tab}', curses.A_REVERSE if page == 0 else 0)
+
+    available = max(1, height - 7)
+    if page == 0:
+        selected = max(0, min(selected, len(TUI_FIELDS) - 1))
+        if selected < scroll:
+            scroll = selected
+        if selected >= scroll + available:
+            scroll = selected - available + 1
+        for row, (name, label, _kind, _help) in enumerate(TUI_FIELDS[scroll:scroll + available], start=3):
+            index = scroll + row - 3
+            attr = curses.A_REVERSE if index == selected else 0
+            if state.format != 'v3.1' and name in ('initial_soundfont', 'instrument'):
+                attr |= curses.A_DIM
+            _safe_addstr(screen, row, 2, f"{'>' if index == selected else ' '} {label:<16} {_tui_field_value(state, name)}", attr)
+        _name, _label, _kind, help_text = TUI_FIELDS[selected]
+        _safe_addstr(screen, height - 4, 2, help_text, curses.A_DIM)
+        controls = 'Tab 切换页  ↑↓ 选择  Enter 修改  P 浏览 MIDI  F5/C 开始转换  Q 退出'
+    else:
+        _safe_addstr(screen, 3, 2, f'已设置 {len(state.switches)}/{MAX_PROGRAM_SWITCHES} 条（仅 v3.1 保存）', curses.A_BOLD)
+        list_rows = max(1, available - 2)
+        if state.switches:
+            selected = max(0, min(selected, len(state.switches) - 1))
+            if selected < scroll:
+                scroll = selected
+            if selected >= scroll + list_rows:
+                scroll = selected - list_rows + 1
+            for row, (at_ms, soundfont, instrument) in enumerate(state.switches[scroll:scroll + list_rows], start=5):
+                index = scroll + row - 5
+                attr = curses.A_REVERSE if index == selected else 0
+                text = f"{'>' if index == selected else ' '} #{index + 1:02d}  {_format_switch_seconds(at_ms):>10} 秒   SF {soundfont}   GM {instrument}"
+                _safe_addstr(screen, row, 2, text, attr)
+        else:
+            _safe_addstr(screen, 5, 4, '暂无定时切换；按 A 添加。', curses.A_DIM)
+        _safe_addstr(screen, height - 4, 2, '输入格式：秒:音色（沿用初始 SF）或 秒:SF编号:音色', curses.A_DIM)
+        controls = 'Tab 切换页  ↑↓ 选择  A 添加  Enter/E 编辑  D/Delete 删除  F5/C 转换  Q 退出'
+    _safe_addstr(screen, height - 3, 2, controls, curses.A_DIM)
+    if status:
+        attr = curses.color_pair(3 if status_error else 2) | curses.A_BOLD
+        _safe_addstr(screen, height - 2, 2, status, attr)
+    else:
+        _safe_addstr(screen, height - 2, 2, '无参数启动的独立界面，不会修改主 TUI 设置。', curses.A_DIM)
+    screen.refresh()
+    return scroll
+
+
+def _edit_tui_field(screen, state, field_index):
+    """编辑当前表单字段，返回状态提示。"""
+    name, label, kind, _help = TUI_FIELDS[field_index]
+    if kind == 'bool':
+        setattr(state, name, not getattr(state, name))
+        return f'{label}已设为 {_tui_field_value(state, name)}'
+    if kind == 'format':
+        index = TUI_FORMATS.index(state.format)
+        state.format = TUI_FORMATS[(index + 1) % len(TUI_FORMATS)]
+        if state.format != 'v3.1' and (
+            state.initial_soundfont != '1' or state.instrument != '0' or state.switches
+        ):
+            return f'已选 {state.format}；该格式不能保存非默认音色配置'
+        return f'输出格式已设为 {state.format}'
+    value = _prompt_text(screen, f'输入 {label}', getattr(state, name))
+    if value is not None:
+        setattr(state, name, value.strip())
+        return f'{label}已更新'
+    return ''
+
+
+def _switch_prompt(screen, state, initial=''):
+    """输入并校验一条定时切换。"""
+    value = _prompt_text(
+        screen,
+        '定时切换：秒:音色 或 秒:SF编号:音色',
+        initial,
+        allow_empty=False,
+    )
+    if value is None:
+        return None
+    try:
+        initial_sf = _parse_tui_int(state.initial_soundfont, '初始 SF 编号', 1, 3)
+        return _parse_switches([value.strip()], initial_sf)[0]
+    except ValueError as exc:
+        _message_dialog(screen, '切换设置无效', str(exc), error=True)
+        return None
+
+
+def _convert_from_tui(screen, state):
+    """执行转换，所有成功与错误都在 curses 界面内显示。"""
+    import curses
+
+    try:
+        midi_path, output_path, opts = _build_tui_job(state)
+        screen.erase()
+        _safe_addstr(screen, 2, 2, '正在转换，请稍候…', curses.A_BOLD | curses.color_pair(1))
+        _safe_addstr(screen, 4, 2, midi_path, curses.A_DIM)
+        screen.refresh()
+        count = convert(midi_path, output_path, opts)
+        state.output = output_path
+    except (MidiError, ValueError, OSError, struct.error) as exc:
+        _message_dialog(screen, '转换失败', str(exc), error=True)
+        return False, f'转换失败: {exc}'
+    _message_dialog(
+        screen,
+        '转换完成',
+        f'已输出: {output_path}\n音轨数: {count}\n格式: {state.format}',
+        error=False,
+    )
+    return True, f'转换完成: {output_path}'
+
+
+def _tui_main(screen):
+    """curses.wrapper 内部主循环。"""
+    import curses
+
+    screen.keypad(True)
+    _set_cursor_visible(False)
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+    except curses.error:
+        pass
+
+    state = ConverterTuiState()
+    page = 0
+    setting_selected = 0
+    switch_selected = 0
+    setting_scroll = 0
+    switch_scroll = 0
+    status = ''
+    status_error = False
+
+    while True:
+        selected = setting_selected if page == 0 else switch_selected
+        scroll = setting_scroll if page == 0 else switch_scroll
+        scroll = _draw_tui(screen, state, page, selected, scroll, status, status_error)
+        if page == 0:
+            setting_scroll = scroll
+        else:
+            switch_scroll = scroll
+        try:
+            key = screen.get_wch()
+        except curses.error:
+            continue
+
+        if key in ('q', 'Q'):
+            return 0
+        if key == '\t':
+            page = 1 - page
+            status = ''
+            status_error = False
+            continue
+        if key in (curses.KEY_F5, 'c', 'C'):
+            success, status = _convert_from_tui(screen, state)
+            status_error = not success
+            continue
+
+        if page == 0:
+            if key in (curses.KEY_UP, 'k', 'K'):
+                setting_selected = (setting_selected - 1) % len(TUI_FIELDS)
+            elif key in (curses.KEY_DOWN, 'j', 'J'):
+                setting_selected = (setting_selected + 1) % len(TUI_FIELDS)
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                name, _label, kind, _help = TUI_FIELDS[setting_selected]
+                if kind == 'bool':
+                    setattr(state, name, not getattr(state, name))
+                    status = f'{_label}已设为 {_tui_field_value(state, name)}'
+                    status_error = False
+                elif kind == 'format':
+                    direction = -1 if key == curses.KEY_LEFT else 1
+                    index = TUI_FORMATS.index(state.format)
+                    state.format = TUI_FORMATS[(index + direction) % len(TUI_FORMATS)]
+                    status = f'输出格式已设为 {state.format}'
+                    status_error = False
+            elif key in ('p', 'P'):
+                chosen = _pick_midi_file(screen, state.midi)
+                if chosen:
+                    state.midi = chosen
+                    status = f'已选择: {chosen}'
+                    status_error = False
+            elif key in ('\n', '\r') or key == curses.KEY_ENTER:
+                status = _edit_tui_field(screen, state, setting_selected)
+                status_error = bool(
+                    status and state.format != 'v3.1' and '不能保存' in status
+                )
+        else:
+            if key in (curses.KEY_UP, 'k', 'K') and state.switches:
+                switch_selected = (switch_selected - 1) % len(state.switches)
+            elif key in (curses.KEY_DOWN, 'j', 'J') and state.switches:
+                switch_selected = (switch_selected + 1) % len(state.switches)
+            elif key in ('a', 'A'):
+                if len(state.switches) >= MAX_PROGRAM_SWITCHES:
+                    status = f'最多只能设置 {MAX_PROGRAM_SWITCHES} 条切换'
+                    status_error = True
+                    continue
+                rule = _switch_prompt(screen, state)
+                if rule is not None:
+                    state.switches.append(rule)
+                    state.switches.sort(key=lambda item: item[0])
+                    switch_selected = max(
+                        index for index, item in enumerate(state.switches) if item == rule
+                    )
+                    status = '已添加定时切换'
+                    status_error = False
+            elif (key in ('e', 'E', '\n', '\r') or key == curses.KEY_ENTER) and state.switches:
+                old_rule = state.switches[switch_selected]
+                initial = ':'.join((
+                    _format_switch_seconds(old_rule[0]),
+                    str(old_rule[1]),
+                    str(old_rule[2]),
+                ))
+                rule = _switch_prompt(screen, state, initial)
+                if rule is not None:
+                    state.switches[switch_selected] = rule
+                    state.switches.sort(key=lambda item: item[0])
+                    switch_selected = next(
+                        index for index, item in enumerate(state.switches) if item == rule
+                    )
+                    status = '已更新定时切换'
+                    status_error = False
+            elif (key in ('d', 'D') or key in (curses.KEY_DC, 127)) and state.switches:
+                del state.switches[switch_selected]
+                switch_selected = min(switch_selected, max(0, len(state.switches) - 1))
+                status = '已删除定时切换'
+                status_error = False
+
+
+def run_tui():
+    """启动无参数独立 TUI；不可交互时返回友好错误。"""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(
+            '错误: 无参数模式需要可交互终端。'
+            '请在终端中运行，或传入 MIDI 文件使用命令行模式。',
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        import curses
+        return curses.wrapper(_tui_main)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        # `_curses.error` 在某些 Python 版本不方便于导入前引用；
+        # wrapper 中的转换错误已就地处理，到这里的通常是 curses/TERM 初始化失败。
+        print(f'错误: 无法启动转换界面: {exc}', file=sys.stderr)
+        return 2
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        return run_tui()
+
     parser = argparse.ArgumentParser(
         description='MIDI → 简谱TXT 转换器 (music_rust 配套)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -855,22 +1613,51 @@ def main():
     )
     parser.add_argument('midi', help='输入 MIDI 文件')
     parser.add_argument('-o', '--output', help='输出 TXT 文件 (默认同目录同名)')
-    parser.add_argument('-b', '--bpm', type=int, help='覆盖速度 (BPM)')
+    parser.add_argument(
+        '-b', '--bpm', type=_bounded_int('BPM', 1, 60_000),
+        help='覆盖速度 (BPM，1..60000)',
+    )
     parser.add_argument('--track', help='只转换指定音轨 (从0开始, 逗号分隔)')
     parser.add_argument('--quantize', type=int, default=0, help='量化粒度 tick (默认 0=关闭)')
     parser.add_argument('--max-tracks', type=int, help='最多转换音轨数')
-    parser.add_argument('--drum', action='store_true', help='包含打击乐轨')
+    drum_group = parser.add_mutually_exclusive_group()
+    drum_group.add_argument('--drum', dest='drum', action='store_true', help='包含打击乐轨')
+    drum_group.add_argument('--no-drum', dest='drum', action='store_false', help='排除打击乐轨（默认）')
+    parser.set_defaults(drum=False)
     parser.add_argument('--min-vel', type=int, default=0, help='最低力度')
     parser.add_argument('--velocity-scale', type=float, help='MIDI 力度倍率；交互终端未指定时询问（默认 1.0）')
     parser.add_argument('--keep-empty', action='store_true', help='保留空白音轨')
     parser.add_argument('--no-chord', action='store_true', help='不合并和弦')
-    parser.add_argument('--v2', action='store_true', help='输出旧版可读多音轨 T 格式（默认输出 v3）')
+    parser.add_argument(
+        '--initial-soundfont', type=_bounded_int('SoundFont 编号', 1, MAX_SOUNDFONTS),
+        default=1, metavar='1..3', help='初始 SoundFont 编号（默认 1）',
+    )
+    parser.add_argument(
+        '--instrument', type=_bounded_int('音色号', 0, 127), default=0,
+        metavar='0..127', help='初始 GM 音色号（默认 0）',
+    )
+    parser.add_argument(
+        '--switch', action='append', default=[], metavar='秒[:SF编号]:音色',
+        help='定时切换音色，格式为 秒:音色 或 秒:SF编号:音色（最多 24 条）',
+    )
+    parser.add_argument('--v2', action='store_true', help='输出旧版可读多音轨 T 格式（默认输出 v3.1）')
     parser.add_argument('--legacy', action='store_true', help='输出最旧版两行一组格式')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    try:
+        args.program_switches = _parse_switches(args.switch, args.initial_soundfont)
+    except ValueError as e:
+        parser.error(str(e))
+
+    has_nondefault_instrument = (
+        args.initial_soundfont != 1 or args.instrument != 0 or bool(args.program_switches)
+    )
+    if (args.v2 or args.legacy) and has_nondefault_instrument:
+        parser.error('--v2/--legacy 无法保存音色配置；请使用默认 v3.1 格式')
 
     if not os.path.isfile(args.midi):
         print(f"错误: 找不到文件 {args.midi}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     out = args.output
     if not out:
@@ -883,23 +1670,28 @@ def main():
             args.track_list = [int(x) for x in args.track.split(',')]
         except ValueError:
             print("错误: --track 参数格式应为逗号分隔的数字", file=sys.stderr)
-            sys.exit(1)
+            return 1
 
     try:
         count = convert(args.midi, out, args)
-    except MidiError as e:
+    except (MidiError, ValueError, OSError, struct.error) as e:
         print(f"错误: {e}", file=sys.stderr)
-        sys.exit(1)
-    except ValueError as e:
-        print(f"错误: {e}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     print(f"转换完成: {args.midi} → {out}")
     print(f"音轨数: {count}")
     if args.bpm:
         print(f"速度: {args.bpm} BPM")
     print(f"力度倍率: {args.velocity_scale:g}")
+    if not args.v2 and not args.legacy:
+        print("TXT 格式: music_rust v3.1")
+        print(
+            f"初始音色: SoundFont {args.initial_soundfont}, "
+            f"GM {args.instrument}"
+        )
+        print(f"定时切换: {len(args.program_switches)} 条")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

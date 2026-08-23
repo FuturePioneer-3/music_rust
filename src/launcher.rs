@@ -11,14 +11,22 @@ use std::cmp;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::synth::{
+    soundfont_total_bytes, validate_program_switches, validate_soundfont_paths,
+    ProgramSwitch, MAX_PROGRAM_SWITCHES, MAX_SOUNDFONTS,
+};
+
 /// 启动选择界面收集到的配置。
 ///
-/// `soundfont == None` 代表保留原有的自动探测行为。
+/// 空 `soundfonts` 代表保留原有的自动探测行为；启动选择器会默认填入
+/// 内置电子合成器 SoundFont。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchConfig {
     pub file: String,
-    pub soundfont: Option<String>,
+    /// 按加载顺序排列的音源；第一个是默认音源，最多 3 个。
+    pub soundfonts: Vec<String>,
     pub instrument: u8,
+    pub program_switches: Vec<ProgramSwitch>,
 }
 
 const RESET: &str = "\x1b[0m";
@@ -46,8 +54,9 @@ pub fn select_startup() -> Result<Option<LaunchConfig>, String> {
     let fonts = crate::synth::available_soundfonts();
     let mut state = StartupState {
         file: None,
-        soundfont: preferred_soundfont(&fonts),
+        soundfonts: preferred_soundfont(&fonts).into_iter().collect(),
         instrument: 0,
+        program_switches: Vec::new(),
         program_input: None,
         focus: StartupField::File,
         notice: None,
@@ -130,9 +139,20 @@ pub fn select_startup() -> Result<Option<LaunchConfig>, String> {
                     None => state.notice = Some("未更改乐曲文件。".to_string()),
                 },
                 StartupField::Soundfont => {
-                    if let Some(font) = choose_soundfont(state.soundfont.as_deref())? {
-                        state.soundfont = Some(font);
-                        state.notice = None;
+                    if let Some(fonts) = choose_soundfonts(&state.soundfonts)? {
+                        let (switches, removed) = remap_program_switches(
+                            &state.program_switches,
+                            &state.soundfonts,
+                            &fonts,
+                        );
+                        state.soundfonts = fonts;
+                        state.program_switches = switches;
+                        state.notice = (removed > 0).then(|| {
+                            format!(
+                                "已移除 {} 条引用已取消 SoundFont 的切换规则。",
+                                removed
+                            )
+                        });
                     } else {
                         state.notice = Some("未更改 SoundFont。".to_string());
                     }
@@ -141,12 +161,41 @@ pub fn select_startup() -> Result<Option<LaunchConfig>, String> {
                     state.program_input = Some(String::new());
                     state.notice = None;
                 }
+                StartupField::Switches => {
+                    match edit_program_switches(
+                        state.program_switches.clone(),
+                        state.soundfonts.len(),
+                    ) {
+                        Ok(Some(switches)) => {
+                            state.program_switches = switches;
+                            state.notice = None;
+                        }
+                        Ok(None) => {
+                            state.notice = Some("未更改中途音色切换。".to_string());
+                        }
+                        Err(error) => state.notice = Some(error),
+                    }
+                }
                 StartupField::Start => {
                     if let Some(file) = &state.file {
+                        if let Err(error) = validate_soundfont_paths(&state.soundfonts) {
+                            state.notice = Some(error);
+                            state.focus = StartupField::Soundfont;
+                            continue;
+                        }
+                        if let Err(error) = validate_program_switches(
+                            &state.program_switches,
+                            state.soundfonts.len(),
+                        ) {
+                            state.notice = Some(error);
+                            state.focus = StartupField::Switches;
+                            continue;
+                        }
                         return Ok(Some(LaunchConfig {
                             file: file.to_string_lossy().into_owned(),
-                            soundfont: state.soundfont.clone(),
+                            soundfonts: state.soundfonts.clone(),
                             instrument: state.instrument,
+                            program_switches: state.program_switches.clone(),
                         }));
                     }
                     state.notice = Some("请先选择一个可播放的乐曲文件。".to_string());
@@ -158,11 +207,38 @@ pub fn select_startup() -> Result<Option<LaunchConfig>, String> {
     }
 }
 
+/// SoundFont 重新排序时按路径重映射已有切换；被取消的音源对应规则会被
+/// 删除。返回值中的计数用于在主界面明确提醒用户。
+fn remap_program_switches(
+    switches: &[ProgramSwitch],
+    old_soundfonts: &[String],
+    new_soundfonts: &[String],
+) -> (Vec<ProgramSwitch>, usize) {
+    let mut remapped = Vec::with_capacity(switches.len());
+    let mut removed = 0;
+    for switch_ in switches {
+        let Some(path) = old_soundfonts.get(switch_.soundfont) else {
+            removed += 1;
+            continue;
+        };
+        let Some(soundfont) = new_soundfonts.iter().position(|candidate| candidate == path) else {
+            removed += 1;
+            continue;
+        };
+        remapped.push(ProgramSwitch {
+            soundfont,
+            ..*switch_
+        });
+    }
+    (remapped, removed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupField {
     File,
     Soundfont,
     Program,
+    Switches,
     Start,
 }
 
@@ -171,7 +247,8 @@ impl StartupField {
         match self {
             Self::File => Self::Soundfont,
             Self::Soundfont => Self::Program,
-            Self::Program => Self::Start,
+            Self::Program => Self::Switches,
+            Self::Switches => Self::Start,
             Self::Start => Self::File,
         }
     }
@@ -181,15 +258,17 @@ impl StartupField {
             Self::File => Self::Start,
             Self::Soundfont => Self::File,
             Self::Program => Self::Soundfont,
-            Self::Start => Self::Program,
+            Self::Switches => Self::Program,
+            Self::Start => Self::Switches,
         }
     }
 }
 
 struct StartupState {
     file: Option<PathBuf>,
-    soundfont: Option<String>,
+    soundfonts: Vec<String>,
     instrument: u8,
+    program_switches: Vec<ProgramSwitch>,
     program_input: Option<String>,
     focus: StartupField,
     notice: Option<String>,
@@ -254,7 +333,7 @@ fn render_startup(state: &StartupState) -> Result<(), String> {
 
     write_box_top(&mut out, width)?;
     try_draw!(writeln!(out, "{CYAN}{BOLD}  music_rust 启动选择器{RESET}"));
-    try_draw!(writeln!(out, "{GRAY}  SoundFont 用于 MIDI/简谱；GM 音色仅用于简谱 TXT。{RESET}"));
+    try_draw!(writeln!(out, "{GRAY}  SoundFont 与初始 GM 音色用于 MIDI/简谱；TXT v3.1 内嵌计划优先。{RESET}"));
     write_box_rule(&mut out, width)?;
 
     let file = state
@@ -262,11 +341,14 @@ fn render_startup(state: &StartupState) -> Result<(), String> {
         .as_ref()
         .map(|p| display_path(p, width.saturating_sub(23)))
         .unwrap_or_else(|| "<尚未选择>".to_string());
-    let font = state
-        .soundfont
-        .as_deref()
-        .map(|p| display_text(p, width.saturating_sub(23)))
-        .unwrap_or_else(|| "<自动探测>".to_string());
+    let font = if state.soundfonts.is_empty() {
+        "<未选择>".to_string()
+    } else {
+        let total = soundfont_total_bytes(&state.soundfonts)
+            .map(|bytes| format!("{} 个 · {:.1} MB", state.soundfonts.len(), bytes as f64 / 1_000_000.0))
+            .unwrap_or_else(|_| format!("{} 个 · 大小待检查", state.soundfonts.len()));
+        format!("{} · {}", total, display_text(state.soundfonts.first().map(String::as_str).unwrap_or(""), width.saturating_sub(42)))
+    };
 
     render_field(
         &mut out,
@@ -295,6 +377,19 @@ fn render_startup(state: &StartupState) -> Result<(), String> {
         &program,
     )?;
 
+    let switches = if state.program_switches.is_empty() {
+        "未设置（播放中可按秒切换）".to_string()
+    } else {
+        format!("{} 条（最多 {} 条）", state.program_switches.len(), MAX_PROGRAM_SWITCHES)
+    };
+    render_field(
+        &mut out,
+        width,
+        state.focus == StartupField::Switches,
+        "中途切换",
+        &switches,
+    )?;
+
     let start_value = if state.file.is_some() {
         "Enter 开始播放"
     } else {
@@ -313,7 +408,7 @@ fn render_startup(state: &StartupState) -> Result<(), String> {
     } else if state.program_input.is_some() {
         try_draw!(writeln!(out, "{GRAY}  输入 0–127 · Enter 确认 · Backspace 删除 · Esc 取消{RESET}"));
     } else {
-        try_draw!(writeln!(out, "{GRAY}  ↑↓/Tab 切换 · Enter 选择 · ←→/+− 调音色 · 数字直接输入 · Q/Esc 取消{RESET}"));
+        try_draw!(writeln!(out, "{GRAY}  ↑↓/Tab 切换 · Enter 选择 · ←→/+− 调音色 · 中途切换最多 24 条 · Q/Esc 取消{RESET}"));
     }
     write_box_bottom(&mut out, width)?;
     out.flush().map_err(|e| format!("刷新启动界面失败: {e}"))
@@ -335,29 +430,57 @@ fn render_field(
     Ok(())
 }
 
-/// 选择一个系统发现的 SoundFont，或从目录浏览器挑选其它文件。
-fn choose_soundfont(current: Option<&str>) -> Result<Option<String>, String> {
+/// 选择 1--3 个系统发现的 SoundFont，或从目录浏览器挑选其它文件。
+/// Enter/Space 勾选，右方向键确认；每次勾选都会立即检查任意两个音源
+/// 合计不超过 120 MB。
+fn choose_soundfonts(current: &[String]) -> Result<Option<Vec<String>>, String> {
     let mut fonts = crate::synth::available_soundfonts();
     // 用户从“浏览其它目录”选过的自定义音源不一定属于自动扫描目录；
     // 重新打开列表时保留它，避免界面突然跳回默认项。
-    if let Some(path) = current {
+    for path in current {
         if Path::new(path).is_file() && !fonts.iter().any(|font| font == path) {
-            fonts.push(path.to_string());
+            fonts.push(path.clone());
         }
     }
     let preferred = preferred_soundfont(&fonts);
-    let mut selected = current
-        .and_then(|value| fonts.iter().position(|font| font == value))
-        .or_else(|| preferred.as_ref().and_then(|value| fonts.iter().position(|font| font == value)))
-        .unwrap_or(0);
+    // 下标在此向量中的顺序就是播放端的 SoundFont #1/#2/#3。这样用户
+    // 勾选 B 再勾选 A 时，B 确实成为 #1，切换编辑器不会与界面显示错位。
+    let mut chosen_indices = current
+        .iter()
+        .filter_map(|path| fonts.iter().position(|font| font == path))
+        .collect::<Vec<_>>();
+    if chosen_indices.is_empty() {
+        if let Some(index) = preferred.as_ref().and_then(|value| fonts.iter().position(|font| font == value)) {
+            chosen_indices.push(index);
+        }
+    }
+    let mut selected = chosen_indices.first().copied().unwrap_or(0);
+    let mut notice: Option<String> = None;
 
     loop {
         let (width, height) = terminal_size();
         let mut out = io::stdout();
         clear_screen(&mut out)?;
         write_box_top(&mut out, width)?;
-        try_draw!(writeln!(out, "{MAGENTA}{BOLD}  选择 SoundFont{RESET}"));
-        try_draw!(writeln!(out, "{GRAY}  默认优先 electronic_synth.sf2；也可以浏览其它目录。{RESET}"));
+        try_draw!(writeln!(out, "{MAGENTA}{BOLD}  选择 SoundFont（最多 3 个）{RESET}"));
+        let chosen = chosen_indices
+            .iter()
+            .map(|index| fonts[*index].clone())
+            .collect::<Vec<_>>();
+        let total_text = if chosen.is_empty() {
+            "0 个".to_string()
+        } else {
+            soundfont_total_bytes(&chosen)
+                .map(|bytes| {
+                    format!(
+                        "{} 个，总计 {:.1} MB（任意两个 ≤120 MB）",
+                        chosen.len(),
+                        bytes as f64 / 1_000_000.0
+                    )
+                })
+                .unwrap_or_else(|_| format!("{} 个，成对大小超限或不可读", chosen.len()))
+        };
+        try_draw!(writeln!(out, "{GRAY}  Enter/Space 勾选 · → 完成 · 当前：{}{RESET}", total_text));
         write_box_rule(&mut out, width)?;
 
         let item_count = fonts.len() + 1; // 最后一项始终是文件浏览器
@@ -368,14 +491,15 @@ fn choose_soundfont(current: Option<&str>) -> Result<Option<String>, String> {
             let is_selected = i == selected;
             let marker = if is_selected { ">" } else { " " };
             if i < fonts.len() {
-                let default_mark = if preferred.as_deref() == Some(fonts[i].as_str()) {
-                    " [默认]"
-                } else {
-                    ""
-                };
+                let checked_mark = chosen_indices
+                    .iter()
+                    .position(|index| *index == i)
+                    .map(|position| format!("[#{}]", position + 1))
+                    .unwrap_or_else(|| "[  ]".to_string());
+                let default_mark = if preferred.as_deref() == Some(fonts[i].as_str()) { " [默认]" } else { "" };
                 let color = if is_selected { CYAN } else { "" };
                 let font = display_text(&fonts[i], width.saturating_sub(18));
-                try_draw!(writeln!(out, "{color} {marker} {font}{default_mark}{RESET}"));
+                try_draw!(writeln!(out, "{color} {marker} {checked_mark} {font}{default_mark}{RESET}"));
             } else {
                 let color = if is_selected { CYAN } else { "" };
                 try_draw!(writeln!(out, "{color} {marker} 浏览其它目录…{RESET}"));
@@ -385,7 +509,11 @@ fn choose_soundfont(current: Option<&str>) -> Result<Option<String>, String> {
             try_draw!(writeln!(out, "{DIM}  ↓ 还有更多项{RESET}"));
         }
         write_box_rule(&mut out, width)?;
-        try_draw!(writeln!(out, "{GRAY}  ↑/↓ 选择  ·  Enter 确认  ·  Esc 返回{RESET}"));
+        if let Some(message) = &notice {
+            try_draw!(writeln!(out, "{YELLOW}  {}{RESET}", display_text(message, width.saturating_sub(4))));
+        } else {
+            try_draw!(writeln!(out, "{GRAY}  ↑/↓ 选择  ·  Enter/Space 勾选  ·  → 完成  ·  Esc 返回{RESET}"));
+        }
         write_box_bottom(&mut out, width)?;
         out.flush().map_err(|e| format!("刷新 SoundFont 列表失败: {e}"))?;
 
@@ -393,13 +521,268 @@ fn choose_soundfont(current: Option<&str>) -> Result<Option<String>, String> {
             Key::Quit | Key::Escape | Key::Left => return Ok(None),
             Key::Up => selected = selected.saturating_sub(1),
             Key::Down | Key::Tab => selected = (selected + 1).min(item_count.saturating_sub(1)),
-            Key::Enter => {
+            Key::Enter | Key::Space => {
                 if selected < fonts.len() {
-                    return Ok(Some(fonts[selected].clone()));
+                    if let Some(position) = chosen_indices
+                        .iter()
+                        .position(|index| *index == selected)
+                    {
+                        chosen_indices.remove(position);
+                        notice = None;
+                    } else if chosen_indices.len() >= MAX_SOUNDFONTS {
+                        notice = Some(format!("最多同时选择 {} 个 SoundFont。", MAX_SOUNDFONTS));
+                    } else {
+                        chosen_indices.push(selected);
+                        let chosen = chosen_indices
+                            .iter()
+                            .map(|index| fonts[*index].clone())
+                            .collect::<Vec<_>>();
+                        match validate_soundfont_paths(&chosen) {
+                            Ok(()) => notice = None,
+                            Err(error) => {
+                                chosen_indices.pop();
+                                notice = Some(error);
+                            }
+                        }
+                    }
+                } else if let Some(path) = browse_file(BrowseKind::Soundfont)? {
+                    if chosen_indices.len() >= MAX_SOUNDFONTS {
+                        notice = Some(format!("最多同时选择 {} 个 SoundFont。", MAX_SOUNDFONTS));
+                    } else {
+                        let path_text = path.to_string_lossy().into_owned();
+                        if let Some(index) = fonts.iter().position(|font| font == &path_text) {
+                            selected = index;
+                            if !chosen_indices.contains(&index) {
+                                chosen_indices.push(index);
+                                let chosen = chosen_indices
+                                    .iter()
+                                    .map(|font_index| fonts[*font_index].clone())
+                                    .collect::<Vec<_>>();
+                                if let Err(error) = validate_soundfont_paths(&chosen) {
+                                    chosen_indices.pop();
+                                    notice = Some(error);
+                                } else {
+                                    notice = None;
+                                }
+                            }
+                        } else {
+                            let chosen = chosen_indices
+                                .iter()
+                                .map(|index| fonts[*index].clone())
+                                .chain(std::iter::once(path_text.clone()))
+                                .collect::<Vec<_>>();
+                            match validate_soundfont_paths(&chosen) {
+                                Ok(()) => {
+                                    fonts.push(path_text);
+                                    selected = fonts.len() - 1;
+                                    chosen_indices.push(selected);
+                                    notice = None;
+                                }
+                                Err(error) => notice = Some(error),
+                            }
+                        }
+                    }
                 }
-                if let Some(path) = browse_file(BrowseKind::Soundfont)? {
-                    return Ok(Some(path.to_string_lossy().into_owned()));
+            }
+            Key::Right => {
+                let chosen = chosen_indices
+                    .iter()
+                    .map(|index| fonts[*index].clone())
+                    .collect::<Vec<_>>();
+                if chosen.is_empty() {
+                    notice = Some("至少选择一个 SoundFont。".to_string());
+                } else if let Err(error) = validate_soundfont_paths(&chosen) {
+                    notice = Some(error);
+                } else {
+                    return Ok(Some(chosen));
                 }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwitchDraftField {
+    Seconds,
+    Soundfont,
+    Instrument,
+}
+
+struct SwitchDraft {
+    seconds: String,
+    soundfont: String,
+    instrument: String,
+    field: SwitchDraftField,
+}
+
+impl SwitchDraft {
+    fn new() -> Self {
+        Self {
+            seconds: String::new(),
+            soundfont: String::new(),
+            instrument: String::new(),
+            field: SwitchDraftField::Seconds,
+        }
+    }
+
+    fn current_input_mut(&mut self) -> &mut String {
+        match self.field {
+            SwitchDraftField::Seconds => &mut self.seconds,
+            SwitchDraftField::Soundfont => &mut self.soundfont,
+            SwitchDraftField::Instrument => &mut self.instrument,
+        }
+    }
+
+    fn next(&mut self) {
+        self.field = match self.field {
+            SwitchDraftField::Seconds => SwitchDraftField::Soundfont,
+            SwitchDraftField::Soundfont => SwitchDraftField::Instrument,
+            SwitchDraftField::Instrument => SwitchDraftField::Seconds,
+        };
+    }
+
+    fn build(&self, soundfont_count: usize) -> Result<ProgramSwitch, String> {
+        let seconds: u64 = self.seconds.parse().map_err(|_| "秒数必须是非负整数")?;
+        let at_ms = seconds
+            .checked_mul(1_000)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or("秒数超出可表示范围（最大约 4294967 秒）")?;
+        let soundfont: usize = self.soundfont.parse::<usize>().map_err(|_| "SoundFont 编号必须是整数")?.checked_sub(1).ok_or("SoundFont 编号从 1 开始")?;
+        let instrument: u16 = self.instrument.parse().map_err(|_| "GM 音色号必须是 0–127")?;
+        let switch = ProgramSwitch {
+            at_ms,
+            soundfont,
+            instrument: instrument.try_into().map_err(|_| "GM 音色号必须是 0–127")?,
+        };
+        validate_program_switches(&[switch], soundfont_count)?;
+        Ok(switch)
+    }
+}
+
+/// 编辑中途音色切换。每条记录输入“秒数 → SoundFont 编号 → GM 音色号”，
+/// 最多 24 条；列表按秒数排序，等时记录保留输入顺序。
+fn edit_program_switches(
+    mut switches: Vec<ProgramSwitch>,
+    soundfont_count: usize,
+) -> Result<Option<Vec<ProgramSwitch>>, String> {
+    validate_program_switches(&switches, soundfont_count)?;
+    let original = switches.clone();
+    let mut selected = 0usize;
+    let mut draft: Option<SwitchDraft> = None;
+    let mut notice: Option<String> = None;
+    loop {
+        let (width, height) = terminal_size();
+        let mut out = io::stdout();
+        clear_screen(&mut out)?;
+        write_box_top(&mut out, width)?;
+        try_draw!(writeln!(out, "{MAGENTA}{BOLD}  设置中途音色切换（最多 24 条）{RESET}"));
+        try_draw!(writeln!(out, "{GRAY}  时间单位为秒；SoundFont 编号按选择顺序从 1 开始。{RESET}"));
+        write_box_rule(&mut out, width)?;
+        let rows = height.saturating_sub(10).max(3);
+        if switches.is_empty() {
+            try_draw!(writeln!(out, "{DIM}  尚未设置。按 A 添加一条记录。{RESET}"));
+        } else {
+            let (start, end) = page_bounds(selected, switches.len(), rows);
+            for (index, switch) in switches.iter().enumerate().take(end).skip(start) {
+                let marker = if index == selected { ">" } else { " " };
+                let color = if index == selected { CYAN } else { "" };
+                try_draw!(writeln!(out, "{color} {marker} {:>2}. {:>6.1}s  SoundFont #{}  GM#{}{RESET}", index + 1, switch.at_ms as f64 / 1000.0, switch.soundfont + 1, switch.instrument));
+            }
+        }
+        if let Some(draft) = &draft {
+            write_box_rule(&mut out, width)?;
+            let field = match draft.field {
+                SwitchDraftField::Seconds => "秒数",
+                SwitchDraftField::Soundfont => "SoundFont 编号",
+                SwitchDraftField::Instrument => "GM 音色号",
+            };
+            try_draw!(writeln!(out, "{CYAN}  新记录：秒={} · 音源={} · 音色={} · 当前输入：{}{RESET}", draft.seconds, draft.soundfont, draft.instrument, field));
+        }
+        write_box_rule(&mut out, width)?;
+        if let Some(message) = &notice {
+            try_draw!(writeln!(out, "{YELLOW}  {}{RESET}", display_text(message, width.saturating_sub(4))));
+        } else if draft.is_some() {
+            try_draw!(writeln!(out, "{GRAY}  数字输入 · Backspace 删除 · Tab/Enter 下一项 · Esc 取消本条{RESET}"));
+        } else {
+            try_draw!(writeln!(out, "{GRAY}  ↑/↓ 选择 · A 添加 · D 删除 · → 完成 · Esc 返回{RESET}"));
+        }
+        write_box_bottom(&mut out, width)?;
+        out.flush().map_err(|e| format!("刷新音色切换界面失败: {e}"))?;
+
+        let key = read_key()?;
+        if let Some(current) = draft.as_mut() {
+            match key {
+                Key::Quit | Key::Escape => {
+                    draft = None;
+                    notice = None;
+                }
+                Key::Digit(digit) => {
+                    let input = current.current_input_mut();
+                    if input.len() < 10 { input.push(char::from(b'0' + digit)); }
+                    notice = None;
+                }
+                Key::Backspace => {
+                    current.current_input_mut().pop();
+                    notice = None;
+                }
+                Key::Tab | Key::Enter => {
+                    if current.field != SwitchDraftField::Instrument {
+                        current.next();
+                        notice = None;
+                    } else {
+                        match current.build(soundfont_count) {
+                            Ok(value) => {
+                                if switches.len() >= MAX_PROGRAM_SWITCHES {
+                                    notice = Some(format!("最多只能设置 {} 条切换。", MAX_PROGRAM_SWITCHES));
+                                } else {
+                                    switches.push(value);
+                                    switches.sort_by_key(|switch| switch.at_ms);
+                                    selected = switches.iter().position(|item| *item == value).unwrap_or(0);
+                                    draft = None;
+                                    notice = None;
+                                }
+                            }
+                            Err(error) => notice = Some(error),
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match key {
+            Key::Quit | Key::Escape | Key::Left => return Ok(None),
+            Key::Up => selected = selected.saturating_sub(1),
+            Key::Down | Key::Tab => selected = (selected + 1).min(switches.len().saturating_sub(1)),
+            Key::Add => {
+                if switches.len() >= MAX_PROGRAM_SWITCHES {
+                    notice = Some(format!("最多只能设置 {} 条切换。", MAX_PROGRAM_SWITCHES));
+                } else {
+                    draft = Some(SwitchDraft::new());
+                    notice = None;
+                }
+            }
+            Key::Delete => {
+                if !switches.is_empty() {
+                    switches.remove(selected.min(switches.len() - 1));
+                    selected = selected.min(switches.len().saturating_sub(1));
+                    notice = None;
+                }
+            }
+            Key::Enter => {
+                if switches.is_empty() && switches.len() < MAX_PROGRAM_SWITCHES {
+                    draft = Some(SwitchDraft::new());
+                }
+                notice = None;
+            }
+            Key::Right => {
+                validate_program_switches(&switches, soundfont_count)?;
+                if switches == original {
+                    return Ok(None);
+                }
+                return Ok(Some(switches));
             }
             _ => {}
         }
@@ -730,6 +1113,9 @@ enum Key {
     Tab,
     Increment,
     Decrement,
+    Space,
+    Add,
+    Delete,
     Digit(u8),
     Backspace,
     Quit,
@@ -763,6 +1149,9 @@ fn read_key() -> Result<Key, String> {
         b'\t' => Key::Tab,
         b'+' | b'=' => Key::Increment,
         b'-' => Key::Decrement,
+        b' ' => Key::Space,
+        b'a' | b'A' => Key::Add,
+        b'd' | b'D' => Key::Delete,
         b'0'..=b'9' => Key::Digit(first - b'0'),
         0x08 | 0x7f => Key::Backspace,
         b'k' | b'K' => Key::Up,
@@ -907,9 +1296,9 @@ impl Drop for TerminalSession {
 mod tests {
     use super::{
         display_text, display_width, matches_browser_kind, page_bounds, parse_program_number,
-        preferred_soundfont,
-        BrowseKind,
+        preferred_soundfont, remap_program_switches, SwitchDraft, BrowseKind,
     };
+    use crate::synth::ProgramSwitch;
     use std::path::Path;
 
     #[test]
@@ -951,5 +1340,38 @@ mod tests {
         assert_eq!(parse_program_number("127"), Ok(127));
         assert!(parse_program_number("128").is_err());
         assert!(parse_program_number("").is_err());
+    }
+
+    #[test]
+    fn soundfont_reorder_remaps_switches_and_removed_fonts_drop_rules() {
+        let old = vec!["a.sf2".to_string(), "b.sf2".to_string(), "c.sf2".to_string()];
+        let new = vec!["c.sf2".to_string(), "a.sf2".to_string()];
+        let switches = vec![
+            ProgramSwitch { at_ms: 1_000, soundfont: 0, instrument: 10 },
+            ProgramSwitch { at_ms: 2_000, soundfont: 1, instrument: 20 },
+            ProgramSwitch { at_ms: 3_000, soundfont: 2, instrument: 30 },
+        ];
+        let (remapped, removed) = remap_program_switches(&switches, &old, &new);
+        assert_eq!(removed, 1);
+        assert_eq!(remapped.len(), 2);
+        assert_eq!(remapped[0].soundfont, 1);
+        assert_eq!(remapped[1].soundfont, 0);
+        assert_eq!(remapped[1].at_ms, 3_000);
+    }
+
+    #[test]
+    fn switch_editor_rejects_seconds_that_overflow_milliseconds() {
+        let valid = SwitchDraft {
+            seconds: "4294967".to_string(),
+            soundfont: "1".to_string(),
+            instrument: "0".to_string(),
+            field: super::SwitchDraftField::Seconds,
+        };
+        assert_eq!(valid.build(1).unwrap().at_ms, 4_294_967_000);
+        let overflow = SwitchDraft {
+            seconds: "4294968".to_string(),
+            ..valid
+        };
+        assert!(overflow.build(1).unwrap_err().contains("超出可表示范围"));
     }
 }
