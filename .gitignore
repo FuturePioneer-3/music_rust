@@ -5,3 +5,7 @@ packaging/pkg/
 packaging/src/
 packaging/music
 testdata/
+*.AppImage
+*.AppImage.sha256
+*.pkg.tar.zst
+SHA256SUMS
