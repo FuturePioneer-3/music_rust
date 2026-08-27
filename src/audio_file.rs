@@ -22,6 +22,8 @@ extern "C" {
     fn music_audio_spectrum(player: *mut RawAudio, levels: *mut u8);
     fn music_audio_metadata(player: *mut RawAudio, key: *const c_char) -> *const c_char;
     fn music_audio_art(player: *mut RawAudio, data: *mut *const u8, width: *mut c_int, height: *mut c_int) -> i32;
+    fn music_audio_decode_image(encoded: *const u8, len: usize, data: *mut *mut u8, width: *mut c_int, height: *mut c_int) -> i32;
+    fn music_audio_free_image(data: *mut u8);
     fn music_audio_close(player: *mut RawAudio);
 
     // 汇编优化例程（src/music_asm.S，AT&T 语法，非内联）；
@@ -102,6 +104,29 @@ impl AudioFilePlayer {
         let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
         Some(ArtImage { data: bytes, width: width as usize, height: height as usize })
     }
+}
+
+/// 使用与音频专辑封面相同的 FFmpeg 解码路径，将内嵌图片转为 RGBA8。
+pub fn decode_image(encoded: &[u8]) -> Option<ArtImage> {
+    let mut data: *mut u8 = std::ptr::null_mut();
+    let mut width: c_int = 0;
+    let mut height: c_int = 0;
+    let present = unsafe {
+        music_audio_decode_image(encoded.as_ptr(), encoded.len(), &mut data, &mut width, &mut height)
+    };
+    if present == 0 || data.is_null() || width <= 0 || height <= 0 {
+        return None;
+    }
+    let len = match (width as usize).checked_mul(height as usize).and_then(|size| size.checked_mul(4)) {
+        Some(len) => len,
+        None => {
+            unsafe { music_audio_free_image(data); }
+            return None;
+        }
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+    unsafe { music_audio_free_image(data); }
+    Some(ArtImage { data: bytes, width: width as usize, height: height as usize })
 }
 
 impl Drop for AudioFilePlayer { fn drop(&mut self) { unsafe { music_audio_close(self.raw); } } }
@@ -318,6 +343,22 @@ mod tests {
         for i in 0..odd.len() {
             assert!((odd[i] - rodd[i]).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn decodes_embedded_png_for_score_tui() {
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+            0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02,
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x12, 0x16, 0xf1, 0x4d, 0x00, 0x00, 0x00,
+            0x15, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x94, 0xab, 0xb8, 0xc3,
+            0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc4, 0x00, 0x03, 0x00, 0x19, 0x82,
+            0x01, 0x76, 0xb0, 0x32, 0x48, 0x05, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+            0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let image = decode_image(png).expect("FFmpeg should decode the embedded PNG");
+        assert_eq!((image.width, image.height), (3, 2));
+        assert_eq!(image.data.len(), 3 * 2 * 4);
     }
 
     /// 元数据 + 封面提取集成测试：

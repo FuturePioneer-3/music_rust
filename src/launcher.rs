@@ -333,7 +333,7 @@ fn render_startup(state: &StartupState) -> Result<(), String> {
 
     write_box_top(&mut out, width)?;
     try_draw!(writeln!(out, "{CYAN}{BOLD}  music_rust 启动选择器{RESET}"));
-    try_draw!(writeln!(out, "{GRAY}  SoundFont 与初始 GM 音色用于 MIDI/简谱；TXT v3.1 内嵌计划优先。{RESET}"));
+    try_draw!(writeln!(out, "{GRAY}  SoundFont 与初始 GM 音色用于 MIDI/简谱；TXT v3.2/v3.1 内嵌计划优先。{RESET}"));
     write_box_rule(&mut out, width)?;
 
     let file = state

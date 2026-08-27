@@ -21,7 +21,7 @@
 MIDI → 简谱TXT 转换器
 music_rust 钢琴演奏器配套工具
 
-将标准 MIDI 文件 (.mid/.midi) 转换为 music_rust v3.1 绝对事件 TXT。
+将标准 MIDI 文件 (.mid/.midi) 转换为 music_rust v3.2 绝对事件 TXT。
 
 用法:
     python3 convert.py                         # 打开独立转换界面
@@ -45,6 +45,11 @@ music_rust 钢琴演奏器配套工具
     --switch <秒:音色>  在指定时间切换音色，可重复使用
     --switch <秒:SF:音色>
                          切换 SoundFont 和音色，最多 24 条
+    --embed-image <图片> 将图片二进制内嵌到 TXT v3.2
+    --image-compression <raw|zstd>
+                         图片使用原始或 zstd 二进制（默认 raw）
+    --image-level <1..22>
+                         zstd 压缩级别（默认 3）
     --v2                 输出旧版可读多音轨 T 格式
     --legacy             输出最旧的 v1/v2 两行一组格式
 
@@ -57,8 +62,11 @@ MIDI 音符编号 → 简谱:
 
 import argparse
 import math
+import mimetypes
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import textwrap
 from collections import defaultdict
@@ -89,6 +97,9 @@ MAX_SOUNDFONTS = 3
 MAX_PROGRAM_SWITCHES = 24
 # Rust 播放时间线的 ProgramSwitch.at_ms 为 u32。
 MAX_SWITCH_MILLISECONDS = (1 << 32) - 1
+MAX_EMBEDDED_IMAGE_BYTES = 64 * 1024 * 1024
+IMAGE_BEGIN = b'-----BEGIN MUSIC_RUST IMAGE-----\n'
+IMAGE_END = b'-----END MUSIC_RUST IMAGE-----\n'
 
 # ---------------------------------------------------------------------------
 # MIDI 解析器
@@ -584,13 +595,20 @@ def convert(midi_path, out_path, opts):
         for name, events in v2_tracks:
             _convert_track_to_lines(name, events, division, opts, lines, tempo_timeline, initial_tempo_ms, global_start)
     else:
+        embedded_image = _prepare_embedded_image(opts)
         output_track_count = _convert_v3(
-            out_tracks, division, tempo_timeline, midi_path, lines, opts
+            out_tracks, division, tempo_timeline, midi_path, lines, opts,
+            embedded_image,
         )
 
     # 写入
-    content = '\n'.join(lines)
-    with open(out_path, 'w', encoding='utf-8') as f:
+    content = '\n'.join(lines).encode('utf-8')
+    if not content.endswith(b'\n'):
+        content += b'\n'
+    if not opts.legacy and not opts.v2 and embedded_image is not None:
+        _mime, _encoding, payload, _raw_size = embedded_image
+        content += IMAGE_BEGIN + payload + b'\n' + IMAGE_END
+    with open(out_path, 'wb') as f:
         f.write(content)
     return output_track_count
 
@@ -641,8 +659,61 @@ def _expand_v3_tracks_by_channel(out_tracks):
     return expanded
 
 
-def _convert_v3(out_tracks, division, tempo_timeline, midi_path, lines, opts):
-    """输出 v3.1：音色元数据 + 绝对 tick 音符 + 全局 tempo 表。
+def _image_mime(path, data):
+    """用文件头优先判断图片类型，扩展名只作为兜底。"""
+    signatures = (
+        (b'\x89PNG\r\n\x1a\n', 'image/png'),
+        (b'\xff\xd8\xff', 'image/jpeg'),
+        (b'GIF87a', 'image/gif'),
+        (b'GIF89a', 'image/gif'),
+        (b'RIFF', 'image/webp'),
+        (b'BM', 'image/bmp'),
+    )
+    for signature, mime in signatures:
+        if data.startswith(signature):
+            return mime
+    return mimetypes.guess_type(path)[0] or 'application/octet-stream'
+
+
+def _prepare_embedded_image(opts):
+    """返回 (MIME, 编码, payload, 原始大小)，未启用时返回 None。"""
+    image_path = getattr(opts, 'image_path', None)
+    if not image_path:
+        return None
+    image_path = os.path.abspath(os.path.expanduser(image_path))
+    if not os.path.isfile(image_path):
+        raise ValueError(f'找不到内嵌图片: {image_path}')
+    with open(image_path, 'rb') as f:
+        raw = f.read()
+    if not raw:
+        raise ValueError('内嵌图片不能为空')
+    if len(raw) > MAX_EMBEDDED_IMAGE_BYTES:
+        raise ValueError('内嵌图片不能超过 64 MiB')
+    encoding = getattr(opts, 'image_compression', 'raw').lower()
+    if encoding == 'raw':
+        payload = raw
+    elif encoding == 'zstd':
+        level = int(getattr(opts, 'image_level', 3))
+        if not 1 <= level <= 22:
+            raise ValueError('zstd 压缩级别必须在 1..22 之间')
+        zstd = shutil.which('zstd')
+        if not zstd:
+            raise ValueError('选择 zstd 压缩时需要安装 zstd 命令')
+        result = subprocess.run(
+            [zstd, f'-{level}', '--stdout', '--no-progress'],
+            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode('utf-8', errors='replace').strip()
+            raise ValueError(f'zstd 压缩失败: {detail or result.returncode}')
+        payload = result.stdout
+    else:
+        raise ValueError('图片编码必须是 raw 或 zstd')
+    return _image_mime(image_path, raw), encoding, payload, len(raw)
+
+
+def _convert_v3(out_tracks, division, tempo_timeline, midi_path, lines, opts, embedded_image=None):
+    """输出 v3.2：音色元数据、绝对 tick 音符、全局 tempo 表和可选图片。
 
     单通道 MIDI 轨保留原始索引；同一物理轨内的多个通道会拆成独立 TXT 轨，
     避免 type-0 MIDI 被折叠到首通道。音符不再通过简谱 token 的顺序和休止符
@@ -651,12 +722,16 @@ def _convert_v3(out_tracks, division, tempo_timeline, midi_path, lines, opts):
     initial_soundfont = getattr(opts, 'initial_soundfont', 1)
     instrument = getattr(opts, 'instrument', 0)
     program_switches = getattr(opts, 'program_switches', [])
+    format_version = str(getattr(opts, 'format', 'v3.2')).lstrip('vV')
     lines.extend([
-        "#MUSIC_RUST 3.1",
+        f"#MUSIC_RUST {format_version}",
         f"#TITLE {os.path.splitext(os.path.basename(midi_path))[0]}",
         f"#PPQ {division}",
         f"@INSTRUMENT {initial_soundfont} {instrument}",
     ])
+    if embedded_image is not None:
+        mime, encoding, payload, raw_size = embedded_image
+        lines.append(f'@IMAGE {mime} {encoding} {len(payload)} {raw_size}')
     for at_ms, soundfont, switch_instrument in program_switches:
         lines.append(
             f"@SWITCH {_format_switch_seconds(at_ms)} {soundfont} {switch_instrument}"
@@ -1002,11 +1077,16 @@ def _parse_switches(specs, initial_soundfont):
 # 无参数 curses 转换界面
 # ---------------------------------------------------------------------------
 
-TUI_FORMATS = ('v3.1', 'v2', 'legacy')
+TUI_FORMATS = ('v3.2', 'v3.1', 'v2', 'legacy')
+TUI_IMAGE_ENCODINGS = ('raw', 'zstd')
 TUI_FIELDS = (
     ('midi', 'MIDI 文件', 'path', '回车输入，P 浏览'),
     ('output', '输出 TXT', 'path', '留空时使用 MIDI 同名 .txt'),
-    ('format', '输出格式', 'format', 'v3.1 可保存音色切换'),
+    ('format', '输出格式', 'format', 'v3.2 支持内嵌图片；v3.1 仅保存音色切换'),
+    ('embed_image', '内嵌图片', 'bool', 'v3.2 专用；是后填写图片文件'),
+    ('image_path', '图片文件', 'path', 'v3.2 专用；PNG/JPEG/WebP 等图片'),
+    ('image_compression', '图片编码', 'choice', 'raw 原始二进制；zstd 可压缩'),
+    ('image_level', 'zstd 级别', 'text', '1..22；级别越高越省空间但越慢'),
     ('bpm', 'BPM 覆盖', 'text', '留空时保留 MIDI 速度'),
     ('velocity_scale', '力度倍率', 'text', '大于 0，默认 1.0'),
     ('track', '音轨编号', 'text', '例如 0,2,5；留空为全部'),
@@ -1027,7 +1107,11 @@ class ConverterTuiState:
 
     midi: str = ''
     output: str = ''
-    format: str = 'v3.1'
+    format: str = 'v3.2'
+    embed_image: bool = False
+    image_path: str = ''
+    image_compression: str = 'raw'
+    image_level: str = '3'
     bpm: str = ''
     velocity_scale: str = '1.0'
     track: str = ''
@@ -1080,6 +1164,14 @@ def _build_tui_job(state):
 
     if state.format not in TUI_FORMATS:
         raise ValueError('输出格式无效')
+    if state.embed_image and state.format != 'v3.2':
+        raise ValueError('内嵌图片仅能用于 v3.2 输出格式')
+    if state.image_compression not in TUI_IMAGE_ENCODINGS:
+        raise ValueError('图片编码必须是 raw 或 zstd')
+    image_path = state.image_path.strip() if state.embed_image else None
+    if state.embed_image and not image_path:
+        raise ValueError('已启用内嵌图片，请填写图片文件')
+    image_level = _parse_tui_int(state.image_level, 'zstd 压缩级别', 1, 22)
     bpm = _parse_tui_int(state.bpm, 'BPM', 1, 60_000, optional=True)
     quantize = _parse_tui_int(state.quantize, '量化 tick', 0)
     max_tracks = _parse_tui_int(state.max_tracks, '最多音轨', 1, optional=True)
@@ -1120,7 +1212,7 @@ def _build_tui_job(state):
     if (v2 or legacy) and (
         initial_soundfont != 1 or instrument != 0 or program_switches
     ):
-        raise ValueError('v2/legacy 无法保存音色配置；请选择 v3.1 或清空音色切换')
+        raise ValueError('v2/legacy 无法保存音色配置；请选择 v3.1/v3.2 或清空音色切换')
 
     opts = argparse.Namespace(
         bpm=bpm,
@@ -1136,6 +1228,10 @@ def _build_tui_job(state):
         initial_soundfont=initial_soundfont,
         instrument=instrument,
         program_switches=program_switches,
+        image_path=image_path,
+        image_compression=state.image_compression,
+        image_level=image_level,
+        format=state.format,
         switch=[],
         v2=v2,
         legacy=legacy,
@@ -1364,14 +1460,16 @@ def _draw_tui(screen, state, page, selected, scroll, status='', status_error=Fal
         for row, (name, label, _kind, _help) in enumerate(TUI_FIELDS[scroll:scroll + available], start=3):
             index = scroll + row - 3
             attr = curses.A_REVERSE if index == selected else 0
-            if state.format != 'v3.1' and name in ('initial_soundfont', 'instrument'):
+            if state.format not in ('v3.1', 'v3.2') and name in ('initial_soundfont', 'instrument'):
+                attr |= curses.A_DIM
+            if state.format != 'v3.2' and name in ('embed_image', 'image_path', 'image_compression', 'image_level'):
                 attr |= curses.A_DIM
             _safe_addstr(screen, row, 2, f"{'>' if index == selected else ' '} {label:<16} {_tui_field_value(state, name)}", attr)
         _name, _label, _kind, help_text = TUI_FIELDS[selected]
         _safe_addstr(screen, height - 4, 2, help_text, curses.A_DIM)
         controls = 'Tab 切换页  ↑↓ 选择  Enter 修改  P 浏览 MIDI  F5/C 开始转换  Q 退出'
     else:
-        _safe_addstr(screen, 3, 2, f'已设置 {len(state.switches)}/{MAX_PROGRAM_SWITCHES} 条（仅 v3.1 保存）', curses.A_BOLD)
+        _safe_addstr(screen, 3, 2, f'已设置 {len(state.switches)}/{MAX_PROGRAM_SWITCHES} 条（v3.1/v3.2 保存）', curses.A_BOLD)
         list_rows = max(1, available - 2)
         if state.switches:
             selected = max(0, min(selected, len(state.switches) - 1))
@@ -1404,10 +1502,15 @@ def _edit_tui_field(screen, state, field_index):
     if kind == 'bool':
         setattr(state, name, not getattr(state, name))
         return f'{label}已设为 {_tui_field_value(state, name)}'
+    if kind == 'choice':
+        choices = TUI_IMAGE_ENCODINGS
+        index = choices.index(getattr(state, name))
+        setattr(state, name, choices[(index + 1) % len(choices)])
+        return f'{label}已设为 {_tui_field_value(state, name)}'
     if kind == 'format':
         index = TUI_FORMATS.index(state.format)
         state.format = TUI_FORMATS[(index + 1) % len(TUI_FORMATS)]
-        if state.format != 'v3.1' and (
+        if state.format not in ('v3.1', 'v3.2') and (
             state.initial_soundfont != '1' or state.instrument != '0' or state.switches
         ):
             return f'已选 {state.format}；该格式不能保存非默认音色配置'
@@ -1527,6 +1630,12 @@ def _tui_main(screen):
                     state.format = TUI_FORMATS[(index + direction) % len(TUI_FORMATS)]
                     status = f'输出格式已设为 {state.format}'
                     status_error = False
+                elif kind == 'choice':
+                    index = TUI_IMAGE_ENCODINGS.index(getattr(state, name))
+                    direction = -1 if key == curses.KEY_LEFT else 1
+                    setattr(state, name, TUI_IMAGE_ENCODINGS[(index + direction) % len(TUI_IMAGE_ENCODINGS)])
+                    status = f'{_label}已设为 {_tui_field_value(state, name)}'
+                    status_error = False
             elif key in ('p', 'P'):
                 chosen = _pick_midi_file(screen, state.midi)
                 if chosen:
@@ -1536,7 +1645,7 @@ def _tui_main(screen):
             elif key in ('\n', '\r') or key == curses.KEY_ENTER:
                 status = _edit_tui_field(screen, state, setting_selected)
                 status_error = bool(
-                    status and state.format != 'v3.1' and '不能保存' in status
+                    status and state.format not in ('v3.1', 'v3.2') and '不能保存' in status
                 )
         else:
             if key in (curses.KEY_UP, 'k', 'K') and state.switches:
@@ -1640,7 +1749,19 @@ def main(argv=None):
         '--switch', action='append', default=[], metavar='秒[:SF编号]:音色',
         help='定时切换音色，格式为 秒:音色 或 秒:SF编号:音色（最多 24 条）',
     )
-    parser.add_argument('--v2', action='store_true', help='输出旧版可读多音轨 T 格式（默认输出 v3.1）')
+    parser.add_argument(
+        '--embed-image', '--image', dest='image_path', metavar='图片',
+        help='将图片二进制内嵌到 TXT v3.2（默认不内嵌）',
+    )
+    parser.add_argument(
+        '--image-compression', choices=('raw', 'zstd'), default='raw',
+        help='图片二进制编码：raw 或 zstd（默认 raw）',
+    )
+    parser.add_argument(
+        '--image-level', type=_bounded_int('zstd 压缩级别', 1, 22), default=3,
+        metavar='1..22', help='zstd 压缩级别（默认 3）',
+    )
+    parser.add_argument('--v2', action='store_true', help='输出旧版可读多音轨 T 格式（默认输出 v3.2）')
     parser.add_argument('--legacy', action='store_true', help='输出最旧版两行一组格式')
     args = parser.parse_args(argv)
 
@@ -1653,7 +1774,7 @@ def main(argv=None):
         args.initial_soundfont != 1 or args.instrument != 0 or bool(args.program_switches)
     )
     if (args.v2 or args.legacy) and has_nondefault_instrument:
-        parser.error('--v2/--legacy 无法保存音色配置；请使用默认 v3.1 格式')
+        parser.error('--v2/--legacy 无法保存音色配置；请使用默认 v3.2 格式')
 
     if not os.path.isfile(args.midi):
         print(f"错误: 找不到文件 {args.midi}", file=sys.stderr)
@@ -1665,6 +1786,8 @@ def main(argv=None):
         out = base + '.txt'
 
     args.track_list = None
+    if args.image_path and (args.v2 or args.legacy):
+        parser.error('--embed-image 只能用于默认 v3.2 格式')
     if args.track:
         try:
             args.track_list = [int(x) for x in args.track.split(',')]
@@ -1684,12 +1807,14 @@ def main(argv=None):
         print(f"速度: {args.bpm} BPM")
     print(f"力度倍率: {args.velocity_scale:g}")
     if not args.v2 and not args.legacy:
-        print("TXT 格式: music_rust v3.1")
+        print("TXT 格式: music_rust v3.2")
         print(
             f"初始音色: SoundFont {args.initial_soundfont}, "
             f"GM {args.instrument}"
         )
         print(f"定时切换: {len(args.program_switches)} 条")
+        if args.image_path:
+            print(f"内嵌图片: {args.image_path} ({args.image_compression}, 级别 {args.image_level})")
     return 0
 
 

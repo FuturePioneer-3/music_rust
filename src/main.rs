@@ -21,8 +21,9 @@
 //! 跨平台(主要 Linux) MIDI 简谱播放器。
 //! 读取自定义简谱 TXT（支持多音轨），通过系统 libfluidsynth + SoundFont 演奏钢琴音色。
 //!
-//! 3.22：
-//!   - 新增 TXT v3.1：文件可声明初始 SoundFont/GM 音色及最多 24 条按秒切换
+//! 3.3：
+//!   - 新增 TXT v3.2：文件可内嵌原始或 zstd 压缩图片，并保持二进制安全解析
+//!   - 图片可在播放 TUI 中按音频封面相同的半区块方式显示
 //!   - 播放前严格检查 TXT 要求的全部音色；任一预置缺失即报错退出
 //!   - 新增无参数启动选择器，可选择乐曲、SoundFont 与 MIDI/简谱初始 GM 音色号
 //!   - 无参数启动器可同时加载至多 3 个 SoundFont（任意两个合计 ≤120 MB），并为
@@ -34,7 +35,7 @@
 //!   - 音量缩放、频谱 Goertzel 谐振器、峰值限制器热循环改为独立
 //!     AT&T 语法汇编（src/music_asm.S，非内联，SSE2）
 //!
-//! 3.22.1：
+//! 3.3.0：
 //!   - 修复 MIDI 总时长估算对非 0 通道事件的解析错位
 //!   - 修复截断/损坏 MIDI 文件可能导致越界崩溃的问题
 //!   - 修复音频文件播放线程与控制线程对 ramp_gain 的数据竞争
@@ -75,7 +76,7 @@ use parser::{parse_file, print_first_events, print_score_summary};
 use synth::{find_soundfont, ProgramSwitch, SynthPlayer};
 
 /// 展示版本号（与 Cargo/Arch 包保持一致）
-pub const VERSION: &str = "3.22.1";
+pub const VERSION: &str = "3.3.0";
 
 fn print_usage() {
     println!("music_rust —— 钢琴演奏器 v{}", VERSION);
@@ -349,7 +350,7 @@ fn main() {
     print_score_summary(&score);
     print_first_events(&score, 20);
 
-    // TXT v3.1 的音色计划属于乐谱内容，确保转换后的文件无需再次手工输入
+    // TXT v3.1/v3.2 的音色计划属于乐谱内容，确保转换后的文件无需再次手工输入
     // 就能复现；v3.0 及旧格式继续沿用启动选择器/命令行配置。
     let (initial_soundfont, initial_instrument, program_switches) =
         if let Some(plan) = &score.program_plan {
@@ -363,7 +364,7 @@ fn main() {
                 })
                 .collect::<Vec<_>>();
             info(format!(
-                "TXT v3.1 音色计划: 初始 SoundFont #{} / GM Program {}，中途切换 {} 条",
+                "TXT v3.x 音色计划: 初始 SoundFont #{} / GM Program {}，中途切换 {} 条",
                 plan.initial_soundfont + 1,
                 plan.initial_instrument,
                 switches.len()
@@ -372,6 +373,19 @@ fn main() {
         } else {
             (0, args.instrument, args.program_switches.clone())
         };
+
+    let score_art = score.image.as_ref().and_then(|image| {
+        match audio_file::decode_image(&image.data) {
+            Some(art) => {
+                info(format!("TXT 内嵌图片已解码: {} ({} bytes)", image.mime, image.data.len()));
+                Some(art)
+            }
+            None => {
+                log::warn(format!("TXT 内嵌图片无法解码（{}），继续播放乐谱", image.mime));
+                None
+            }
+        }
+    });
 
     // 初始化合成器
     let mut player = match SynthPlayer::new_with_soundfonts(&soundfonts, score.tempo_ms, args.debug, args.limit_db) {
@@ -395,7 +409,7 @@ fn main() {
         exit(1);
     }
 
-    // 设置每个音轨的初始乐器。v3.1 使用文件内要求；旧格式默认 GM 0，
+    // 设置每个音轨的初始乐器。v3.1/v3.2 使用文件内要求；旧格式默认 GM 0，
     // 并可由 --instrument 或无参数启动器覆盖。
     for track in &score.tracks {
         if let Err(err) = player.set_soundfont_instrument(
@@ -439,6 +453,7 @@ fn main() {
         initial_soundfont,
         initial_instrument,
         &program_switches,
+        score_art,
     ) {
         error(format!("简谱播放失败: {}", err));
         player.shutdown();

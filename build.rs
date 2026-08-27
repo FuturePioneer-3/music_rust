@@ -54,6 +54,8 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib={}", link_name);
     }
     println!("cargo:rustc-link-lib=dylib=m");
+    // TXT v3.2 的图片区块可选择 zstd；使用系统库避免引入额外 Rust 运行时。
+    println!("cargo:rustc-link-lib=dylib=zstd");
 
     let has_pkgconfig = Command::new("pkg-config")
         .args(["--exists", "fluidsynth"])

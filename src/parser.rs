@@ -19,8 +19,8 @@
 //! 简谱(TXT)解析器 —— 改进版：支持多音轨
 //!
 //! v3 文件使用 `#MUSIC_RUST 3` 标记、全局 `@TEMPO` 表和绝对 `@NOTE` 事件；
-//! v3.1 在此基础上增加文件内嵌的初始音色与按秒切换规则；v1/v2 的
-//! 行式简谱格式仍由下面的兼容解析器处理。
+//! v3.1 在此基础上增加文件内嵌的初始音色与按秒切换规则；v3.2 再增加
+//! 可选的原始/zstd 二进制图片区块；v1/v2 的行式简谱格式仍由下面的兼容解析器处理。
 //!
 //! ## 格式说明
 //!
@@ -96,6 +96,14 @@ pub struct ScoreProgramPlan {
     pub switches: Vec<ScoreProgramSwitch>,
 }
 
+/// TXT v3.2 的内嵌图片。data 始终是解压后的原始图片文件字节，便于上层
+/// 直接交给已有的 FFmpeg 图片解码器；文本中的 zstd 只影响磁盘占用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreImage {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
 /// TXT v3.1 与启动选择器保持一致，最多允许 24 条中途切换。
 pub const MAX_SCORE_PROGRAM_SWITCHES: usize = 24;
 
@@ -108,6 +116,8 @@ pub struct Score {
     pub total_ms: u32,
     /// 仅 TXT v3.1 携带；v3.0/v2/v1 继续使用命令行或启动选择器的设置。
     pub program_plan: Option<ScoreProgramPlan>,
+    /// 仅 TXT v3.2 携带；图片解码失败时播放器仍可继续播放乐谱。
+    pub image: Option<ScoreImage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -329,15 +339,100 @@ fn classify_line(line: &str) -> LineKind {
 
 /// 从文件中读取并解析。`force_tempo` 可覆盖第一行速度。
 pub fn parse_file(path: &str, force_tempo: Option<u32>) -> Result<Score, String> {
-    let content = std::fs::read_to_string(path)
+    let content = std::fs::read(path)
         .map_err(|e| format!("无法读取 {}: {}", path, e))?;
-    parse_str(&content, force_tempo)
+    parse_bytes(&content, force_tempo)
 }
 
 /// 解析字符串内容。
+#[allow(dead_code)]
 pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, String> {
+    parse_bytes(content.as_bytes(), force_tempo)
+}
+
+const IMAGE_BEGIN: &[u8] = b"-----BEGIN MUSIC_RUST IMAGE-----\n";
+const IMAGE_END: &[u8] = b"-----END MUSIC_RUST IMAGE-----";
+const MAX_EMBEDDED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+#[link(name = "zstd")]
+extern "C" {
+    fn ZSTD_decompress(dst: *mut u8, dst_capacity: usize, src: *const u8, compressed_size: usize) -> usize;
+    fn ZSTD_isError(code: usize) -> u32;
+    fn ZSTD_getErrorName(code: usize) -> *const std::ffi::c_char;
+}
+
+fn decompress_zstd(payload: &[u8], original_size: usize) -> Result<Vec<u8>, String> {
+    if original_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut output = vec![0u8; original_size];
+    let result = unsafe {
+        ZSTD_decompress(output.as_mut_ptr(), output.len(), payload.as_ptr(), payload.len())
+    };
+    if unsafe { ZSTD_isError(result) } != 0 {
+        let message = unsafe { std::ffi::CStr::from_ptr(ZSTD_getErrorName(result)) }
+            .to_string_lossy();
+        return Err(format!("zstd 图片解压失败: {}", message));
+    }
+    output.truncate(result);
+    Ok(output)
+}
+
+/// 解析 UTF-8 文本及其可选的 v3.2 二进制图片区块。
+fn parse_bytes(content: &[u8], force_tempo: Option<u32>) -> Result<Score, String> {
+    let mut image = None;
+    let text = if let Some(begin) = content.windows(IMAGE_BEGIN.len()).position(|w| w == IMAGE_BEGIN) {
+        let prefix = &content[..begin];
+        let prefix_text = std::str::from_utf8(prefix)
+            .map_err(|_| "TXT v3.2 图片区块前的文本不是有效 UTF-8".to_string())?;
+        let image_line = prefix_text.lines().find(|line| {
+            let upper = line.trim().to_ascii_uppercase();
+            upper.starts_with("@IMAGE ") || upper == "@IMAGE"
+        }).ok_or_else(|| "找到图片起始分隔线，但缺少 @IMAGE 描述行".to_string())?;
+        let mut fields = image_line.split_whitespace();
+        let _ = fields.next();
+        let mime = fields.next().ok_or_else(|| "@IMAGE 缺少 MIME 类型".to_string())?.to_string();
+        let encoding = fields.next().ok_or_else(|| "@IMAGE 缺少编码方式".to_ascii_lowercase())?;
+        let encoded_size = fields.next().ok_or_else(|| "@IMAGE 缺少二进制长度".to_string())?
+            .parse::<usize>().map_err(|_| "@IMAGE 二进制长度无效".to_string())?;
+        let original_size = fields.next().ok_or_else(|| "@IMAGE 缺少原始长度".to_string())?
+            .parse::<usize>().map_err(|_| "@IMAGE 原始长度无效".to_string())?;
+        if fields.next().is_some() || encoded_size > MAX_EMBEDDED_IMAGE_BYTES || original_size > MAX_EMBEDDED_IMAGE_BYTES {
+            return Err("@IMAGE 长度超出 64 MiB 限制或字段过多".to_string());
+        }
+        let payload_start = begin + IMAGE_BEGIN.len();
+        let payload_end = payload_start.checked_add(encoded_size)
+            .ok_or_else(|| "@IMAGE 二进制长度溢出".to_string())?;
+        let payload = content.get(payload_start..payload_end)
+            .ok_or_else(|| "@IMAGE 二进制数据不完整".to_string())?;
+        let after_payload = content.get(payload_end..)
+            .ok_or_else(|| "@IMAGE 结束位置无效".to_string())?;
+        let after_newline = if after_payload.starts_with(b"\r\n") {
+            &after_payload[2..]
+        } else if after_payload.starts_with(b"\n") {
+            &after_payload[1..]
+        } else {
+            return Err("@IMAGE 二进制数据后缺少换行分隔".to_string());
+        };
+        if !after_newline.starts_with(IMAGE_END) {
+            return Err("@IMAGE 缺少结束分隔线".to_string());
+        }
+        let decoded = match encoding.to_ascii_lowercase().as_str() {
+            "raw" | "original" => payload.to_vec(),
+            "zstd" => decompress_zstd(payload, original_size)?,
+            other => return Err(format!("不支持的图片编码方式: {}（可用 raw 或 zstd）", other)),
+        };
+        if decoded.len() != original_size {
+            return Err(format!("图片原始长度不匹配: 声明 {}，实际 {}", original_size, decoded.len()));
+        }
+        image = Some(ScoreImage { mime, data: decoded });
+        prefix_text
+    } else {
+        std::str::from_utf8(content).map_err(|_| "TXT 文件不是有效 UTF-8".to_string())?
+    };
+
     // 第一遍：扫描行分类，得到结构
-    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
 
     // v3 使用绝对 tick 和全局 tempo 表，必须在旧版行式解析前单独处理。
     // 版本号做完整匹配，避免把未来的 3.10 误当作 3.1。
@@ -354,8 +449,9 @@ pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, Strin
     });
     if let Some(version) = declared_format {
         match version.as_str() {
-            "3" | "3.0" => return parse_v3_format(&lines, force_tempo, false),
-            "3.1" => return parse_v3_format(&lines, force_tempo, true),
+            "3" | "3.0" => return parse_v3_format(&lines, force_tempo, 30, image),
+            "3.1" => return parse_v3_format(&lines, force_tempo, 31, image),
+            "3.2" => return parse_v3_format(&lines, force_tempo, 32, image),
             // 旧式行格式曾允许把版本写在注释中，继续交给兼容解析器。
             "1" | "2" => {}
             _ => return Err(format!("不支持的 MUSIC_RUST TXT 格式版本: {}", version)),
@@ -434,6 +530,7 @@ pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, Strin
         tracks: Vec::new(),
         total_ms: 0,
         program_plan: None,
+        image,
     };
 
     if has_track_header {
@@ -490,8 +587,11 @@ pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, Strin
 fn parse_v3_format(
     lines: &[String],
     force_tempo: Option<u32>,
-    is_v31: bool,
+    format_version: u8,
+    image: Option<ScoreImage>,
 ) -> Result<Score, String> {
+    let is_v31 = format_version >= 31;
+    let is_v32 = format_version >= 32;
     #[derive(Clone)]
     struct TrackDef { id: u32, channel: u8, name: String }
     #[derive(Clone, Copy)]
@@ -638,6 +738,21 @@ fn parse_v3_format(
                     instrument,
                 });
             }
+            "@IMAGE" | "IMAGE" => {
+                if !is_v32 {
+                    return Err(format!(
+                        "v3 第{}行 @IMAGE 仅能用于 #MUSIC_RUST 3.2",
+                        line_no + 1
+                    ));
+                }
+                let fields = fields.collect::<Vec<_>>();
+                if fields.len() != 4 {
+                    return Err(format!(
+                        "v3.2 第{}行 @IMAGE 字段应为 MIME 编码 压缩长度 原始长度",
+                        line_no + 1
+                    ));
+                }
+            }
             "@TEMPO" | "TEMPO" => {
                 let tick = fields.next().ok_or_else(|| format!("v3 第{}行缺少 tempo tick", line_no + 1))?
                     .parse::<u64>().map_err(|_| format!("v3 第{}行 tempo tick 无效", line_no + 1))?;
@@ -756,6 +871,7 @@ fn parse_v3_format(
         title,
         total_ms,
         program_plan,
+        image,
     })
 }
 
@@ -1206,8 +1322,22 @@ mod tests {
         assert!(parse_str(old_v3, None)
             .unwrap_err()
             .contains("仅能用于 #MUSIC_RUST 3.1"));
-        assert!(parse_str("#MUSIC_RUST 3.2\n", None)
-            .unwrap_err()
-            .contains("不支持"));
+    }
+
+    #[test]
+    fn test_v32_reads_raw_binary_image_by_declared_length() {
+        let image = vec![0x89, b'P', b'N', b'G', b'\n', 0, 0xff, b'-'];
+        let prefix = format!(
+            "#MUSIC_RUST 3.2\n#TITLE Picture\n@IMAGE image/png raw {} {}\n@TRACK 0 0 P\n",
+            image.len(), image.len()
+        );
+        let mut data = prefix.into_bytes();
+        data.extend_from_slice(IMAGE_BEGIN);
+        data.extend_from_slice(&image);
+        data.extend_from_slice(b"\n");
+        data.extend_from_slice(IMAGE_END);
+        let score = parse_bytes(&data, None).unwrap();
+        assert_eq!(score.title, "Picture");
+        assert_eq!(score.image.unwrap().data, image);
     }
 }

@@ -6,6 +6,7 @@
 #define MUSIC_AUDIO_FILE_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct music_audio music_audio;
 
@@ -21,6 +22,9 @@ float music_audio_volume(music_audio *player);
 void music_audio_spectrum(music_audio *player, uint8_t levels[16]);
 const char *music_audio_metadata(music_audio *player, const char *key);
 int music_audio_art(music_audio *player, const unsigned char **data, int *width, int *height);
+int music_audio_decode_image(const unsigned char *encoded, size_t len,
+                             unsigned char **data, int *width, int *height);
+void music_audio_free_image(unsigned char *data);
 void music_audio_close(music_audio *player);
 
 // ---- 2.4.0：元数据与封面 ----

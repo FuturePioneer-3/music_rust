@@ -351,6 +351,16 @@ impl Tui {
         Self::start_full(title, mode, enabled, None, MetaInfo::default())
     }
 
+    /// 带有任意图片的播放界面入口；音频封面和 TXT v3.2 图片共用同一布局。
+    pub fn start_with_art(
+        title: &str,
+        mode: &'static str,
+        enabled: bool,
+        art: Option<ArtImage>,
+    ) -> Option<Self> {
+        Self::start_full(title, mode, enabled, art, MetaInfo::default())
+    }
+
     /// 带封面与元数据的完整启动（音频文件模式）。
     pub fn start_full(
         title: &str,

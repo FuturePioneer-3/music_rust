@@ -25,7 +25,7 @@ music_rust 是一个**终端音乐播放器**，内置三套播放引擎：
 
 | 模式 | 输入 | 引擎 |
 | ---- | ---- | ---- |
-| 🎼 **简谱模式** | 简谱 TXT（v3.1 / v3.0 / v2 / 旧版 v1） | 系统 **libfluidsynth** + SoundFont，毫秒级排程 |
+| 🎼 **简谱模式** | 简谱 TXT（v3.2 / v3.1 / v3.0 / v2 / 旧版 v1） | 系统 **libfluidsynth** + SoundFont，毫秒级排程 |
 | 🎵 **MIDI 模式** | `.mid` / `.midi` | fluidsynth 原生播放器（多轨同步 + tempo 变速，最准确） |
 | 📁 **音乐文件模式** | WAV / MP3 / FLAC / OGG / Opus / AAC / M4A / WMA | C/FFmpeg 解码 + ALSA 输出，专辑封面与元数据渲染 |
 
@@ -33,14 +33,20 @@ music_rust 是一个**终端音乐播放器**，内置三套播放引擎：
 本项目完全用 **Rust** 重写，通过 FFI 直连系统 `libfluidsynth` 合成器，支持绝大多数 Linux 发行版。
 **不带参数**运行会打开交互式启动选择器；带文件运行则直接开始播放。
 
-## v3.22.1 修复
+## v3.3.0 新特性
+
+- 🖼️ **TXT v3.2 内嵌图片**：图片以原始或 zstd 二进制放在分隔线后，长度字段保证任意二进制内容（包括换行）都能安全读取。
+- 🎛️ Python 转换器和 curses TUI 都可以选择是否内嵌图片、raw/zstd 编码以及 1–22 的 zstd 压缩级别。
+- 🖥️ Rust 播放 TUI 复用音频封面的 FFmpeg 解码和半区块渲染，终端不支持真彩色时自动降级。
+
+## v3.22.1 修复（历史）
 
 - 🐛 修复 MIDI 总时长估算在通道 1–15 上解析错位的问题，MIDI 模式的进度条和
   总时长显示不再离谱。
 - 🛡️ 截断或损坏的 MIDI 文件不再越界崩溃，而是按“无法估算时长”处理。
 - 🔧 消除音频播放线程与暂停/跳转控制之间对渐变音量的数据竞争。
 
-## v3.22 新特性
+## v3.22 新特性（历史）
 
 - 📄 **TXT v3.1** 可在乐谱内嵌初始 SoundFont/GM 音色与最多 24 条定时
   切换，转换后的文件自带完整播放计划。
@@ -61,7 +67,7 @@ music_rust 是一个**终端音乐播放器**，内置三套播放引擎：
 2. 🧭 **启动选择器**（无参数运行）：文件浏览、多 SoundFont 选择、GM 音色号与中途切换编辑；`Q`/`Esc` 取消。
 3. 🎹 简谱 TXT 与 MIDI 都可使用已选 SoundFont；两种模式均支持按秒中途切换音色。
 4. 🎼 **直接播放 MIDI 文件**（`-m` 或 `.mid` 扩展名）：fluidsynth 原生多轨同步 + tempo 变速。
-5. 📄 **TXT v3.1 格式**：在 v3.0 绝对 tick 事件与全局 tempo 表上，增加内嵌初始音色与定时切换计划。
+5. 📄 **TXT v3.2 格式**：在 v3.0 绝对 tick 事件与全局 tempo 表上，增加音色计划与可选二进制图片。
 6. 📜 完全兼容 TXT v3.0、v2 多轨 `T` 行和原版 v1 两行一组左右手格式。
 7. ⏱️ `fluid_sequencer` 毫秒级精确事件调度；快进/后退/循环/暂停精确到毫秒。
 8. 📊 **动态进度条**：实时百分比、已播/总时长、剩余时间。
@@ -72,7 +78,7 @@ music_rust 是一个**终端音乐播放器**，内置三套播放引擎：
 13. ⚙️ **SSE2 汇编音频内核**（`src/audio_dsp.S`、`src/music_asm.S`）：逐样本音量线性渐变 + 饱和钳制（音量调节/暂停/跳转不爆音）、峰值限制、16 段 Goertzel 频谱（4 路并行）。
 14. 🔇 **峰值限制器（默认 -1dBFS）**：自动防止多音符叠加削波/电流声。
 15. 📜 **自研彩色分级日志**（`log.rs`）：TRACE/DEBUG/INFO/WARN/ERROR 分级着色 + 毫秒时间戳 + 300 条环形缓冲。
-16. 🐍 配套纯 Python 转换器：`MIDI → 简谱 TXT`（默认 TXT v3.1），提供独立的无参数 curses TUI 与兼容的命令行。
+16. 🐍 配套纯 Python 转换器：`MIDI → 简谱 TXT`（默认 TXT v3.2），提供独立的无参数 curses TUI 与兼容的命令行。
 
 ## 快速开始
 
@@ -99,15 +105,15 @@ chmod +x music_rust-*-x86_64.AppImage
 从最新 release 下载 `music_rust-<版本>-1-x86_64.pkg.tar.zst`，然后：
 
 ```bash
-sudo pacman -U music_rust-3.22.1-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-3.3.0-1-x86_64.pkg.tar.zst
 # 包内已包含电子合成器 SoundFont；自动安装 fluidsynth 等运行依赖
 music 乐曲.txt
 music                # 或打开启动选择器
 music-convert        # 打开独立的 MIDI → TXT 转换器 TUI
 ```
 
-转换器会安装为 `/usr/bin/music-convert`。它只使用 Python 标准库（包括 curses），
-不需要 pip 或任何第三方 Python 包。
+转换器会安装为 `/usr/bin/music-convert`。MIDI 解析只使用 Python 标准库（包括 curses）；
+可选的 zstd 图片编码使用包内的 `zstd` 命令。
 
 ### 从源码构建
 
@@ -262,16 +268,25 @@ TXT v3.1 乐谱如果内嵌了音色计划，则文件内计划会取代这些�
 ./target/release/music 乐曲.txt --limit -6
 ```
 
-## TXT v3.1 格式（推荐）
+## TXT v3.2 格式（推荐）
 
-TXT v3.1 在 v3.0 的**绝对 tick 音符事件**和全局 tempo 表上，增加了可随文件
-保存的音色计划。新指令的严格格式如下：
+TXT v3.2 在 v3.0 的**绝对 tick 音符事件**和全局 tempo 表上，保留 v3.1 的音色计划，
+并增加可选的二进制图片区块。新指令的严格格式如下：
 
 ```text
-#MUSIC_RUST 3.1
+#MUSIC_RUST 3.2
 @INSTRUMENT <1-based SoundFont 1..3> <GM 0..127>
 @SWITCH <nonnegative seconds> <SF number> <GM>
+@IMAGE <MIME> <raw|zstd> <encoded-bytes> <original-bytes>
+-----BEGIN MUSIC_RUST IMAGE-----
+<encoded image bytes, written directly>
+-----END MUSIC_RUST IMAGE-----
 ```
+
+图片区块必须放在 `@IMAGE` 描述行之后；程序严格按 `encoded-bytes` 读取，随后要求结束分隔线，
+因此图片二进制可以包含换行、零字节和任意其它字节。`raw` 保存原始图片文件，`zstd` 保存压缩后的
+图片文件，压缩级别由转换器指定（1–22）。播放器解压后交给 FFmpeg，并像 MP3 封面一样在 Rust TUI
+中以半区块字符显示；图片解码失败不会影响乐曲播放。
 
 `@INSTRUMENT` 选择初始 SoundFont 和 GM 音色。`@SWITCH` 在指定的非负时间同时切换
 SoundFont 与 GM 音色；可使用小数秒，解析时换算为毫秒。每个文件最多 24 条
@@ -281,7 +296,7 @@ SoundFont 与 GM 音色；可使用小数秒，解析时换算为毫秒。每个
 完整示例：
 
 ```text
-#MUSIC_RUST 3.1
+#MUSIC_RUST 3.2
 #TITLE 示例
 #PPQ 480
 @INSTRUMENT 1 80
@@ -299,9 +314,9 @@ SoundFont 与 GM 音色；可使用小数秒，解析时换算为毫秒。每个
 字段与播放约定：
 
 - SoundFont 编号从 1 开始，指向已加载的 1–3 个音源；GM 音色号为 0–127。
-- v3.1 文件未写音色指令时，初始默认为 SoundFont 1 / GM 0。自动发现会优先把
+- v3.2/v3.1 文件未写音色指令时，初始默认为 SoundFont 1 / GM 0。自动发现会优先把
   内置 `electronic_synth.sf2` 作为第 1 个音源，因此默认仍是电子合成器音源。
-- v3.1 文件内嵌的初始音色与切换计划优先于无参数启动器中的音色设置和
+- v3.2/v3.1 文件内嵌的初始音色与切换计划优先于无参数启动器中的音色设置和
   `--instrument`。SoundFont 文件路径仍由自动发现、启动器或重复的 `--soundfont` 提供。
 - Rust 会在安排任何音符前，检查所有引用的 SoundFont 是否已加载、每个要求的 GM 预置
   是否存在。任一项缺失都会明确报错并在播放前退出。
@@ -309,7 +324,7 @@ SoundFont 与 GM 音色；可使用小数秒，解析时换算为毫秒。每个
   单位为 microseconds per quarter；休止由绝对时间间隔自然表达。
 - MIDI 音高为 0–127，力度为 1–127。
 
-MIDI 转换器默认生成 TXT v3.1：
+MIDI 转换器默认生成 TXT v3.2：
 
 ```bash
 python3 convert/convert.py song.mid -o song.v31.txt
@@ -317,6 +332,7 @@ python3 convert/convert.py song.mid --initial-soundfont 2 --instrument 40
 python3 convert/convert.py song.mid --switch 5:81 --switch 12.5:2:40
 python3 convert/convert.py song.mid --bpm 90       # 按比例缩放整张 tempo 表
 python3 convert/convert.py song.mid --track 2,5    # 按原始 MIDI 轨道编号选择
+python3 convert/convert.py song.mid --embed-image cover.jpg --image-compression zstd --image-level 12
 ```
 
 `秒:音色` 写法使用 `--initial-soundfont`；如需指定其他音源，使用 `秒:SF:音色`。
@@ -413,13 +429,13 @@ music-convert               # 安装 Arch 包后
 
 转换器 TUI 可选择输入 MIDI 文件与输出 TXT 路径、设置基本转换选项、初始
 SoundFont 编号与 GM 音色号，并可添加/编辑最多 24 条按时切换 SoundFont/音色的
-规则。转换进度、完成或错误状态也会直接显示在该界面中。
+规则；v3.2 下还可选择是否内嵌图片、图片路径、raw/zstd 和压缩级别。转换进度、完成或错误状态也会直接显示在该界面中。
 
 传入 MIDI 路径时仍使用原有的非交互命令行；所有旧参数与自动化脚本保持兼容。
 安装后的 `music-convert` 与 `python3 convert/convert.py` 接受完全相同的参数：
 
 ```bash
-music-convert 歌曲.mid              # 默认输出 歌曲.txt（TXT v3.1）
+music-convert 歌曲.mid              # 默认输出 歌曲.txt（TXT v3.2）
 music-convert 歌曲.mid -o 输出.txt  # 指定输出
 music-convert 歌曲.mid --bpm 100    # 指定速度
 music-convert 歌曲.mid --track 0,1  # 按原始 MIDI 编号转换 0、1 轨
@@ -429,6 +445,7 @@ music-convert 歌曲.mid              # 交互输入力度倍率，如 0.5、1.2
 music-convert 歌曲.mid --velocity-scale 1.25
 music-convert 歌曲.mid --v2         # 输出旧版可读 T 多轨格式
 music-convert 歌曲.mid --legacy     # 输出旧版两行一组格式
+music-convert 歌曲.mid --embed-image cover.jpg --image-compression zstd --image-level 12
 ```
 
 ### 转换器参数
@@ -449,17 +466,20 @@ music-convert 歌曲.mid --legacy     # 输出旧版两行一组格式
 | `--instrument <0..127>` | 初始 GM 音色号（默认 0） |
 | `--switch <秒:音色>` | 在初始 SoundFont 上定时切换音色；可重复，最多 24 条 |
 | `--switch <秒:SF:音色>` | 定时切换 SoundFont/音色；两种写法可混用，合计最多 24 条 |
+| `--embed-image <图片>` | 将图片二进制内嵌到 TXT v3.2；不填写则不内嵌 |
+| `--image-compression <raw\|zstd>` | 图片保存为原始或 zstd 二进制（默认 raw） |
+| `--image-level <1..22>` | zstd 压缩级别（默认 3；级别越高通常越省空间但越慢） |
 | `--v2` | 输出旧版可读多音轨 T 格式；仅接受默认音色配置 |
 | `--legacy` | 输出旧版 v1/v2 格式；仅接受默认音色配置 |
 
-> 转换器纯 Python 标准库实现，无第三方依赖，支持标准 MIDI (SMF type 0/1/2)。
+> 转换器 MIDI 解析使用 Python 标准库；启用 zstd 图片压缩时需要系统 `zstd` 命令。支持标准 MIDI (SMF type 0/1/2)。
 > 在交互终端运行且未指定 `--velocity-scale` 时，转换器会询问力度倍率；可输入任意正数，输出会钳制到 MIDI 的 1–127。TXT v3.1 会保存力度，v2/legacy 简谱格式没有力度字段。`--v2` 和 `--legacy` 会拒绝任何非默认音色配置，因为这两种格式无法表示它。
 > 对 type-0 等“单物理轨、多 MIDI 通道”的文件，v3.1 会按通道拆成独立 `@TRACK`，避免所有音符被折叠到首通道；未指定 `--drum` 时会逐事件排除打击乐通道 10（内部 ch9）。
 > 转换器会明确拒绝 SMPTE time-division MIDI；请先转为 PPQ MIDI，以免绝对 tick 时间被错误解释。
 
 ### 动态 BPM（中途变速）
 
-转换器会从所有 MIDI 轨道收集 tempo 事件，并在 TXT v3.1 文件中写成全局 `@TEMPO tick us_per_quarter` 表；
+转换器会从所有 MIDI 轨道收集 tempo 事件，并在 TXT v3.2 文件中写成全局 `@TEMPO tick us_per_quarter` 表；
 播放器按绝对 tick 换算时间，变速不会在轨道之间漂移。`--bpm` 会等比例缩放整张 tempo 表。
 `--v2` 输出的旧格式仍保留 `#BPM` 兼容行为：
 

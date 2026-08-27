@@ -215,6 +215,101 @@ static int decode_attached_picture(music_audio *p, AVPacket *packet,
     return ok;
 }
 
+typedef struct {
+    const unsigned char *data;
+    size_t len;
+    size_t pos;
+} music_image_input;
+
+static int image_read_packet(void *opaque, uint8_t *buf, int buf_size) {
+    music_image_input *input = (music_image_input *)opaque;
+    if (!input || input->pos >= input->len) return AVERROR_EOF;
+    size_t remaining = input->len - input->pos;
+    size_t count = remaining < (size_t)buf_size ? remaining : (size_t)buf_size;
+    memcpy(buf, input->data + input->pos, count);
+    input->pos += count;
+    return (int)count;
+}
+
+static int64_t image_seek(void *opaque, int64_t offset, int whence) {
+    music_image_input *input = (music_image_input *)opaque;
+    if (!input) return -1;
+    if (whence == AVSEEK_SIZE) return (int64_t)input->len;
+    int64_t target;
+    if (whence == SEEK_SET) target = offset;
+    else if (whence == SEEK_CUR) target = (int64_t)input->pos + offset;
+    else if (whence == SEEK_END) target = (int64_t)input->len + offset;
+    else return -1;
+    if (target < 0 || (uint64_t)target > input->len) return -1;
+    input->pos = (size_t)target;
+    return target;
+}
+
+/* Decode a standalone embedded image using the same FFmpeg path as audio covers. */
+int music_audio_decode_image(const unsigned char *encoded, size_t len,
+                             unsigned char **data, int *width, int *height) {
+    if (!encoded || len == 0 || !data || !width || !height) return 0;
+    *data = NULL; *width = 0; *height = 0;
+    music_image_input input = { encoded, len, 0 };
+    unsigned char *io_buffer = av_malloc(4096);
+    if (!io_buffer) return 0;
+    AVIOContext *io = avio_alloc_context(io_buffer, 4096, 0, &input,
+                                         image_read_packet, NULL, image_seek);
+    if (!io) { av_free(io_buffer); return 0; }
+    AVFormatContext *format = avformat_alloc_context();
+    if (!format) { avio_context_free(&io); return 0; }
+    format->pb = io;
+    format->flags |= AVFMT_FLAG_CUSTOM_IO;
+    if (avformat_open_input(&format, NULL, NULL, NULL) < 0 ||
+        avformat_find_stream_info(format, NULL) < 0) {
+        avformat_close_input(&format);
+        return 0;
+    }
+    int stream = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (stream < 0) { avformat_close_input(&format); return 0; }
+    AVCodecParameters *params = format->streams[stream]->codecpar;
+    const AVCodec *codec = avcodec_find_decoder(params->codec_id);
+    AVCodecContext *ctx = codec ? avcodec_alloc_context3(codec) : NULL;
+    AVFrame *frame = av_frame_alloc();
+    AVPacket *packet = av_packet_alloc();
+    int ok = 0;
+    if (!ctx || !frame || !packet || avcodec_parameters_to_context(ctx, params) < 0 ||
+        avcodec_open2(ctx, codec, NULL) < 0) goto image_done;
+    while (av_read_frame(format, packet) >= 0) {
+        if (packet->stream_index == stream && avcodec_send_packet(ctx, packet) >= 0 &&
+            avcodec_receive_frame(ctx, frame) >= 0) {
+            int iw = frame->width, ih = frame->height;
+            if (iw > 0 && ih > 0 && frame->format >= 0) {
+                double scale = (double)MUSIC_ART_MAX_DIM / (iw > ih ? iw : ih);
+                if (scale > 1.0) scale = 1.0;
+                int dw = (int)(iw * scale + 0.5); if (dw < 1) dw = 1;
+                int dh = (int)(ih * scale + 0.5); if (dh < 1) dh = 1;
+                struct SwsContext *sws = sws_getContext(
+                    iw, ih, (enum AVPixelFormat)frame->format,
+                    dw, dh, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
+                unsigned char *rgba = sws ? malloc((size_t)dw * dh * 4) : NULL;
+                if (sws && rgba) {
+                    uint8_t *dst_data[1] = { rgba };
+                    int dst_linesize[1] = { dw * 4 };
+                    sws_scale(sws, (const uint8_t *const *)frame->data,
+                              frame->linesize, 0, ih, dst_data, dst_linesize);
+                    *data = rgba; *width = dw; *height = dh; ok = 1;
+                } else free(rgba);
+                sws_freeContext(sws);
+            }
+            av_packet_unref(packet);
+            break;
+        }
+        av_packet_unref(packet);
+    }
+image_done:
+    av_packet_free(&packet); av_frame_free(&frame); avcodec_free_context(&ctx);
+    avformat_close_input(&format);
+    return ok;
+}
+
+void music_audio_free_image(unsigned char *data) { free(data); }
+
 /// 从已打开的 AVFormatContext 中查找内嵌封面流（ATTACHED_PIC），
 /// 使用流自带 attached_pic 包解码。找到并解码成功返回 1。
 static int load_attached_picture_from_format(music_audio *p, AVFormatContext *format) {

@@ -25,7 +25,7 @@ music_rust is a **terminal music player** with three playback engines:
 
 | Mode | Input | Engine |
 | ---- | ----- | ------ |
-| 🎼 **Score mode** | jianpu TXT (v3.1 / v3.0 / v2 / legacy v1) | system **libfluidsynth** + SoundFont, millisecond-precise sequencer |
+| 🎼 **Score mode** | jianpu TXT (v3.2 / v3.1 / v3.0 / v2 / legacy v1) | system **libfluidsynth** + SoundFont, millisecond-precise sequencer |
 | 🎵 **MIDI mode** | `.mid` / `.midi` | fluidsynth native player (multitrack sync + tempo map, most accurate) |
 | 📁 **Audio file mode** | WAV / MP3 / FLAC / OGG / Opus / AAC / M4A / WMA | C/FFmpeg decoder + ALSA output, album art & metadata rendering |
 
@@ -34,7 +34,13 @@ This project is fully rewritten in **Rust** and talks directly to the system `li
 supporting most Linux distributions. Run it with **no arguments** to open an interactive startup
 selector; run it with a file to start playing immediately.
 
-## What's New in v3.22.1
+## What's New in v3.3.0
+
+- 🖼️ **TXT v3.2 embedded images**: raw or zstd-compressed image bytes can follow delimiter lines; declared lengths make arbitrary binary data, including newlines, safe.
+- 🎛️ The Python converter and curses TUI can choose whether to embed an image, raw/zstd encoding, and any zstd level from 1–22.
+- 🖥️ The Rust playback TUI reuses the FFmpeg decoder and half-block renderer used for audio covers, with a real-tty fallback.
+
+## What's New in v3.22.1 (historical)
 
 - 🐛 Fixed the MIDI duration estimator desyncing on channels 1–15, which made the progress
   bar and the estimated total time wrong in MIDI mode.
@@ -43,7 +49,7 @@ selector; run it with a file to start playing immediately.
 - 🔧 Eliminated a data race on the audio fade gain between the playback thread and the
   pause/seek controls.
 
-## What's New in v3.22
+## What's New in v3.22 (historical)
 
 - 📄 **TXT v3.1** embeds its initial SoundFont/GM program and up to 24 timed timbre switches in
   the score, so a converted file carries its complete playback plan.
@@ -64,7 +70,7 @@ Recent milestones: **v3.21** added multi-SoundFont loading and timed MIDI/TXT sw
 2. 🧭 **Startup selector** (no arguments): file browser, multi-SoundFont picker, GM program input and timed switch editor; `Q`/`Esc` cancels.
 3. 🎹 Plays custom jianpu TXT and MIDI with any selected SoundFont timbre; timed switches are supported in both modes.
 4. 🎼 **Direct MIDI playback** (`-m` or `.mid` extension): fluidsynth-native multitrack sync + tempo changes.
-5. 📄 **TXT v3.1 format**: v3.0 absolute tick events and global tempo map, plus an embedded initial timbre and timed-switch plan.
+5. 📄 **TXT v3.2 format**: v3.0 absolute tick events and global tempo map, plus a timbre plan and optional binary image.
 6. 📜 Fully compatible with TXT v3.0, v2 multi-track `T` lines, and the original v1 two-line left/right-hand format.
 7. ⏱️ `fluid_sequencer` millisecond-precise event scheduling; seek/loop/pause exact to the millisecond.
 8. 📊 **Dynamic progress bar**: percentage, elapsed/total time, remaining time.
@@ -75,7 +81,7 @@ Recent milestones: **v3.21** added multi-SoundFont loading and timed MIDI/TXT sw
 13. ⚙️ **SSE2 assembly audio core** (`src/audio_dsp.S`, `src/music_asm.S`): per-sample volume ramping + saturated clamping (no pops on volume/pause/seek), peak limiting and the 16-band Goertzel spectrum (4 lanes in parallel).
 14. 🔇 **Peak limiter (default -1dBFS)**: prevents clipping/buzz from overlapping notes.
 15. 📜 **Custom colored leveled logger** (`log.rs`): TRACE/DEBUG/INFO/WARN/ERROR with colors, millisecond timestamps and a 300-entry ring buffer.
-16. 🐍 Companion pure-Python converter: `MIDI → jianpu TXT` (TXT v3.1 by default), with an independent no-argument curses TUI and a compatible CLI.
+16. 🐍 Companion pure-Python converter: `MIDI → jianpu TXT` (TXT v3.2 by default), with an independent no-argument curses TUI and a compatible CLI.
 
 ## Quick Start
 
@@ -102,15 +108,15 @@ The bundled SoundFont is loaded automatically. To use another font: `--soundfont
 Download `music_rust-<version>-1-x86_64.pkg.tar.zst` from the latest release, then:
 
 ```bash
-sudo pacman -U music_rust-3.22.1-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-3.3.0-1-x86_64.pkg.tar.zst
 # bundles the electronic-synth SoundFont and pulls in FluidSynth automatically
 music 乐曲.txt
 music                # or open the startup selector
 music-convert        # open the independent MIDI → TXT converter TUI
 ```
 
-The package installs the converter as `/usr/bin/music-convert`. It uses only the Python standard
-library (including curses); no pip or other third-party Python packages are required.
+The package installs the converter as `/usr/bin/music-convert`. MIDI parsing uses only the Python
+standard library (including curses); the optional zstd image encoder uses the packaged `zstd` command.
 
 ### Build from Source
 
@@ -268,16 +274,25 @@ Customize the target with `--limit`, e.g. more conservative `-6 dBFS` or more ag
 ./target/release/music 乐曲.txt --limit -6
 ```
 
-## TXT v3.1 Format (Recommended)
+## TXT v3.2 Format (Recommended)
 
-TXT v3.1 extends v3.0's **absolute tick events** and global tempo map with a playback-ready timbre
-plan. Its three new records are written in this form:
+TXT v3.2 extends v3.0's **absolute tick events** and global tempo map with v3.1's playback-ready timbre
+plan plus an optional binary image block. The image descriptor and delimiters are:
 
 ```text
-#MUSIC_RUST 3.1
+#MUSIC_RUST 3.2
 @INSTRUMENT <1-based SoundFont 1..3> <GM 0..127>
 @SWITCH <nonnegative seconds> <SF number> <GM>
+@IMAGE <MIME> <raw|zstd> <encoded-bytes> <original-bytes>
+-----BEGIN MUSIC_RUST IMAGE-----
+<encoded image bytes, written directly>
+-----END MUSIC_RUST IMAGE-----
 ```
+
+The parser reads exactly `encoded-bytes` after the begin delimiter and then requires the end delimiter,
+so image data may contain newlines, zero bytes, or delimiter-like bytes. `raw` stores the original image;
+`zstd` stores its compressed bytes using a converter-selected level from 1–22. Rust decompresses it and
+passes it through FFmpeg, rendering it in the score TUI like an MP3 cover. A decode failure does not stop playback.
 
 `@INSTRUMENT` selects the initial SoundFont and GM program. `@SWITCH` changes both at the stated
 nonnegative time; decimal seconds are accepted and normalized to milliseconds. A file may contain
@@ -288,7 +303,7 @@ to the same millisecond, their file order is preserved and the last one takes ef
 Complete example:
 
 ```text
-#MUSIC_RUST 3.1
+#MUSIC_RUST 3.2
 #TITLE Example
 #PPQ 480
 @INSTRUMENT 1 80
@@ -306,9 +321,9 @@ Complete example:
 Field and playback conventions:
 
 - SoundFont numbers are 1-based indices into the 1–3 loaded SoundFonts; GM programs are 0–127.
-- If omitted in a v3.1 file, the initial selection is SoundFont 1 / GM 0. Automatic discovery
+- If omitted in a v3.2/v3.1 file, the initial selection is SoundFont 1 / GM 0. Automatic discovery
   prioritizes the bundled `electronic_synth.sf2` as SoundFont 1, so the default remains the electronic font.
-- A v3.1 file's embedded initial selection and switch plan take precedence over the no-argument
+- A v3.2/v3.1 file's embedded initial selection and switch plan take precedence over the no-argument
   launcher's timbre settings and `--instrument`. SoundFont paths are still supplied by discovery,
   the launcher, or repeated `--soundfont` arguments.
 - Before scheduling any note, Rust checks that every referenced SoundFont is loaded and that every
@@ -317,7 +332,7 @@ Field and playback conventions:
   to all tracks and stores exact microseconds per quarter note; silence is the gap between absolute events.
 - MIDI keys are 0–127 and velocities are 1–127.
 
-The converter emits TXT v3.1 by default:
+The converter emits TXT v3.2 by default:
 
 ```bash
 python3 convert/convert.py song.mid -o song.v31.txt
@@ -325,6 +340,7 @@ python3 convert/convert.py song.mid --initial-soundfont 2 --instrument 40
 python3 convert/convert.py song.mid --switch 5:81 --switch 12.5:2:40
 python3 convert/convert.py song.mid --bpm 90       # scale the complete tempo map
 python3 convert/convert.py song.mid --track 2,5    # select original MIDI track IDs
+python3 convert/convert.py song.mid --embed-image cover.jpg --image-compression zstd --image-level 12
 ```
 
 In `seconds:program`, the switch uses `--initial-soundfont`; use `seconds:SF:program` to choose a
@@ -421,14 +437,15 @@ music-convert               # installed Arch package
 
 The converter TUI lets you choose the input MIDI file and output TXT path, edit the basic conversion
 options, set the initial SoundFont number and GM program, add/edit up to 24 timed SoundFont/program
-switches, and follow conversion status and the final success/error result in the same screen.
+switches, choose whether to embed an image, choose raw/zstd encoding and its compression level, and
+follow conversion status and the final success/error result in the same screen.
 
 Supplying a MIDI path continues to use the existing non-interactive command line; all previous CLI
 options and scripts remain compatible. The packaged `music-convert` command accepts the same options
 as `python3 convert/convert.py`:
 
 ```bash
-music-convert 歌曲.mid              # default output 歌曲.txt (TXT v3.1)
+music-convert 歌曲.mid              # default output 歌曲.txt (TXT v3.2)
 music-convert 歌曲.mid -o 输出.txt  # specify output
 music-convert 歌曲.mid --bpm 100    # specify tempo
 music-convert 歌曲.mid --track 0,1  # select original MIDI tracks 0 and 1
@@ -438,6 +455,7 @@ music-convert 歌曲.mid              # interactively enter a velocity multiplie
 music-convert 歌曲.mid --velocity-scale 1.25
 music-convert 歌曲.mid --v2         # output readable legacy T format
 music-convert 歌曲.mid --legacy     # output legacy two-line format
+music-convert 歌曲.mid --embed-image cover.jpg --image-compression zstd --image-level 12
 ```
 
 ### Converter Options
@@ -458,18 +476,21 @@ music-convert 歌曲.mid --legacy     # output legacy two-line format
 | `--instrument <0..127>` | initial GM program (default 0) |
 | `--switch <seconds:program>` | timed program switch on the initial SoundFont; repeat up to 24 times |
 | `--switch <seconds:SF:program>` | timed SoundFont/program switch; may be mixed and repeated up to 24 times total |
+| `--embed-image <image>` | embed image bytes in TXT v3.2; omit to disable |
+| `--image-compression <raw\|zstd>` | store raw or zstd-compressed image bytes (default raw) |
+| `--image-level <1..22>` | zstd compression level (default 3) |
 | `--v2` | output the older readable multitrack T format; accepts only default timbre configuration |
 | `--legacy` | output legacy v1/v2 format; accepts only default timbre configuration |
 
-> The converter is pure Python standard library, no third-party deps, supports standard MIDI (SMF type 0/1/2).
-> In an interactive terminal, omitting `--velocity-scale` prompts for any positive multiplier (for example `0.5`, `1.25`, or `2`). Values are clamped to MIDI 1–127. TXT v3.1 preserves velocity; v2/legacy notation has no velocity field. `--v2` and `--legacy` reject any non-default timbre configuration because those formats cannot represent it.
-> For type-0 and other single-physical-track/multi-channel files, v3.1 splits channels into independent `@TRACK` records instead of folding every note onto the first channel. Without `--drum`, percussion channel 10 (internal ch9) is filtered per event.
+> The MIDI parser uses only the Python standard library; zstd image compression additionally requires the system `zstd` command. It supports standard MIDI (SMF type 0/1/2).
+> In an interactive terminal, omitting `--velocity-scale` prompts for any positive multiplier (for example `0.5`, `1.25`, or `2`). Values are clamped to MIDI 1–127. TXT v3.2 preserves velocity; v2/legacy notation has no velocity field. `--v2` and `--legacy` reject any non-default timbre configuration because those formats cannot represent it.
+> For type-0 and other single-physical-track/multi-channel files, v3.2 splits channels into independent `@TRACK` records instead of folding every note onto the first channel. Without `--drum`, percussion channel 10 (internal ch9) is filtered per event.
 > The converter explicitly rejects SMPTE time-division MIDI; convert it to PPQ first so absolute-tick timing cannot be misinterpreted.
 
 ### Dynamic BPM (Mid-song Tempo Change)
 
 The converter collects tempo events from all MIDI tracks and writes a global `@TEMPO tick us_per_quarter`
-map in TXT v3.1. The player converts absolute ticks using that map, so tempo changes cannot drift between tracks.
+map in TXT v3.2. The player converts absolute ticks using that map, so tempo changes cannot drift between tracks.
 `--bpm` scales the complete tempo map. The older `--v2` output retains `#BPM` compatibility behavior:
 
 ```
