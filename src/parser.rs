@@ -31,8 +31,8 @@
 //! 之后：
 //!   - 以 `#` 开头的行是元指令（速度切换、注释）
 //!   - 以 `T` 开头的行开启一个音轨，格式：
-//!       `T 轨名 | 音符集1 | 音符集2 | ...`  —— 竖线 `|` 是该轨内的“段落”分隔，
-//!       竖线同时会被解析器忽略（兼容原格式的小节线含义）。
+//!     `T 轨名 | 音符集1 | 音符集2 | ...`  —— 竖线 `|` 是该轨内的“段落”分隔，
+//!     竖线同时会被解析器忽略（兼容原格式的小节线含义）。
 //!   - 其它行视为一个“时刻组”：按空格/制表符切分后，每个空白分隔的 Token
 //!     属于一个音轨。若同一行有多个 Token，则它们同时播放（多音轨同时发声）。
 //!   - 以空行分隔的连续行组 = 按顺序播放（纵向多轨并行，横向上一个组播完再播下一组）。
@@ -165,15 +165,18 @@ fn parse_token(token: &str, tempo_ms: u32) -> (Vec<u8>, u32) {
                 i += 1;
             }
             '*' => {
-                ctn = ctn * 1 / 3;
+                // 三连音（时值 ÷3）；原实现写成 ctn * 1 / 3，整数结果相同。
+                ctn /= 3;
                 i += 1;
             }
             '%' => {
-                ctn = ctn * 1 / 5;
+                // 五连音（时值 ÷5）。
+                ctn /= 5;
                 i += 1;
             }
             '&' => {
-                ctn = ctn * 1 / 7;
+                // 七连音（时值 ÷7）。
+                ctn /= 7;
                 i += 1;
             }
             '.' => {
@@ -226,26 +229,20 @@ fn parse_token(token: &str, tempo_ms: u32) -> (Vec<u8>, u32) {
                         "音符 {:?} 八度过高 (lvl={})，已截断",
                         token, lvl
                     ));
-                    lvl = MAX_HIGH;
                 }
                 if lvl < -MAX_LOW {
                     warn(format!(
                         "音符 {:?} 八度过低 (lvl={})，已截断",
                         token, lvl
                     ));
-                    lvl = -MAX_LOW;
                 }
+                lvl = lvl.clamp(-MAX_LOW, MAX_HIGH);
                 // MIDI = 60 (C4) + 12*lvl + 音级偏移 (+1 升音)
                 let mut midi = 60 + 12 * (lvl as i32) + DEGREE_OFFSET[degree] as i32;
                 if sharp {
                     midi += 1;
                 }
-                if midi < 0 {
-                    midi = 0;
-                }
-                if midi > 127 {
-                    midi = 127;
-                }
+                midi = midi.clamp(0, 127);
                 let note = midi as u8;
                 if is_chord {
                     chord_notes.push(note);
@@ -387,8 +384,9 @@ pub fn parse_str(content: &str, force_tempo: Option<u32>) -> Result<Score, Strin
                             .filter(|c| c.is_ascii_digit())
                             .collect();
                         if let Ok(bpm) = num.parse::<u32>() {
-                            if bpm > 0 {
-                                tempo_ms = (60_000 / bpm).max(1);
+                            // bpm 为 0 时保持原速度（checked_div 返回 None）。
+                            if let Some(ms) = 60_000_u32.checked_div(bpm) {
+                                tempo_ms = ms.max(1);
                             }
                         }
                     } else {
@@ -772,12 +770,17 @@ fn parse_legacy_format(
     let mut line_idx = 0usize;
     let mut t = 0i64; // 当前时间（毫秒）
     let mut cur_tempo = tempo_ms; // 当前速度（可变，支持中途变速）
-    let mut track1 = Track::default();
-    track1.name = "右手(R)".to_string();
-    track1.channel = 0;
-    let mut track2 = Track::default();
-    track2.name = "左手(L)".to_string();
-    track2.channel = 1;
+    // 旧版约定：第一行是右手、第二行是左手，通道固定 0/1。
+    let mut track1 = Track {
+        name: "右手(R)".to_string(),
+        channel: 0,
+        ..Track::default()
+    };
+    let mut track2 = Track {
+        name: "左手(L)".to_string(),
+        channel: 1,
+        ..Track::default()
+    };
     let mut groups_played = 0;
 
     while line_idx < lines.len() {
@@ -797,8 +800,8 @@ fn parse_legacy_format(
                 if let Some(rest) = t.strip_prefix('#') {
                     let num: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
                     if let Ok(bpm) = num.parse::<u32>() {
-                        if bpm > 0 {
-                            let new_ms = (60_000 / bpm).max(1);
+                        if let Some(new_ms) = 60_000_u32.checked_div(bpm) {
+                            let new_ms = new_ms.max(1);
                             if new_ms != cur_tempo {
                                 info(format!("旧版中途切换速度: {}ms/四分音符 ({} BPM)", new_ms, bpm));
                             }
@@ -976,8 +979,8 @@ fn parse_new_format(
                 if r.starts_with("BPM") || r.starts_with("bpm") {
                     let num: String = r.chars().filter(|c| c.is_ascii_digit()).collect();
                     if let Ok(bpm) = num.parse::<u32>() {
-                        if bpm > 0 {
-                            let new_ms = (60_000 / bpm).max(1);
+                        if let Some(new_ms) = 60_000_u32.checked_div(bpm) {
+                            let new_ms = new_ms.max(1);
                             if new_ms != cur_tempo {
                                 info(format!("多轨中途变速: {}ms/四分音符 ({} BPM)", new_ms, bpm));
                             }

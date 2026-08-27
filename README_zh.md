@@ -33,6 +33,13 @@ music_rust 是一个**终端音乐播放器**，内置三套播放引擎：
 本项目完全用 **Rust** 重写，通过 FFI 直连系统 `libfluidsynth` 合成器，支持绝大多数 Linux 发行版。
 **不带参数**运行会打开交互式启动选择器；带文件运行则直接开始播放。
 
+## v3.22.1 修复
+
+- 🐛 修复 MIDI 总时长估算在通道 1–15 上解析错位的问题，MIDI 模式的进度条和
+  总时长显示不再离谱。
+- 🛡️ 截断或损坏的 MIDI 文件不再越界崩溃，而是按“无法估算时长”处理。
+- 🔧 消除音频播放线程与暂停/跳转控制之间对渐变音量的数据竞争。
+
 ## v3.22 新特性
 
 - 📄 **TXT v3.1** 可在乐谱内嵌初始 SoundFont/GM 音色与最多 24 条定时
@@ -92,7 +99,7 @@ chmod +x music_rust-*-x86_64.AppImage
 从最新 release 下载 `music_rust-<版本>-1-x86_64.pkg.tar.zst`，然后：
 
 ```bash
-sudo pacman -U music_rust-3.22-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-3.22.1-1-x86_64.pkg.tar.zst
 # 包内已包含电子合成器 SoundFont；自动安装 fluidsynth 等运行依赖
 music 乐曲.txt
 music                # 或打开启动选择器

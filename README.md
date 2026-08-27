@@ -34,6 +34,15 @@ This project is fully rewritten in **Rust** and talks directly to the system `li
 supporting most Linux distributions. Run it with **no arguments** to open an interactive startup
 selector; run it with a file to start playing immediately.
 
+## What's New in v3.22.1
+
+- 🐛 Fixed the MIDI duration estimator desyncing on channels 1–15, which made the progress
+  bar and the estimated total time wrong in MIDI mode.
+- 🛡️ Truncated or corrupt MIDI files no longer crash with an out-of-bounds panic; the
+  estimator simply reports that the duration is unknown.
+- 🔧 Eliminated a data race on the audio fade gain between the playback thread and the
+  pause/seek controls.
+
 ## What's New in v3.22
 
 - 📄 **TXT v3.1** embeds its initial SoundFont/GM program and up to 24 timed timbre switches in
@@ -93,7 +102,7 @@ The bundled SoundFont is loaded automatically. To use another font: `--soundfont
 Download `music_rust-<version>-1-x86_64.pkg.tar.zst` from the latest release, then:
 
 ```bash
-sudo pacman -U music_rust-3.22-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-3.22.1-1-x86_64.pkg.tar.zst
 # bundles the electronic-synth SoundFont and pulls in FluidSynth automatically
 music 乐曲.txt
 music                # or open the startup selector

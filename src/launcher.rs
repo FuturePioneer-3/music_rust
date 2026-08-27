@@ -900,8 +900,9 @@ fn browser_entries(directory: &Path, kind: BrowseKind) -> Result<Vec<BrowserEntr
             });
         }
     }
-    directories.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // 目录与文件分开排序，都按小写名称比较，保证“ABC”和“abc”相邻。
+    directories.sort_by_key(|entry| entry.name.to_lowercase());
+    files.sort_by_key(|entry| entry.name.to_lowercase());
 
     let mut result = Vec::new();
     if let Some(parent) = directory.parent() {
@@ -1271,7 +1272,7 @@ impl TerminalSession {
                 };
                 return Err(format!("无法初始化启动界面: {error}"));
             }
-            return Ok(Self { alternate_screen, _raw: raw });
+            Ok(Self { alternate_screen, _raw: raw })
         }
         #[cfg(not(unix))]
         {

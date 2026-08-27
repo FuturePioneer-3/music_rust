@@ -299,12 +299,14 @@ static void *audio_thread(void *opaque) {
                 int64_t fade_count = fade_left > 512 ? 512 : fade_left;
                 int64_t fade_start = p->cursor;
                 uint64_t gen = p->generation;
-                pthread_mutex_unlock(&p->lock);
                 int16_t *buffer = malloc((size_t)fade_count * (size_t)p->channels * sizeof(int16_t));
-                if (!buffer) { pthread_mutex_lock(&p->lock); p->finished = 1; p->stop = 1; pthread_mutex_unlock(&p->lock); break; }
-                // 汇编：把剩余音频在 512 帧内线性淡出
+                if (!buffer) { p->finished = 1; p->stop = 1; pthread_mutex_unlock(&p->lock); break; }
+                // 汇编：把剩余音频在 512 帧内线性淡出。ramp_gain 由
+                // pause/seek 在持锁时清零，这里也在持锁状态下读写，
+                // 消除音频线程与控制线程之间的数据竞争。
                 dsp_vol_s16(p->pcm + fade_start * p->channels, buffer,
                             (uint32_t)(fade_count * p->channels), &p->ramp_gain, 0.0f);
+                pthread_mutex_unlock(&p->lock);
                 snd_pcm_sframes_t written = snd_pcm_writei(pcm, buffer, (snd_pcm_uframes_t)fade_count);
                 free(buffer);
                 pthread_mutex_lock(&p->lock);
@@ -321,22 +323,16 @@ static void *audio_thread(void *opaque) {
         int64_t start = p->cursor;
         float volume = p->volume;
         uint64_t generation = p->generation;
-        pthread_mutex_unlock(&p->lock);
         if (generation != played_generation) {
+            pthread_mutex_unlock(&p->lock);
             snd_pcm_drop(pcm);
             snd_pcm_prepare(pcm);
             played_generation = generation;
             continue;
         }
         if (left <= 0) {
-            /*
-             * The snapshot above is taken without holding the mutex while the
-             * PCM device is serviced.  A seek can therefore move the cursor
-             * (and bump generation) after `left` was computed but before this
-             * branch runs.  Do not let that stale end-of-file observation
-             * cancel the newly requested playback position.
-             */
-            pthread_mutex_lock(&p->lock);
+            /* 快照与判定都在持锁状态下完成，seek 无法在两者之间移动
+             * cursor，因此不会把新请求的播放位置误判为文件结束。 */
             if (generation == p->generation && start == p->cursor && p->playing) {
                 p->finished = 1;
                 p->playing = 0;
@@ -346,14 +342,13 @@ static void *audio_thread(void *opaque) {
         }
         int64_t count = left > 512 ? 512 : left;
         int16_t *buffer = malloc((size_t)count * (size_t)p->channels * sizeof(int16_t));
-        if (!buffer) break;
-        // 汇编：音量渐变（音量突变不产生咔哒声）+ 饱和钳制
+        if (!buffer) { pthread_mutex_unlock(&p->lock); break; }
+        // 汇编：音量渐变（音量突变不产生咔哒声）+ 饱和钳制。
+        // ramp_gain 在持锁状态下读写，避免与 pause/seek 的清零竞争；
+        // 锁内 DSP 很快，只影响控制接口的微秒级等待。
         dsp_vol_s16(p->pcm + start * p->channels, buffer,
                     (uint32_t)(count * p->channels), &p->ramp_gain, volume);
-        pthread_mutex_lock(&p->lock);
-        int changed = generation != p->generation || start != p->cursor;
         pthread_mutex_unlock(&p->lock);
-        if (changed) { free(buffer); continue; }
         snd_pcm_sframes_t written = snd_pcm_writei(pcm, buffer, (snd_pcm_uframes_t)count);
         free(buffer);
         if (written < 0) { snd_pcm_recover(pcm, (int)written, 1); continue; }

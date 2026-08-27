@@ -34,6 +34,11 @@
 //!   - 音量缩放、频谱 Goertzel 谐振器、峰值限制器热循环改为独立
 //!     AT&T 语法汇编（src/music_asm.S，非内联，SSE2）
 //!
+//! 3.22.1：
+//!   - 修复 MIDI 总时长估算对非 0 通道事件的解析错位
+//!   - 修复截断/损坏 MIDI 文件可能导致越界崩溃的问题
+//!   - 修复音频文件播放线程与控制线程对 ramp_gain 的数据竞争
+//!
 //! 用法:
 //!   music                       无参数时进入启动选择界面
 //!   music <乐曲.txt|音频文件> [选项]
@@ -70,7 +75,7 @@ use parser::{parse_file, print_first_events, print_score_summary};
 use synth::{find_soundfont, ProgramSwitch, SynthPlayer};
 
 /// 展示版本号（与 Cargo/Arch 包保持一致）
-pub const VERSION: &str = "3.22";
+pub const VERSION: &str = "3.22.1";
 
 fn print_usage() {
     println!("music_rust —— 钢琴演奏器 v{}", VERSION);
@@ -208,8 +213,8 @@ fn parse_args() -> Result<Args, String> {
                 if a.starts_with('-') {
                     return Err(format!("未知选项: {}", a));
                 }
-                if out.file.is_some() {
-                    return Err(format!("只能指定一个乐曲文件: {} 和 {}", out.file.as_ref().unwrap(), a));
+                if let Some(existing) = &out.file {
+                    return Err(format!("只能指定一个乐曲文件: {} 和 {}", existing, a));
                 }
                 out.file = Some(a);
             }
@@ -539,19 +544,6 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_audio_file;
-
-    #[test]
-    fn recognizes_ffmpeg_audio_extensions() {
-        assert!(is_audio_file("song.MP3"));
-        assert!(is_audio_file("voice.flac"));
-        assert!(!is_audio_file("score.txt"));
-        assert!(!is_audio_file("song.mid"));
-    }
-}
-
 /// 轻量解析 MIDI 文件，估算总时长（毫秒）。
 /// 读取 division、tempo 事件、最长 tick，换算总时长。
 /// 失败或异常时返回 None（调用方回退到仅显示经过时间）。
@@ -624,19 +616,31 @@ fn midi_total_ms(path: &str) -> Option<u32> {
                     let mtype = *data.get(pos)?;
                     pos += 1;
                     let mlen = read_varlen(&data, &mut pos)? as usize;
+                    // 元事件载荷必须完整落在当前音轨内，否则按损坏文件处理，
+                    // 避免长度声明超出实际数据时越界读取（此前会 panic）。
+                    let payload_end = pos.checked_add(mlen)?;
+                    if payload_end > end {
+                        return None;
+                    }
                     if mtype == 0x51 && mlen >= 3 {
                         // tempo
                         let us = ((data[pos] as u32) << 16) | ((data[pos + 1] as u32) << 8) | data[pos + 2] as u32;
                         tempos.push((tick, us));
                     }
-                    pos += mlen;
+                    pos = payload_end;
                 }
                 0xf0 | 0xf7 => {
                     let slen = read_varlen(&data, &mut pos)? as usize;
-                    pos += slen;
+                    let payload_end = pos.checked_add(slen)?;
+                    if payload_end > end {
+                        return None;
+                    }
+                    pos = payload_end;
                 }
                 m => {
-                    match m {
+                    // 按消息类型判断数据字节数时必须先屏蔽通道号：否则 0x91、
+                    // 0x82 等非 0 通道事件会匹配不到任何分支，导致解析错位。
+                    match m & 0xf0 {
                         0x80 | 0x90 | 0xa0 | 0xb0 | 0xe0 => { pos += 2; }
                         0xc0 | 0xd0 => { pos += 1; }
                         _ => {}
@@ -667,4 +671,65 @@ fn midi_total_ms(path: &str) -> Option<u32> {
     ms += seg;
 
     Some((ms as u32).max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_audio_file, midi_total_ms};
+    use std::path::PathBuf;
+
+    #[test]
+    fn recognizes_ffmpeg_audio_extensions() {
+        assert!(is_audio_file("song.MP3"));
+        assert!(is_audio_file("voice.flac"));
+        assert!(!is_audio_file("score.txt"));
+        assert!(!is_audio_file("song.mid"));
+    }
+
+    /// 写一个单音轨 MIDI 到临时目录，返回路径。
+    fn write_temp_midi(payload: &[u8]) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "music_rust_midi_test_{}_{}.mid",
+            std::process::id(),
+            stamp
+        ));
+        let mut midi = b"MThd".to_vec();
+        // format 0、1 个音轨、division 480
+        midi.extend_from_slice(&[0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0]);
+        midi.extend_from_slice(b"MTrk");
+        midi.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        midi.extend_from_slice(payload);
+        std::fs::write(&path, midi).unwrap();
+        path
+    }
+
+    #[test]
+    fn midi_total_ms_handles_channels_other_than_zero() {
+        // 120 BPM 下的一个四分音符（480 tick）放在通道 1（0x91/0x81），
+        // 应估算为 500ms；旧实现会因状态字节匹配不到而错位成 17 秒级。
+        let payload = [
+            0x00, 0x91, 0x3C, 0x64, // delta 0, note-on ch2, key 60, vel 100
+            0x83, 0x60, 0x81, 0x3C, 0x00, // delta 480, note-off ch2
+            0x00, 0xFF, 0x2F, 0x00, // end of track
+        ];
+        let path = write_temp_midi(&payload);
+        let result = midi_total_ms(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, Some(500));
+    }
+
+    #[test]
+    fn midi_total_ms_rejects_truncated_tempo_event() {
+        // tempo 元事件声明 3 字节但文件已截断：应返回 None 而不是越界 panic。
+        let payload = [0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1];
+        let path = write_temp_midi(&payload);
+        let result = midi_total_ms(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, None);
+    }
 }

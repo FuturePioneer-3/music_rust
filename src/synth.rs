@@ -181,7 +181,7 @@ fn silence_stderr<T>(f: impl FnOnce() -> T) -> T {
         return f();
     }
     let devnull = unsafe {
-        libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_WRONLY)
+        libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY)
     };
     if devnull >= 0 {
         unsafe {
@@ -224,12 +224,14 @@ fn request_limiter_reset() {
 #[inline]
 fn reset_limiter_if_requested(
     revision: u32,
-    seen: &mut u32,
-    limiter: &mut LimiterState,
+    seen: *mut u32,
+    limiter: *mut LimiterState,
 ) {
-    if revision != *seen {
-        limiter.current_gain = 1.0;
-        *seen = revision;
+    if revision != unsafe { *seen } {
+        unsafe {
+            (*limiter).current_gain = 1.0;
+            *seen = revision;
+        }
     }
 }
 
@@ -252,8 +254,8 @@ unsafe extern "C" fn audio_render_callback(
     // 不一致。常见输出是立体声，4 个 effect 槽按声道循环别名即可。
     let mut fx_alias = [std::ptr::null_mut(); 4];
     let ret = if nfx == 0 && nout > 0 && !out.is_null() {
-        for i in 0..fx_alias.len() {
-            fx_alias[i] = *out.add(i % nout as usize);
+        for (i, slot) in fx_alias.iter_mut().enumerate() {
+            *slot = *out.add(i % nout as usize);
         }
         fluid_synth_process(
             synth,
@@ -272,15 +274,15 @@ unsafe extern "C" fn audio_render_callback(
     // 音量改变后不要沿用上一个音量的慢释放包络，否则实际响度会滞后
     // UI 数值数秒。LIMITER 只由音频回调线程写入，主线程通过原子版本号
     // 通知，避免直接跨线程访问 static mut。
-    let l = &mut *(&raw mut LIMITER);
+    let l = &raw mut LIMITER;
     let revision = LIMITER_RESET_REVISION.load(Ordering::Acquire);
-    let seen = &mut *(&raw mut LIMITER_RESET_SEEN);
+    let seen = &raw mut LIMITER_RESET_SEEN;
     reset_limiter_if_requested(revision, seen, l);
     // 对每个输出通道应用限制器
     for ch in 0..nout {
         let buf = *out.add(ch as usize);
         if !buf.is_null() {
-            l.process(buf, len as usize);
+            (*l).process(buf, len as usize);
         }
     }
     FLUID_OK
@@ -1086,10 +1088,7 @@ impl SynthPlayer {
             soundfont: sf,
         })
         });
-        let inner = match init {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        let inner = init?;
 
         Ok(SynthPlayer {
             settings: inner.settings,
@@ -1114,12 +1113,7 @@ impl SynthPlayer {
         // 0.8 - 0.1 - 0.1 之类的二进制浮点累积让实际增益落在 0.6
         // 附近、而 UI 显示/音频模式使用的是精确的 60%。
         g = (g * 100.0).round() / 100.0;
-        if g < 0.0 {
-            g = 0.0;
-        }
-        if g > MAX_VOLUME_SCALE {
-            g = MAX_VOLUME_SCALE;
-        }
+        g = g.clamp(0.0, MAX_VOLUME_SCALE);
         self.gain = g;
         unsafe { fluid_synth_set_gain(self.synth, g) };
         request_limiter_reset();
@@ -1533,6 +1527,8 @@ impl SynthPlayer {
     /// `show_progress`: 显示动态进度条。
     /// `interactive`: 启用键盘交互控制（快进/后退/暂停/循环/退出）。
     /// `total_ms`: 估算的总时长（毫秒），用于进度条；0 时仅显示经过时间。
+    /// 参数虽然多，但都是 MIDI 播放这一件事的完整配置，保持平铺方便调用方逐项传参。
+    #[allow(clippy::too_many_arguments)]
     pub fn play_midi(
         &mut self,
         midi_path: &str,
@@ -1967,6 +1963,7 @@ impl SynthPlayer {
     ///   1. 清除所有已排事件（fluid_sequencer_remove_events）
     ///   2. 更新 playhead
     ///   3. 从新 playhead 重新排程剩余事件（相对时间）
+    ///
     /// 暂停时清除已排事件并停止排程，恢复时重新排程。
     ///
     /// `events` 必须已按 at_ms 升序排序。

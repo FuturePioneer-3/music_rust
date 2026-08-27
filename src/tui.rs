@@ -426,6 +426,9 @@ impl Tui {
         Some(tui)
     }
 
+    /// 参数虽多，但都是一帧渲染所需的全部状态；集中传入避免调用方分多次
+    /// 设置字段、再手动触发刷新。
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(&mut self, elapsed_ms: u64, total_ms: u64, volume: u32, paused: bool, looping: bool, details: &[String], spectrum: &[u8; 16]) {
         if !self.active {
             return;
@@ -470,9 +473,9 @@ impl Tui {
                 // 并排元数据时：可用宽度 = 内宽 − 元数据列 − 间距，再取 46 列上限；
                 // 屏幕足够宽时封面可到 46 列，而不是被元数据挤到十几列。
                 let aw_max = if inner >= 56 && meta_w >= 14 {
-                    inner.saturating_sub(4 + meta_w).min(46).max(10)
+                    inner.saturating_sub(4 + meta_w).clamp(10, 46)
                 } else {
-                    (inner - 2).min(46).max(10)
+                    (inner - 2).clamp(10, 46)
                 };
                 let (aw, ah) = art_size(img, aw_max, mh);
                 let side = aw + meta_w + 4 <= inner && meta_w >= 14;
@@ -612,10 +615,10 @@ impl Tui {
                 if inner >= 74 {
                     // 宽屏：柱体精确置于标签起始列（非均匀间距）
                     let mut cur = 0usize;
-                    for band in 0..16 {
+                    for (band, level) in spectrum.iter().copied().enumerate() {
                         s.push_str(&" ".repeat(bar_cols[band].saturating_sub(cur)));
                         cur = bar_cols[band] + 1;
-                        if spectrum[band] >= row as u8 {
+                        if level >= row as u8 {
                             s.push_str(&format!("{}{}{}", color, st.prog_full, RESET));
                         } else {
                             s.push_str(&format!("{}{}{}", st.p.col(NamedColor::GrayDim), st.prog_empty, RESET));
@@ -624,8 +627,8 @@ impl Tui {
                 } else {
                     // 窄屏：无逐频段标签，均匀排布
                     let spacing = ((inner.saturating_sub(EQ_LABEL_PAD + 16)) / 15).clamp(0, 3);
-                    for band in 0..16 {
-                        if spectrum[band] >= row as u8 {
+                    for (band, level) in spectrum.iter().copied().enumerate() {
+                        if level >= row as u8 {
                             s.push_str(&format!("{}{}{}", color, st.prog_full, RESET));
                         } else {
                             s.push_str(&format!("{}{}{}", st.p.col(NamedColor::GrayDim), st.prog_empty, RESET));
@@ -649,7 +652,7 @@ impl Tui {
             self.render_art_section(&mut frame, inner, aw, ah, art_side, &meta);
         } else if !meta.is_empty() {
             for (label, value) in meta.iter().take(section_rows) {
-                frame.push(line(inner, st, &format!("{}", meta_text(label, value, inner - 2, st))));
+                frame.push(line(inner, st, &meta_text(label, value, inner - 2, st)));
             }
         }
 
@@ -1109,7 +1112,7 @@ mod tests {
         assert_eq!(clip_w("abcd", 8, "…"), "abcd");
         // 显示宽度计算忽略 ANSI 转义
         assert_eq!(disp_width("\x1b[38;2;1;2;3m音\x1b[0m"), 2);
-        let t = format_time(3723_000);
+        let t = format_time(3_723_000);
         assert_eq!(t, "1:02:03");
         assert_eq!(format_time(83_000), "01:23");
     }
@@ -1118,7 +1121,7 @@ mod tests {
     fn art_size_respects_constraints() {
         let img = ArtImage { data: vec![0u8; 64 * 64 * 4], width: 64, height: 64 };
         let (w, h) = art_size(&img, 46, 16);
-        assert!(w <= 46 && h <= 16 && h >= 1);
+        assert!(w <= 46 && (1..=16).contains(&h));
         let (w2, h2) = art_size(&img, 20, 10);
         assert!(w2 <= 20 && h2 <= 10);
         // 宽图
@@ -1199,7 +1202,7 @@ mod tests {
         let line = FREQ_LABELS.join(" ");
         let mut c = 0usize;
         for (i, l) in FREQ_LABELS.iter().enumerate() {
-            assert_eq!(line[c..].starts_with(l), true, "band {} 标签错位", i);
+            assert!(line[c..].starts_with(l), "band {} 标签错位", i);
             assert_eq!(cols[i], c + (l.len().saturating_sub(1)) / 2, "band {} 柱与标签错位", i);
             c += l.len() + usize::from(i < 15); // 与 freq_bar_cols 同规则
         }

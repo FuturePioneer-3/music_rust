@@ -176,15 +176,12 @@ impl InputListener {
                     continue;
                 }
                 pending.extend(bytes);
-                // 从 pending 中逐个解析按键（可能包含转义序列）
-                loop {
-                    match parse_key(&pending) {
-                        (Some(ctrl), rest) => {
-                            queue2.lock().unwrap().push_back(ctrl);
-                            pending = rest;
-                        }
-                        (None, _) => break,
-                    }
+                // 从 pending 中逐个解析按键（可能包含转义序列）：
+                // 每次解析出一个完整按键就入队，剩下的字节留到下一轮；
+                // 解析不了说明序列还不完整（比如 ESC 后面还在等方向键码）。
+                while let (Some(ctrl), rest) = parse_key(&pending) {
+                    queue2.lock().unwrap().push_back(ctrl);
+                    pending = rest;
                 }
                 // pending 里残留的不完整转义序列（如 ESC 之后还在等待后续），
                 // 若太长则丢弃，避免无限累积
