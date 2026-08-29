@@ -7,7 +7,7 @@
 //       * 音量饱和缩放  music_asm_apply_volume_s16（音频线程，8 样本/迭代 SSE2）
 //       * 频谱 Goertzel  music_asm_goertzel4（16 频段分 4 组并行谐振器）
 //   - 元数据提取（title/artist/album/composer/date/genre，如 MP3 ID3 TCOM → composer）
-//   - 内嵌封面图提取（MP3 APIC / FLAC PICTURE / M4A covr），解码并缩放到 ≤96px RGBA，
+//   - 内嵌封面图提取（MP3 APIC / FLAC PICTURE / M4A covr），解码并缩放到 ≤256px RGBA，
 //     供 TUI 以半块字符渲染。
 
 #include "audio_file.h"
@@ -37,8 +37,8 @@ static int is_wav_path(const char *path) {
 }
 
 #define MUSIC_META_LEN 256
-/// 封面图最长边（像素）。TUI 再按终端尺寸二次缩放渲染。
-#define MUSIC_ART_MAX_DIM 96
+/// 封面图最长边（像素）。256px 为 TUI ×2 放大保留足够源像素，之后仍按终端尺寸二次缩放。
+#define MUSIC_ART_MAX_DIM 256
 
 struct music_audio {
     int16_t *pcm;

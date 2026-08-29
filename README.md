@@ -34,10 +34,11 @@ This project is fully rewritten in **Rust** and talks directly to the system `li
 supporting most Linux distributions. Run it with **no arguments** to open an interactive startup
 selector; run it with a file to start playing immediately.
 
-## What's New in v3.3.0
+## What's New in v3.3.1
 
 - 🖼️ **TXT v3.2 embedded images**: raw, zstd, gzip, zlib, deflate, bzip2, xz, or lz4-compressed image bytes can follow delimiter lines; declared lengths make arbitrary binary data, including newlines, safe.
 - 🎛️ The Python converter and curses TUI can choose whether to embed an image, any of the eight encodings, and a per-algorithm compression level.
+- 🔍 The launcher lets you pick a 1×–2× display zoom (0.25 steps) for TXT embedded images and audio covers.
 - 🖥️ The Rust playback TUI reuses the FFmpeg decoder and half-block renderer used for audio covers, with a real-tty fallback.
 
 ## What's New in v3.22.1 (historical)
@@ -108,7 +109,7 @@ The bundled SoundFont is loaded automatically. To use another font: `--soundfont
 Download `music_rust-<version>-1-x86_64.pkg.tar.zst` from the latest release, then:
 
 ```bash
-sudo pacman -U music_rust-3.3.0-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-3.3.1-1-x86_64.pkg.tar.zst
 # bundles the electronic-synth SoundFont and pulls in FluidSynth automatically
 music 乐曲.txt
 music                # or open the startup selector

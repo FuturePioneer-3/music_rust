@@ -33,10 +33,11 @@ music_rust 是一个**终端音乐播放器**，内置三套播放引擎：
 本项目完全用 **Rust** 重写，通过 FFI 直连系统 `libfluidsynth` 合成器，支持绝大多数 Linux 发行版。
 **不带参数**运行会打开交互式启动选择器；带文件运行则直接开始播放。
 
-## v3.3.0 新特性
+## v3.3.1 新特性
 
 - 🖼️ **TXT v3.2 内嵌图片**：图片以 raw/zstd/gzip/zlib/deflate/bzip2/xz/lz4 二进制放在分隔线后，长度字段保证任意二进制内容（包括换行）都能安全读取。
 - 🎛️ Python 转换器和 curses TUI 都可以选择是否内嵌图片、八种编码以及各算法对应的压缩级别。
+- 🔍 启动选择器可为 TXT 内嵌图片和音频封面选择 ×1–×2 显示倍率（0.25 步进）。
 - 🖥️ Rust 播放 TUI 复用音频封面的 FFmpeg 解码和半区块渲染，终端不支持真彩色时自动降级。
 
 ## v3.22.1 修复（历史）
@@ -105,7 +106,7 @@ chmod +x music_rust-*-x86_64.AppImage
 从最新 release 下载 `music_rust-<版本>-1-x86_64.pkg.tar.zst`，然后：
 
 ```bash
-sudo pacman -U music_rust-3.3.0-1-x86_64.pkg.tar.zst
+sudo pacman -U music_rust-3.3.1-1-x86_64.pkg.tar.zst
 # 包内已包含电子合成器 SoundFont；自动安装 fluidsynth 等运行依赖
 music 乐曲.txt
 music                # 或打开启动选择器

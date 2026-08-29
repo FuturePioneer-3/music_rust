@@ -1976,6 +1976,7 @@ impl SynthPlayer {
         initial_instrument: u8,
         program_switches: &[ProgramSwitch],
         art: Option<crate::tui::ArtImage>,
+        art_zoom: f32,
     ) -> Result<(), String> {
         // 所有要求必须在进入播放 TUI 前可用；不再把错误降级成警告。
         self.validate_program_requirements(
@@ -1984,7 +1985,8 @@ impl SynthPlayer {
             program_switches,
         )?;
         let mut input = crate::input::InputListener::start();
-        let mut tui = crate::tui::Tui::start_with_art("简谱演奏", "简谱", show_progress, art);
+        let mut tui = crate::tui::Tui::start_with_art("简谱演奏", "简谱", show_progress, art)
+            .map(|tui| tui.with_art_zoom(art_zoom));
         let mut prog = crate::progress::Progress::new(show_progress && tui.is_none());
 
         let mut playhead: i64 = 0; // 当前播放位置（毫秒）

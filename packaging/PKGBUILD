@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 pkgname=music_rust
-pkgver=3.3.0
+pkgver=3.3.1
 pkgrel=1
 pkgdesc='Cross-platform MIDI and numbered-notation piano player'
 arch=('x86_64')

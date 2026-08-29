@@ -36,6 +36,11 @@
 //!   - 音量缩放、频谱 Goertzel 谐振器、峰值限制器热循环改为独立
 //!     AT&T 语法汇编（src/music_asm.S，非内联，SSE2）
 //!
+//! 3.3.1：
+//!   - TXT v3.2 内嵌图片新增 gzip/zlib/deflate/bzip2/xz/lz4 压缩编码
+//!   - 启动选择器可为 TXT 内嵌图片/音频封面选择 ×1–×2 显示倍率（0.25 步进）
+//!   - 解码分辨率上限从 96px 提升到 256px，放大后细节更清晰
+//!
 //! 3.3.0：
 //!   - 修复 MIDI 总时长估算对非 0 通道事件的解析错位
 //!   - 修复截断/损坏 MIDI 文件可能导致越界崩溃的问题
@@ -77,7 +82,7 @@ use parser::{parse_file, print_first_events, print_score_summary};
 use synth::{find_soundfont, ProgramSwitch, SynthPlayer};
 
 /// 展示版本号（与 Cargo/Arch 包保持一致）
-pub const VERSION: &str = "3.3.0";
+pub const VERSION: &str = "3.3.1";
 
 fn print_usage() {
     println!("music_rust —— 钢琴演奏器 v{}", VERSION);
@@ -130,6 +135,8 @@ struct Args {
     volume: u32,
     limit_db: f32,
     midi: bool,
+    /// 封面/内嵌图片显示倍率（1.0×–2.0×）；无参数启动选择器可调。
+    art_zoom: f32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -145,6 +152,7 @@ fn parse_args() -> Result<Args, String> {
         volume: 80,
         limit_db: -1.0,
         midi: false,
+        art_zoom: tui::ART_ZOOM_MIN,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -250,6 +258,7 @@ fn main() {
                 args.instrument = selection.instrument;
                 args.instrument_selected = true;
                 args.program_switches = selection.program_switches;
+                args.art_zoom = selection.image_zoom;
             }
             Ok(None) => return,
             Err(e) => {
@@ -272,7 +281,7 @@ fn main() {
     info(format!("乐曲文件: {}", file));
 
     if !args.midi && is_audio_file(&file) {
-        if let Err(e) = play_audio_file(&file, args.volume, !args.debug) {
+        if let Err(e) = play_audio_file(&file, args.volume, !args.debug, args.art_zoom) {
             error(format!("音频播放失败: {}", e));
             exit(1);
         }
@@ -455,6 +464,7 @@ fn main() {
         initial_instrument,
         &program_switches,
         score_art,
+        args.art_zoom,
     ) {
         error(format!("简谱播放失败: {}", err));
         player.shutdown();
@@ -490,7 +500,7 @@ fn is_audio_file(path: &str) -> bool {
         Some("wav" | "mp3" | "flac" | "ogg" | "opus" | "aac" | "m4a" | "wma"))
 }
 
-fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String> {
+fn play_audio_file(path: &str, volume: u32, show_tui: bool, art_zoom: f32) -> Result<(), String> {
     let mut player = audio_file::AudioFilePlayer::open(path)?;
     player.set_volume_percent(volume);
     player.play();
@@ -511,7 +521,8 @@ fn play_audio_file(path: &str, volume: u32, show_tui: bool) -> Result<(), String
         *slot = player.metadata(key);
     }
     let display_title = meta.title.clone().unwrap_or_else(|| path.to_string());
-    let mut tui = tui::Tui::start_full(&display_title, "音乐文件", show_tui, art, meta);
+    let mut tui = tui::Tui::start_full(&display_title, "音乐文件", show_tui, art, meta)
+        .map(|tui| tui.with_art_zoom(art_zoom));
     let mut paused = false;
     let mut looping = false;
     loop {

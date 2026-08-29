@@ -20,13 +20,40 @@ use crate::synth::{
 ///
 /// 空 `soundfonts` 代表保留原有的自动探测行为；启动选择器会默认填入
 /// 内置电子合成器 SoundFont。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaunchConfig {
     pub file: String,
     /// 按加载顺序排列的音源；第一个是默认音源，最多 3 个。
     pub soundfonts: Vec<String>,
     pub instrument: u8,
     pub program_switches: Vec<ProgramSwitch>,
+    /// 封面/内嵌图片显示倍率（1.0×–2.0×，0.25 步进）。
+    pub image_zoom: f32,
+}
+
+/// 图片放大档位：×1、×1.25、×1.5、×1.75、×2。
+pub const ART_ZOOMS: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
+
+fn zoom_next(current: f32) -> f32 {
+    ART_ZOOMS
+        .iter()
+        .copied()
+        .find(|zoom| *zoom > current + 0.0001)
+        .unwrap_or(ART_ZOOMS[ART_ZOOMS.len() - 1])
+}
+
+fn zoom_previous(current: f32) -> f32 {
+    ART_ZOOMS
+        .iter()
+        .rev()
+        .copied()
+        .find(|zoom| *zoom < current - 0.0001)
+        .unwrap_or(ART_ZOOMS[0])
+}
+
+fn art_zoom_label(zoom: f32) -> String {
+    let text = format!("×{:.2}", zoom);
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 const RESET: &str = "\x1b[0m";
@@ -57,6 +84,7 @@ pub fn select_startup() -> Result<Option<LaunchConfig>, String> {
         soundfonts: preferred_soundfont(&fonts).into_iter().collect(),
         instrument: 0,
         program_switches: Vec::new(),
+        image_zoom: ART_ZOOMS[0],
         program_input: None,
         focus: StartupField::File,
         notice: None,
@@ -126,6 +154,18 @@ pub fn select_startup() -> Result<Option<LaunchConfig>, String> {
             Key::Decrement if state.focus == StartupField::Program => {
                 state.instrument = state.instrument.saturating_sub(1);
             }
+            Key::Left if state.focus == StartupField::Zoom => {
+                state.image_zoom = zoom_previous(state.image_zoom);
+            }
+            Key::Right if state.focus == StartupField::Zoom => {
+                state.image_zoom = zoom_next(state.image_zoom);
+            }
+            Key::Increment if state.focus == StartupField::Zoom => {
+                state.image_zoom = zoom_next(state.image_zoom);
+            }
+            Key::Decrement if state.focus == StartupField::Zoom => {
+                state.image_zoom = zoom_previous(state.image_zoom);
+            }
             Key::Digit(digit) if state.focus == StartupField::Program => {
                 state.program_input = Some(digit.to_string());
                 state.notice = None;
@@ -161,6 +201,7 @@ pub fn select_startup() -> Result<Option<LaunchConfig>, String> {
                     state.program_input = Some(String::new());
                     state.notice = None;
                 }
+                StartupField::Zoom => {}
                 StartupField::Switches => {
                     match edit_program_switches(
                         state.program_switches.clone(),
@@ -196,6 +237,7 @@ pub fn select_startup() -> Result<Option<LaunchConfig>, String> {
                             soundfonts: state.soundfonts.clone(),
                             instrument: state.instrument,
                             program_switches: state.program_switches.clone(),
+                            image_zoom: state.image_zoom,
                         }));
                     }
                     state.notice = Some("请先选择一个可播放的乐曲文件。".to_string());
@@ -238,6 +280,7 @@ enum StartupField {
     File,
     Soundfont,
     Program,
+    Zoom,
     Switches,
     Start,
 }
@@ -247,7 +290,8 @@ impl StartupField {
         match self {
             Self::File => Self::Soundfont,
             Self::Soundfont => Self::Program,
-            Self::Program => Self::Switches,
+            Self::Program => Self::Zoom,
+            Self::Zoom => Self::Switches,
             Self::Switches => Self::Start,
             Self::Start => Self::File,
         }
@@ -258,7 +302,8 @@ impl StartupField {
             Self::File => Self::Start,
             Self::Soundfont => Self::File,
             Self::Program => Self::Soundfont,
-            Self::Switches => Self::Program,
+            Self::Zoom => Self::Program,
+            Self::Switches => Self::Zoom,
             Self::Start => Self::Switches,
         }
     }
@@ -269,6 +314,7 @@ struct StartupState {
     soundfonts: Vec<String>,
     instrument: u8,
     program_switches: Vec<ProgramSwitch>,
+    image_zoom: f32,
     program_input: Option<String>,
     focus: StartupField,
     notice: Option<String>,
@@ -376,6 +422,13 @@ fn render_startup(state: &StartupState) -> Result<(), String> {
         "GM 音色",
         &program,
     )?;
+    render_field(
+        &mut out,
+        width,
+        state.focus == StartupField::Zoom,
+        "图片放大",
+        &art_zoom_label(state.image_zoom),
+    )?;
 
     let switches = if state.program_switches.is_empty() {
         "未设置（播放中可按秒切换）".to_string()
@@ -408,7 +461,7 @@ fn render_startup(state: &StartupState) -> Result<(), String> {
     } else if state.program_input.is_some() {
         try_draw!(writeln!(out, "{GRAY}  输入 0–127 · Enter 确认 · Backspace 删除 · Esc 取消{RESET}"));
     } else {
-        try_draw!(writeln!(out, "{GRAY}  ↑↓/Tab 切换 · Enter 选择 · ←→/+− 调音色 · 中途切换最多 24 条 · Q/Esc 取消{RESET}"));
+        try_draw!(writeln!(out, "{GRAY}  ↑↓/Tab 切换 · Enter 选择 · ←→/+− 调音色/图片倍率 · 中途切换最多 24 条 · Q/Esc 取消{RESET}"));
     }
     write_box_bottom(&mut out, width)?;
     out.flush().map_err(|e| format!("刷新启动界面失败: {e}"))
@@ -1296,8 +1349,9 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_text, display_width, matches_browser_kind, page_bounds, parse_program_number,
-        preferred_soundfont, remap_program_switches, SwitchDraft, BrowseKind,
+        art_zoom_label, display_text, display_width, matches_browser_kind, page_bounds,
+        parse_program_number, preferred_soundfont, remap_program_switches, zoom_next,
+        zoom_previous, SwitchDraft, BrowseKind,
     };
     use crate::synth::ProgramSwitch;
     use std::path::Path;
@@ -1341,6 +1395,17 @@ mod tests {
         assert_eq!(parse_program_number("127"), Ok(127));
         assert!(parse_program_number("128").is_err());
         assert!(parse_program_number("").is_err());
+    }
+
+    #[test]
+    fn art_zoom_steps_cycle_within_supported_range() {
+        assert_eq!(zoom_next(1.0), 1.25);
+        assert_eq!(zoom_next(2.0), 2.0);
+        assert_eq!(zoom_previous(1.0), 1.0);
+        assert_eq!(zoom_previous(2.0), 1.75);
+        assert_eq!(art_zoom_label(1.0), "×1");
+        assert_eq!(art_zoom_label(1.25), "×1.25");
+        assert_eq!(art_zoom_label(2.0), "×2");
     }
 
     #[test]

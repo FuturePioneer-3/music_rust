@@ -45,7 +45,7 @@ use crate::input::Control;
 const GITHUB_AVATAR_RGBA: &[u8] = include_bytes!("../assets/github_avatar.rgba");
 const GITHUB_AVATAR_SIZE: usize = 96;
 
-/// 内嵌封面：RGBA8 像素（宽 × 高），由 C 侧解码并缩放到 ≤96px。
+/// 内嵌封面：RGBA8 像素（宽 × 高），由 C 侧解码并缩放到 ≤256px。
 /// 定义在本模块（而非 audio_file），使 selftest 等通过 `#[path]`
 /// 复用 tui.rs 的二进制无需链接 audio_file。
 #[derive(Clone)]
@@ -62,6 +62,14 @@ pub fn github_avatar() -> ArtImage {
         width: GITHUB_AVATAR_SIZE,
         height: GITHUB_AVATAR_SIZE,
     }
+}
+
+/// 封面/图片显示倍率范围：1.0×–2.0×，0.25 步进。
+pub const ART_ZOOM_MIN: f32 = 1.0;
+pub const ART_ZOOM_MAX: f32 = 2.0;
+
+pub fn clamp_art_zoom(zoom: f32) -> f32 {
+    zoom.clamp(ART_ZOOM_MIN, ART_ZOOM_MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +340,7 @@ pub struct Tui {
     active: bool,
     logo: ArtImage,
     art: Option<ArtImage>,
+    art_zoom: f32,
     meta: MetaInfo,
     kind: OutputKind,
     style: Style,
@@ -359,6 +368,13 @@ impl Tui {
         art: Option<ArtImage>,
     ) -> Option<Self> {
         Self::start_full(title, mode, enabled, art, MetaInfo::default())
+    }
+
+    /// 设置封面/图片显示倍率（1.0×–2.0×）。只放大终端里的渲染尺寸，
+    /// 不改变解码分辨率；超出范围时自动钳制。
+    pub fn with_art_zoom(mut self, zoom: f32) -> Self {
+        self.art_zoom = clamp_art_zoom(zoom);
+        self
     }
 
     /// 带封面与元数据的完整启动（音频文件模式）。
@@ -412,6 +428,7 @@ impl Tui {
             active: true,
             logo: github_avatar(),
             art,
+            art_zoom: ART_ZOOM_MIN,
             meta,
             kind,
             style,
@@ -471,21 +488,23 @@ impl Tui {
         let meta = self.meta.lines();
         let meta_w = if !meta.is_empty() { (inner / 3).clamp(14, 30) } else { 0 };
 
-        // 封面区：宽 ≤ 46 列，高 ≤ 16 行且不超过剩余空间的 45%（小一点），
-        // 小屏保底 6 行（不要太小）。元数据并排或下置。
+        // 封面区：基础上限为宽 46 列、高 16 行、剩余空间的 45%，再按用户
+        // 选择的 ×1–×2 倍率放大；最终仍受屏幕余量约束。元数据并排或下置。
         let mut art_disp: Option<(usize, usize)> = None; // (显示宽, 显示行)
         let mut art_side = false;
         let mut section_rows = 0usize;
         if let Some(img) = &self.art {
-            let max_art = ((h.saturating_sub(fixed)) as f64 * 0.45) as usize;
-            let search_max = max_art.min(16);
+            let zoom = clamp_art_zoom(self.art_zoom);
+            let max_art = ((h.saturating_sub(fixed)) as f64 * 0.45 * zoom as f64) as usize;
+            let search_max = max_art.min((16.0 * zoom) as usize);
+            let aw_cap = (46.0 * zoom) as usize;
             for mh in (1..=search_max).rev() {
-                // 并排元数据时：可用宽度 = 内宽 − 元数据列 − 间距，再取 46 列上限；
-                // 屏幕足够宽时封面可到 46 列，而不是被元数据挤到十几列。
+                // 并排元数据时：可用宽度 = 内宽 − 元数据列 − 间距，再取倍率化上限；
+                // 屏幕足够宽时封面可到放大后的列数，而不是被元数据挤到十几列。
                 let aw_max = if inner >= 56 && meta_w >= 14 {
-                    inner.saturating_sub(4 + meta_w).clamp(10, 46)
+                    inner.saturating_sub(4 + meta_w).clamp(10, aw_cap)
                 } else {
-                    (inner - 2).clamp(10, 46)
+                    (inner - 2).clamp(10, aw_cap)
                 };
                 let (aw, ah) = art_size(img, aw_max, mh);
                 let side = aw + meta_w + 4 <= inner && meta_w >= 14;
@@ -1150,6 +1169,7 @@ mod tests {
             active: false,
             logo: github_avatar(),
             art: None,
+            art_zoom: ART_ZOOM_MIN,
             meta: MetaInfo::default(),
             kind: OutputKind::Pty,
             style: Style::full(),
@@ -1159,6 +1179,15 @@ mod tests {
             throttle: Duration::ZERO,
             last_emit: Instant::now(),
         }
+    }
+
+    #[test]
+    fn art_zoom_is_clamped_to_one_to_two_times() {
+        assert_eq!(clamp_art_zoom(1.0), 1.0);
+        assert_eq!(clamp_art_zoom(1.25), 1.25);
+        assert_eq!(clamp_art_zoom(2.0), 2.0);
+        assert_eq!(clamp_art_zoom(0.5), 1.0);
+        assert_eq!(clamp_art_zoom(3.0), 2.0);
     }
 
     /// 进度条点击映射必须与渲染布局严格一致（回归测试：修复 +3 列系统性偏移）。

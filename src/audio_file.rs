@@ -53,7 +53,7 @@ struct WavMeta {
     data_size: u32,
 }
 
-/// 内嵌封面：RGBA8 像素（宽 × 高），已由 C 侧缩放到 ≤96px。
+/// 内嵌封面：RGBA8 像素（宽 × 高），已由 C 侧缩放到 ≤256px。
 /// 类型定义见 tui.rs（ArtImage），保证 selftest 等二进制无需链接本模块即可复用 TUI。
 pub struct AudioFilePlayer { raw: *mut RawAudio }
 unsafe impl Send for AudioFilePlayer {}
