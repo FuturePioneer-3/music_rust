@@ -36,8 +36,8 @@ selector; run it with a file to start playing immediately.
 
 ## What's New in v3.3.0
 
-- 🖼️ **TXT v3.2 embedded images**: raw or zstd-compressed image bytes can follow delimiter lines; declared lengths make arbitrary binary data, including newlines, safe.
-- 🎛️ The Python converter and curses TUI can choose whether to embed an image, raw/zstd encoding, and any zstd level from 1–22.
+- 🖼️ **TXT v3.2 embedded images**: raw, zstd, gzip, zlib, deflate, bzip2, xz, or lz4-compressed image bytes can follow delimiter lines; declared lengths make arbitrary binary data, including newlines, safe.
+- 🎛️ The Python converter and curses TUI can choose whether to embed an image, any of the eight encodings, and a per-algorithm compression level.
 - 🖥️ The Rust playback TUI reuses the FFmpeg decoder and half-block renderer used for audio covers, with a real-tty fallback.
 
 ## What's New in v3.22.1 (historical)
@@ -283,7 +283,7 @@ plan plus an optional binary image block. The image descriptor and delimiters ar
 #MUSIC_RUST 3.2
 @INSTRUMENT <1-based SoundFont 1..3> <GM 0..127>
 @SWITCH <nonnegative seconds> <SF number> <GM>
-@IMAGE <MIME> <raw|zstd> <encoded-bytes> <original-bytes>
+@IMAGE <MIME> <raw|zstd|gzip|zlib|deflate|bzip2|xz|lz4> <encoded-bytes> <original-bytes>
 -----BEGIN MUSIC_RUST IMAGE-----
 <encoded image bytes, written directly>
 -----END MUSIC_RUST IMAGE-----
@@ -291,7 +291,8 @@ plan plus an optional binary image block. The image descriptor and delimiters ar
 
 The parser reads exactly `encoded-bytes` after the begin delimiter and then requires the end delimiter,
 so image data may contain newlines, zero bytes, or delimiter-like bytes. `raw` stores the original image;
-`zstd` stores its compressed bytes using a converter-selected level from 1–22. Rust decompresses it and
+`zstd` (levels 1–22), `gzip`/`zlib`/`deflate`/`xz` (levels 0–9), `bzip2` (levels 1–9), and `lz4`
+(levels 1–12) store compressed bytes using the converter-selected level. Rust decompresses it and
 passes it through FFmpeg, rendering it in the score TUI like an MP3 cover. A decode failure does not stop playback.
 
 `@INSTRUMENT` selects the initial SoundFont and GM program. `@SWITCH` changes both at the stated
@@ -477,12 +478,12 @@ music-convert 歌曲.mid --embed-image cover.jpg --image-compression zstd --imag
 | `--switch <seconds:program>` | timed program switch on the initial SoundFont; repeat up to 24 times |
 | `--switch <seconds:SF:program>` | timed SoundFont/program switch; may be mixed and repeated up to 24 times total |
 | `--embed-image <image>` | embed image bytes in TXT v3.2; omit to disable |
-| `--image-compression <raw\|zstd>` | store raw or zstd-compressed image bytes (default raw) |
-| `--image-level <1..22>` | zstd compression level (default 3) |
+| `--image-compression <encoding>` | store raw, zstd, gzip, zlib, deflate, bzip2, xz, or lz4 image bytes (default raw) |
+| `--image-level <n>` | compression level (default 3; ranges differ per algorithm) |
 | `--v2` | output the older readable multitrack T format; accepts only default timbre configuration |
 | `--legacy` | output legacy v1/v2 format; accepts only default timbre configuration |
 
-> The MIDI parser uses only the Python standard library; zstd image compression additionally requires the system `zstd` command. It supports standard MIDI (SMF type 0/1/2).
+> The MIDI parser uses only the Python standard library; gzip/zlib/deflate/bzip2/xz compression uses Python's standard library, while zstd and lz4 additionally require the system `zstd` and `lz4` commands. It supports standard MIDI (SMF type 0/1/2).
 > In an interactive terminal, omitting `--velocity-scale` prompts for any positive multiplier (for example `0.5`, `1.25`, or `2`). Values are clamped to MIDI 1–127. TXT v3.2 preserves velocity; v2/legacy notation has no velocity field. `--v2` and `--legacy` reject any non-default timbre configuration because those formats cannot represent it.
 > For type-0 and other single-physical-track/multi-channel files, v3.2 splits channels into independent `@TRACK` records instead of folding every note onto the first channel. Without `--drum`, percussion channel 10 (internal ch9) is filtered per event.
 > The converter explicitly rejects SMPTE time-division MIDI; convert it to PPQ first so absolute-tick timing cannot be misinterpreted.

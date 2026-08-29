@@ -20,7 +20,8 @@
 //!
 //! v3 文件使用 `#MUSIC_RUST 3` 标记、全局 `@TEMPO` 表和绝对 `@NOTE` 事件；
 //! v3.1 在此基础上增加文件内嵌的初始音色与按秒切换规则；v3.2 再增加
-//! 可选的原始/zstd 二进制图片区块；v1/v2 的行式简谱格式仍由下面的兼容解析器处理。
+//! 可选的内嵌图片区块（raw/zstd/gzip/zlib/deflate/bzip2/xz/lz4 编码）；
+//! v1/v2 的行式简谱格式仍由下面的兼容解析器处理。
 //!
 //! ## 格式说明
 //!
@@ -53,6 +54,7 @@
 
 use crate::log::{debug, info, warn};
 use std::collections::BTreeMap;
+use std::ffi::{c_char, c_int, c_void};
 
 /// 一条排程事件
 #[derive(Debug, Clone)]
@@ -97,7 +99,7 @@ pub struct ScoreProgramPlan {
 }
 
 /// TXT v3.2 的内嵌图片。data 始终是解压后的原始图片文件字节，便于上层
-/// 直接交给已有的 FFmpeg 图片解码器；文本中的 zstd 只影响磁盘占用。
+/// 直接交给已有的 FFmpeg 图片解码器；文本中的压缩编码只影响磁盘占用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoreImage {
     pub mime: String,
@@ -378,6 +380,273 @@ fn decompress_zstd(payload: &[u8], original_size: usize) -> Result<Vec<u8>, Stri
     Ok(output)
 }
 
+#[repr(C)]
+struct ZStream {
+    next_in: *const u8,
+    avail_in: u32,
+    total_in: u64,
+    next_out: *mut u8,
+    avail_out: u32,
+    total_out: u64,
+    msg: *const c_char,
+    state: *mut c_void,
+    zalloc: *mut c_void,
+    zfree: *mut c_void,
+    opaque: *mut c_void,
+    data_type: c_int,
+    adler: u64,
+    reserved: u64,
+}
+
+#[repr(C)]
+struct BzStream {
+    next_in: *mut c_char,
+    avail_in: u32,
+    total_in_lo32: u32,
+    total_in_hi32: u32,
+    next_out: *mut c_char,
+    avail_out: u32,
+    total_out_lo32: u32,
+    total_out_hi32: u32,
+    state: *mut c_void,
+    bzalloc: *mut c_void,
+    bzfree: *mut c_void,
+    opaque: *mut c_void,
+}
+
+#[repr(C)]
+struct LzmaStream {
+    next_in: *const u8,
+    avail_in: usize,
+    total_in: u64,
+    next_out: *mut u8,
+    avail_out: usize,
+    total_out: u64,
+    allocator: *const c_void,
+    internal: *mut c_void,
+    reserved_ptr1: *mut c_void,
+    reserved_ptr2: *mut c_void,
+    reserved_ptr3: *mut c_void,
+    reserved_ptr4: *mut c_void,
+    seek_pos: u64,
+    reserved_int2: u64,
+    reserved_int3: usize,
+    reserved_int4: usize,
+    reserved_enum1: c_int,
+    reserved_enum2: c_int,
+}
+
+#[link(name = "z")]
+extern "C" {
+    fn zlibVersion() -> *const c_char;
+    fn inflateInit2_(strm: *mut ZStream, window_bits: c_int, version: *const c_char, stream_size: c_int) -> c_int;
+    fn inflate(strm: *mut ZStream, flush: c_int) -> c_int;
+    fn inflateEnd(strm: *mut ZStream) -> c_int;
+}
+
+#[link(name = "bz2")]
+extern "C" {
+    fn BZ2_bzDecompressInit(strm: *mut BzStream, verbosity: c_int, small: c_int) -> c_int;
+    fn BZ2_bzDecompress(strm: *mut BzStream) -> c_int;
+    fn BZ2_bzDecompressEnd(strm: *mut BzStream) -> c_int;
+}
+
+#[link(name = "lzma")]
+extern "C" {
+    fn lzma_stream_decoder(strm: *mut LzmaStream, memlimit: u64, flags: u32) -> c_int;
+    fn lzma_code(strm: *mut LzmaStream, action: c_int) -> c_int;
+    fn lzma_end(strm: *mut LzmaStream);
+}
+
+#[link(name = "lz4")]
+extern "C" {
+    fn LZ4F_createDecompressionContext(ctx: *mut *mut c_void, version: u32) -> usize;
+    fn LZ4F_decompress(ctx: *mut c_void, dst: *mut u8, dst_size: *mut usize, src: *const u8, src_size: *mut usize, options: *const c_void) -> usize;
+    fn LZ4F_freeDecompressionContext(ctx: *mut c_void) -> usize;
+    fn LZ4F_isError(code: usize) -> u32;
+    fn LZ4F_getErrorName(code: usize) -> *const c_char;
+}
+
+const Z_OK: c_int = 0;
+const Z_BUF_ERROR: c_int = -5;
+const Z_STREAM_END: c_int = 1;
+const Z_FINISH: c_int = 4;
+const BZ_OK: c_int = 0;
+const BZ_STREAM_END: c_int = 4;
+const LZMA_FINISH: c_int = 3;
+const LZMA_STREAM_END: c_int = 1;
+const LZMA_CONCATENATED: u32 = 0x08;
+const LZ4F_VERSION: u32 = 100;
+
+fn decompress_zlib(payload: &[u8], original_size: usize, window_bits: c_int) -> Result<Vec<u8>, String> {
+    if original_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut output = vec![0u8; original_size];
+    let mut stream: ZStream = unsafe { std::mem::zeroed() };
+    let init = unsafe {
+        inflateInit2_(
+            &mut stream,
+            window_bits,
+            zlibVersion(),
+            std::mem::size_of::<ZStream>() as c_int,
+        )
+    };
+    if init != Z_OK {
+        return Err("zlib 初始化失败".to_string());
+    }
+    stream.next_in = payload.as_ptr();
+    stream.avail_in = payload.len() as u32;
+    stream.next_out = output.as_mut_ptr();
+    stream.avail_out = output.len() as u32;
+    let mut result;
+    loop {
+        result = unsafe { inflate(&mut stream, Z_FINISH) };
+        if result == Z_STREAM_END {
+            break;
+        }
+        if result != Z_OK && result != Z_BUF_ERROR {
+            break;
+        }
+        if stream.avail_out == 0 || stream.avail_in == 0 {
+            break;
+        }
+    }
+    unsafe { inflateEnd(&mut stream) };
+    if result != Z_STREAM_END {
+        return Err(format!("zlib 图片解压失败: 状态 {}", result));
+    }
+    output.truncate(stream.total_out as usize);
+    Ok(output)
+}
+
+fn decompress_bzip2(payload: &[u8], original_size: usize) -> Result<Vec<u8>, String> {
+    if original_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut output = vec![0u8; original_size];
+    let mut stream: BzStream = unsafe { std::mem::zeroed() };
+    let init = unsafe { BZ2_bzDecompressInit(&mut stream, 0, 0) };
+    if init != BZ_OK {
+        return Err("bzip2 初始化失败".to_string());
+    }
+    stream.next_in = payload.as_ptr() as *const c_char as *mut c_char;
+    stream.avail_in = payload.len() as u32;
+    stream.next_out = output.as_mut_ptr() as *mut c_char;
+    stream.avail_out = output.len() as u32;
+    let mut result;
+    loop {
+        result = unsafe { BZ2_bzDecompress(&mut stream) };
+        if result == BZ_STREAM_END {
+            break;
+        }
+        if result != BZ_OK {
+            break;
+        }
+        if stream.avail_out == 0 || stream.avail_in == 0 {
+            break;
+        }
+    }
+    unsafe { BZ2_bzDecompressEnd(&mut stream) };
+    if result != BZ_STREAM_END {
+        return Err(format!("bzip2 图片解压失败: 状态 {}", result));
+    }
+    let written = ((stream.total_out_hi32 as usize) << 32) | stream.total_out_lo32 as usize;
+    output.truncate(written);
+    Ok(output)
+}
+
+fn decompress_xz(payload: &[u8], original_size: usize) -> Result<Vec<u8>, String> {
+    if original_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut output = vec![0u8; original_size.saturating_add(4096)];
+    let mut stream: LzmaStream = unsafe { std::mem::zeroed() };
+    let init = unsafe { lzma_stream_decoder(&mut stream, u64::MAX, LZMA_CONCATENATED) };
+    if init != 0 {
+        return Err("xz 初始化失败".to_string());
+    }
+    stream.next_in = payload.as_ptr();
+    stream.avail_in = payload.len();
+    stream.next_out = output.as_mut_ptr();
+    stream.avail_out = output.len();
+    let mut result;
+    let mut rounds = 0;
+    loop {
+        result = unsafe { lzma_code(&mut stream, LZMA_FINISH) };
+        if result == LZMA_STREAM_END {
+            break;
+        }
+        if result != 0 {
+            break;
+        }
+        rounds += 1;
+        // 输出缓冲恰好填满时，liblzma 可能先返回 LZMA_OK，下一次无进展调用会
+        // 返回 LZMA_BUF_ERROR；这里只做防御性上限，正常路径不会耗尽。
+        if rounds > 1024 {
+            break;
+        }
+    }
+    unsafe { lzma_end(&mut stream) };
+    if result != LZMA_STREAM_END {
+        return Err(format!("xz 图片解压失败: 状态 {}", result));
+    }
+    output.truncate(stream.total_out as usize);
+    Ok(output)
+}
+
+fn decompress_lz4(payload: &[u8], original_size: usize) -> Result<Vec<u8>, String> {
+    if original_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut context: *mut c_void = std::ptr::null_mut();
+    let code = unsafe { LZ4F_createDecompressionContext(&mut context, LZ4F_VERSION) };
+    if unsafe { LZ4F_isError(code) } != 0 {
+        return Err("lz4 解压上下文初始化失败".to_string());
+    }
+    let mut output = vec![0u8; original_size.saturating_add(4096)];
+    let mut consumed = 0usize;
+    let mut written = 0usize;
+    let mut hint = 1usize;
+    while hint != 0 {
+        if consumed >= payload.len() || written >= output.len() {
+            break;
+        }
+        let mut dst_capacity = output.len() - written;
+        let mut src_capacity = payload.len() - consumed;
+        let result = unsafe {
+            LZ4F_decompress(
+                context,
+                output[written..].as_mut_ptr(),
+                &mut dst_capacity,
+                payload[consumed..].as_ptr(),
+                &mut src_capacity,
+                std::ptr::null(),
+            )
+        };
+        if unsafe { LZ4F_isError(result) } != 0 {
+            let name = unsafe { std::ffi::CStr::from_ptr(LZ4F_getErrorName(result)) }.to_string_lossy();
+            unsafe { LZ4F_freeDecompressionContext(context) };
+            return Err(format!("lz4 图片解压失败: {}", name));
+        }
+        written += dst_capacity;
+        consumed += src_capacity;
+        hint = result;
+    }
+    unsafe { LZ4F_freeDecompressionContext(context) };
+    if hint != 0 {
+        return Err("lz4 图片解压未完成".to_string());
+    }
+    if written != original_size {
+        return Err(format!(
+            "lz4 图片原始长度不匹配: 声明 {}，实际 {}",
+            original_size, written
+        ));
+    }
+    output.truncate(written);
+    Ok(output)
+}
+
 /// 解析 UTF-8 文本及其可选的 v3.2 二进制图片区块。
 fn parse_bytes(content: &[u8], force_tempo: Option<u32>) -> Result<Score, String> {
     let mut image = None;
@@ -420,7 +689,16 @@ fn parse_bytes(content: &[u8], force_tempo: Option<u32>) -> Result<Score, String
         let decoded = match encoding.to_ascii_lowercase().as_str() {
             "raw" | "original" => payload.to_vec(),
             "zstd" => decompress_zstd(payload, original_size)?,
-            other => return Err(format!("不支持的图片编码方式: {}（可用 raw 或 zstd）", other)),
+            "gzip" => decompress_zlib(payload, original_size, 31)?,
+            "zlib" => decompress_zlib(payload, original_size, 15)?,
+            "deflate" => decompress_zlib(payload, original_size, -15)?,
+            "bzip2" | "bz2" => decompress_bzip2(payload, original_size)?,
+            "xz" => decompress_xz(payload, original_size)?,
+            "lz4" => decompress_lz4(payload, original_size)?,
+            other => return Err(format!(
+                "不支持的图片编码方式: {}（可用 raw、zstd、gzip、zlib、deflate、bzip2、xz、lz4）",
+                other
+            )),
         };
         if decoded.len() != original_size {
             return Err(format!("图片原始长度不匹配: 声明 {}，实际 {}", original_size, decoded.len()));
@@ -1339,5 +1617,126 @@ mod tests {
         let score = parse_bytes(&data, None).unwrap();
         assert_eq!(score.title, "Picture");
         assert_eq!(score.image.unwrap().data, image);
+    }
+
+    fn v32_image_file(encoding: &str, payload: &[u8], original_size: usize) -> Vec<u8> {
+        let prefix = format!(
+            "#MUSIC_RUST 3.2\n#TITLE Picture\n@IMAGE image/png {} {} {}\n@TRACK 0 0 P\n",
+            encoding, payload.len(), original_size
+        );
+        let mut data = prefix.into_bytes();
+        data.extend_from_slice(IMAGE_BEGIN);
+        data.extend_from_slice(payload);
+        data.extend_from_slice(b"\n");
+        data.extend_from_slice(IMAGE_END);
+        data
+    }
+
+    #[test]
+    fn test_v32_reads_every_compressed_image_encoding() {
+        let mut original = b"music_rust v3.2 embedded image\x00\xff\n".repeat(20);
+        original.extend_from_slice(b"END");
+        let cases: &[(&str, &[u8])] = &[
+            (
+                "gzip",
+                &[
+                    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xcb, 0x2d, 0x2d,
+                    0xce, 0x4c, 0x8e, 0x2f, 0x2a, 0x2d, 0x2e, 0x51, 0x28, 0x33, 0xd6, 0x33, 0x52,
+                    0x48, 0xcd, 0x4d, 0x4a, 0x4d, 0x49, 0x49, 0x4d, 0x51, 0xc8, 0xcc, 0x4d, 0x4c,
+                    0x4f, 0x65, 0xf8, 0xcf, 0x95, 0x3b, 0xaa, 0x60, 0x54, 0x01, 0x7d, 0x15, 0xb8,
+                    0xfa, 0xb9, 0x00, 0x00, 0x81, 0x0f, 0xad, 0x3e, 0x97, 0x02, 0x00, 0x00,
+                ],
+            ),
+            (
+                "zlib",
+                &[
+                    0x78, 0x9c, 0xcb, 0x2d, 0x2d, 0xce, 0x4c, 0x8e, 0x2f, 0x2a, 0x2d, 0x2e, 0x51,
+                    0x28, 0x33, 0xd6, 0x33, 0x52, 0x48, 0xcd, 0x4d, 0x4a, 0x4d, 0x49, 0x49, 0x4d,
+                    0x51, 0xc8, 0xcc, 0x4d, 0x4c, 0x4f, 0x65, 0xf8, 0xcf, 0x95, 0x3b, 0xaa, 0x60,
+                    0x54, 0x01, 0x7d, 0x15, 0xb8, 0xfa, 0xb9, 0x00, 0x00, 0x2b, 0xcd, 0xef, 0x5c,
+                ],
+            ),
+            (
+                "deflate",
+                &[
+                    0xcb, 0x2d, 0x2d, 0xce, 0x4c, 0x8e, 0x2f, 0x2a, 0x2d, 0x2e, 0x51, 0x28, 0x33,
+                    0xd6, 0x33, 0x52, 0x48, 0xcd, 0x4d, 0x4a, 0x4d, 0x49, 0x49, 0x4d, 0x51, 0xc8,
+                    0xcc, 0x4d, 0x4c, 0x4f, 0x65, 0xf8, 0xcf, 0x95, 0x3b, 0xaa, 0x60, 0x54, 0x01,
+                    0x7d, 0x15, 0xb8, 0xfa, 0xb9, 0x00, 0x00,
+                ],
+            ),
+            (
+                "bzip2",
+                &[
+                    0x42, 0x5a, 0x68, 0x36, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0x75, 0xdf, 0x8a,
+                    0x87, 0x00, 0x00, 0xfb, 0x5f, 0x80, 0xc0, 0x10, 0x40, 0x01, 0x18, 0x00, 0x06,
+                    0x01, 0x00, 0x00, 0xbe, 0xa2, 0x1f, 0x00, 0x00, 0x00, 0xa0, 0x00, 0x90, 0x28,
+                    0x34, 0x68, 0xd0, 0x64, 0x06, 0x81, 0x4a, 0xa8, 0x23, 0xd3, 0x4d, 0x4f, 0x50,
+                    0xf4, 0x7a, 0x53, 0xf5, 0x4f, 0xb2, 0x64, 0x9f, 0x24, 0xfc, 0x27, 0x24, 0xd4,
+                    0x9a, 0x93, 0x24, 0xdf, 0xce, 0xfc, 0x13, 0x02, 0x60, 0x9b, 0x89, 0xb1, 0x30,
+                    0x4e, 0x84, 0xc1, 0x38, 0x26, 0x09, 0xfc, 0x4e, 0xa4, 0xd0, 0x9a, 0x13, 0x6a,
+                    0x31, 0xc9, 0x32, 0x26, 0x84, 0xfa, 0x26, 0x49, 0xa9, 0x32, 0x4f, 0xf1, 0x77,
+                    0x24, 0x53, 0x85, 0x09, 0x07, 0x5d, 0xf8, 0xa8, 0x70,
+                ],
+            ),
+            (
+                "xz",
+                &[
+                    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x02,
+                    0x00, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x74, 0x2f, 0xe5, 0xa3, 0xe0, 0x02,
+                    0x96, 0x00, 0x2f, 0x5d, 0x00, 0x36, 0x9d, 0x4a, 0xb1, 0x05, 0x3d, 0xd9, 0xd6,
+                    0x7d, 0x87, 0xe0, 0x64, 0x64, 0xf6, 0x1c, 0x45, 0xdd, 0xeb, 0x5f, 0xe5, 0x9a,
+                    0x34, 0xeb, 0xaa, 0x71, 0x6c, 0xab, 0x22, 0x91, 0x24, 0x7f, 0xc4, 0x68, 0x4d,
+                    0x6a, 0x21, 0xf6, 0x41, 0xb5, 0x3d, 0xbe, 0xf2, 0x49, 0xd7, 0xd9, 0x70, 0x00,
+                    0x00, 0x00, 0xc8, 0x59, 0x9f, 0xdf, 0xa3, 0x10, 0x2d, 0x69, 0x00, 0x01, 0x4b,
+                    0x97, 0x05, 0x00, 0x00, 0x00, 0x40, 0x25, 0x32, 0xf2, 0xb1, 0xc4, 0x67, 0xfb,
+                    0x02, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a,
+                ],
+            ),
+            (
+                "lz4",
+                &[
+                    0x04, 0x22, 0x4d, 0x18, 0x64, 0x40, 0xa7, 0x2e, 0x00, 0x00, 0x00, 0xff, 0x12,
+                    0x6d, 0x75, 0x73, 0x69, 0x63, 0x5f, 0x72, 0x75, 0x73, 0x74, 0x20, 0x76, 0x33,
+                    0x2e, 0x32, 0x20, 0x65, 0x6d, 0x62, 0x65, 0x64, 0x64, 0x65, 0x64, 0x20, 0x69,
+                    0x6d, 0x61, 0x67, 0x65, 0x00, 0xff, 0x0a, 0x21, 0x00, 0xff, 0xff, 0x60, 0x50,
+                    0xff, 0x0a, 0x45, 0x4e, 0x44, 0x00, 0x00, 0x00, 0x00, 0x68, 0xb3, 0xb4, 0x80,
+                ],
+            ),
+            (
+                "zstd",
+                &[
+                    0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x6d, 0x01, 0x00, 0x44, 0x02, 0x6d, 0x75,
+                    0x73, 0x69, 0x63, 0x5f, 0x72, 0x75, 0x73, 0x74, 0x20, 0x76, 0x33, 0x2e, 0x32,
+                    0x20, 0x65, 0x6d, 0x62, 0x65, 0x64, 0x64, 0x65, 0x64, 0x20, 0x69, 0x6d, 0x61,
+                    0x67, 0x65, 0x00, 0xff, 0x0a, 0x45, 0x4e, 0x44, 0x01, 0x00, 0x81, 0x43, 0x2a,
+                    0xf5, 0x04, 0x23, 0xe2, 0x94, 0xfd,
+                ],
+            ),
+        ];
+        for (encoding, payload) in cases {
+            let data = v32_image_file(encoding, payload, original.len());
+            let score = parse_bytes(&data, None).unwrap_or_else(|e| panic!("{encoding}: {e}"));
+            assert_eq!(score.image.unwrap().data, original, "{encoding}");
+        }
+    }
+
+    #[test]
+    fn test_v32_accepts_bz2_alias_and_rejects_unknown_encoding() {
+        let original = b"alias check";
+        let bz2: &[u8] = &[
+            0x42, 0x5a, 0x68, 0x36, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0xa5, 0x79, 0x29, 0x61,
+            0x00, 0x00, 0x00, 0x91, 0x80, 0x40, 0x00, 0x2a, 0x6c, 0x08, 0x00, 0x20, 0x00, 0x31,
+            0x06, 0x4c, 0x41, 0x00, 0xd3, 0xd2, 0x30, 0xce, 0x07, 0x4e, 0x3c, 0x5d, 0xc9, 0x14,
+            0xe1, 0x42, 0x42, 0x95, 0xe4, 0xa5, 0x84,
+        ];
+        let data = v32_image_file("bz2", bz2, original.len());
+        let score = parse_bytes(&data, None).unwrap();
+        assert_eq!(score.image.unwrap().data, original);
+
+        let bad = v32_image_file("br", original, original.len());
+        assert!(parse_bytes(&bad, None)
+            .unwrap_err()
+            .contains("不支持的图片编码方式"));
     }
 }

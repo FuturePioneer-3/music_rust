@@ -46,10 +46,10 @@ music_rust 钢琴演奏器配套工具
     --switch <秒:SF:音色>
                          切换 SoundFont 和音色，最多 24 条
     --embed-image <图片> 将图片二进制内嵌到 TXT v3.2
-    --image-compression <raw|zstd>
-                         图片使用原始或 zstd 二进制（默认 raw）
-    --image-level <1..22>
-                         zstd 压缩级别（默认 3）
+    --image-compression <raw|zstd|gzip|zlib|deflate|bzip2|xz|lz4>
+                         图片二进制编码（默认 raw）
+    --image-level <n>
+                         压缩级别（默认 3；范围因编码而异）
     --v2                 输出旧版可读多音轨 T 格式
     --legacy             输出最旧的 v1/v2 两行一组格式
 
@@ -61,6 +61,9 @@ MIDI 音符编号 → 简谱:
 """
 
 import argparse
+import bz2
+import gzip
+import lzma
 import math
 import mimetypes
 import os
@@ -69,6 +72,7 @@ import struct
 import subprocess
 import sys
 import textwrap
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -100,6 +104,16 @@ MAX_SWITCH_MILLISECONDS = (1 << 32) - 1
 MAX_EMBEDDED_IMAGE_BYTES = 64 * 1024 * 1024
 IMAGE_BEGIN = b'-----BEGIN MUSIC_RUST IMAGE-----\n'
 IMAGE_END = b'-----END MUSIC_RUST IMAGE-----\n'
+IMAGE_ENCODINGS = ('raw', 'zstd', 'gzip', 'zlib', 'deflate', 'bzip2', 'xz', 'lz4')
+IMAGE_LEVEL_RANGES = {
+    'zstd': (1, 22),
+    'gzip': (0, 9),
+    'zlib': (0, 9),
+    'deflate': (0, 9),
+    'bzip2': (1, 9),
+    'xz': (0, 9),
+    'lz4': (1, 12),
+}
 
 # ---------------------------------------------------------------------------
 # MIDI 解析器
@@ -675,6 +689,48 @@ def _image_mime(path, data):
     return mimetypes.guess_type(path)[0] or 'application/octet-stream'
 
 
+def _compress_embedded_image(raw, encoding, level):
+    """按编码压缩图片，返回压缩后的二进制。"""
+    if encoding == 'raw':
+        return raw
+    if encoding == 'gzip':
+        return gzip.compress(raw, compresslevel=level, mtime=0)
+    if encoding == 'zlib':
+        return zlib.compress(raw, level)
+    if encoding == 'deflate':
+        compressor = zlib.compressobj(level, zlib.DEFLATED, -15)
+        return compressor.compress(raw) + compressor.flush()
+    if encoding == 'bzip2':
+        return bz2.compress(raw, compresslevel=level)
+    if encoding == 'xz':
+        return lzma.compress(raw, preset=level, format=lzma.FORMAT_XZ)
+    if encoding == 'zstd':
+        zstd = shutil.which('zstd')
+        if not zstd:
+            raise ValueError('选择 zstd 压缩时需要安装 zstd 命令')
+        result = subprocess.run(
+            [zstd, f'-{level}', '--stdout', '--no-progress'],
+            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode('utf-8', errors='replace').strip()
+            raise ValueError(f'zstd 压缩失败: {detail or result.returncode}')
+        return result.stdout
+    if encoding == 'lz4':
+        lz4 = shutil.which('lz4')
+        if not lz4:
+            raise ValueError('选择 lz4 压缩时需要安装 lz4 命令')
+        result = subprocess.run(
+            [lz4, '-q', f'-{level}', '-c'],
+            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode('utf-8', errors='replace').strip()
+            raise ValueError(f'lz4 压缩失败: {detail or result.returncode}')
+        return result.stdout
+    raise ValueError(f'图片编码必须是 {"、".join(IMAGE_ENCODINGS)} 之一')
+
+
 def _prepare_embedded_image(opts):
     """返回 (MIME, 编码, payload, 原始大小)，未启用时返回 None。"""
     image_path = getattr(opts, 'image_path', None)
@@ -690,25 +746,13 @@ def _prepare_embedded_image(opts):
     if len(raw) > MAX_EMBEDDED_IMAGE_BYTES:
         raise ValueError('内嵌图片不能超过 64 MiB')
     encoding = getattr(opts, 'image_compression', 'raw').lower()
-    if encoding == 'raw':
-        payload = raw
-    elif encoding == 'zstd':
-        level = int(getattr(opts, 'image_level', 3))
-        if not 1 <= level <= 22:
-            raise ValueError('zstd 压缩级别必须在 1..22 之间')
-        zstd = shutil.which('zstd')
-        if not zstd:
-            raise ValueError('选择 zstd 压缩时需要安装 zstd 命令')
-        result = subprocess.run(
-            [zstd, f'-{level}', '--stdout', '--no-progress'],
-            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.decode('utf-8', errors='replace').strip()
-            raise ValueError(f'zstd 压缩失败: {detail or result.returncode}')
-        payload = result.stdout
-    else:
-        raise ValueError('图片编码必须是 raw 或 zstd')
+    if encoding not in IMAGE_ENCODINGS:
+        raise ValueError(f'图片编码必须是 {"、".join(IMAGE_ENCODINGS)} 之一')
+    level_range = IMAGE_LEVEL_RANGES.get(encoding)
+    level = int(getattr(opts, 'image_level', 3))
+    if level_range is not None and not level_range[0] <= level <= level_range[1]:
+        raise ValueError(f'{encoding} 压缩级别必须在 {level_range[0]}..{level_range[1]} 之间')
+    payload = _compress_embedded_image(raw, encoding, level)
     return _image_mime(image_path, raw), encoding, payload, len(raw)
 
 
@@ -1078,15 +1122,14 @@ def _parse_switches(specs, initial_soundfont):
 # ---------------------------------------------------------------------------
 
 TUI_FORMATS = ('v3.2', 'v3.1', 'v2', 'legacy')
-TUI_IMAGE_ENCODINGS = ('raw', 'zstd')
 TUI_FIELDS = (
     ('midi', 'MIDI 文件', 'path', '回车输入，P 浏览'),
     ('output', '输出 TXT', 'path', '留空时使用 MIDI 同名 .txt'),
     ('format', '输出格式', 'format', 'v3.2 支持内嵌图片；v3.1 仅保存音色切换'),
     ('embed_image', '内嵌图片', 'bool', 'v3.2 专用；是后填写图片文件'),
     ('image_path', '图片文件', 'path', 'v3.2 专用；PNG/JPEG/WebP 等图片'),
-    ('image_compression', '图片编码', 'choice', 'raw 原始二进制；zstd 可压缩'),
-    ('image_level', 'zstd 级别', 'text', '1..22；级别越高越省空间但越慢'),
+    ('image_compression', '图片编码', 'choice', 'raw/zstd/gzip/zlib/deflate/bzip2/xz/lz4'),
+    ('image_level', '压缩级别', 'text', 'zstd 1..22；gzip/zlib/deflate/xz 0..9；bzip2 1..9；lz4 1..12'),
     ('bpm', 'BPM 覆盖', 'text', '留空时保留 MIDI 速度'),
     ('velocity_scale', '力度倍率', 'text', '大于 0，默认 1.0'),
     ('track', '音轨编号', 'text', '例如 0,2,5；留空为全部'),
@@ -1166,12 +1209,16 @@ def _build_tui_job(state):
         raise ValueError('输出格式无效')
     if state.embed_image and state.format != 'v3.2':
         raise ValueError('内嵌图片仅能用于 v3.2 输出格式')
-    if state.image_compression not in TUI_IMAGE_ENCODINGS:
-        raise ValueError('图片编码必须是 raw 或 zstd')
+    if state.image_compression not in IMAGE_ENCODINGS:
+        raise ValueError('图片编码无效')
     image_path = state.image_path.strip() if state.embed_image else None
     if state.embed_image and not image_path:
         raise ValueError('已启用内嵌图片，请填写图片文件')
-    image_level = _parse_tui_int(state.image_level, 'zstd 压缩级别', 1, 22)
+    level_range = IMAGE_LEVEL_RANGES.get(state.image_compression)
+    if level_range is not None:
+        image_level = _parse_tui_int(state.image_level, '压缩级别', *level_range)
+    else:
+        image_level = 3
     bpm = _parse_tui_int(state.bpm, 'BPM', 1, 60_000, optional=True)
     quantize = _parse_tui_int(state.quantize, '量化 tick', 0)
     max_tracks = _parse_tui_int(state.max_tracks, '最多音轨', 1, optional=True)
@@ -1503,7 +1550,7 @@ def _edit_tui_field(screen, state, field_index):
         setattr(state, name, not getattr(state, name))
         return f'{label}已设为 {_tui_field_value(state, name)}'
     if kind == 'choice':
-        choices = TUI_IMAGE_ENCODINGS
+        choices = IMAGE_ENCODINGS
         index = choices.index(getattr(state, name))
         setattr(state, name, choices[(index + 1) % len(choices)])
         return f'{label}已设为 {_tui_field_value(state, name)}'
@@ -1631,9 +1678,9 @@ def _tui_main(screen):
                     status = f'输出格式已设为 {state.format}'
                     status_error = False
                 elif kind == 'choice':
-                    index = TUI_IMAGE_ENCODINGS.index(getattr(state, name))
+                    index = IMAGE_ENCODINGS.index(getattr(state, name))
                     direction = -1 if key == curses.KEY_LEFT else 1
-                    setattr(state, name, TUI_IMAGE_ENCODINGS[(index + direction) % len(TUI_IMAGE_ENCODINGS)])
+                    setattr(state, name, IMAGE_ENCODINGS[(index + direction) % len(IMAGE_ENCODINGS)])
                     status = f'{_label}已设为 {_tui_field_value(state, name)}'
                     status_error = False
             elif key in ('p', 'P'):
@@ -1754,12 +1801,13 @@ def main(argv=None):
         help='将图片二进制内嵌到 TXT v3.2（默认不内嵌）',
     )
     parser.add_argument(
-        '--image-compression', choices=('raw', 'zstd'), default='raw',
-        help='图片二进制编码：raw 或 zstd（默认 raw）',
+        '--image-compression', choices=IMAGE_ENCODINGS, default='raw',
+        help='图片二进制编码：raw/zstd/gzip/zlib/deflate/bzip2/xz/lz4（默认 raw）',
     )
     parser.add_argument(
-        '--image-level', type=_bounded_int('zstd 压缩级别', 1, 22), default=3,
-        metavar='1..22', help='zstd 压缩级别（默认 3）',
+        '--image-level', type=_bounded_int('压缩级别', 0, 22), default=3,
+        metavar='0..22',
+        help='压缩级别（默认 3；zstd 1..22，gzip/zlib/deflate/xz 0..9，bzip2 1..9，lz4 1..12）',
     )
     parser.add_argument('--v2', action='store_true', help='输出旧版可读多音轨 T 格式（默认输出 v3.2）')
     parser.add_argument('--legacy', action='store_true', help='输出最旧版两行一组格式')

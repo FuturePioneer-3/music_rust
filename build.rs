@@ -54,8 +54,12 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib={}", link_name);
     }
     println!("cargo:rustc-link-lib=dylib=m");
-    // TXT v3.2 的图片区块可选择 zstd；使用系统库避免引入额外 Rust 运行时。
+    // TXT v3.2 的图片区块可选择多种压缩编码；使用系统库避免引入额外 Rust 运行时。
     println!("cargo:rustc-link-lib=dylib=zstd");
+    println!("cargo:rustc-link-lib=dylib=z");
+    println!("cargo:rustc-link-lib=dylib=bz2");
+    println!("cargo:rustc-link-lib=dylib=lzma");
+    println!("cargo:rustc-link-lib=dylib=lz4");
 
     let has_pkgconfig = Command::new("pkg-config")
         .args(["--exists", "fluidsynth"])

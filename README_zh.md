@@ -35,8 +35,8 @@ music_rust 是一个**终端音乐播放器**，内置三套播放引擎：
 
 ## v3.3.0 新特性
 
-- 🖼️ **TXT v3.2 内嵌图片**：图片以原始或 zstd 二进制放在分隔线后，长度字段保证任意二进制内容（包括换行）都能安全读取。
-- 🎛️ Python 转换器和 curses TUI 都可以选择是否内嵌图片、raw/zstd 编码以及 1–22 的 zstd 压缩级别。
+- 🖼️ **TXT v3.2 内嵌图片**：图片以 raw/zstd/gzip/zlib/deflate/bzip2/xz/lz4 二进制放在分隔线后，长度字段保证任意二进制内容（包括换行）都能安全读取。
+- 🎛️ Python 转换器和 curses TUI 都可以选择是否内嵌图片、八种编码以及各算法对应的压缩级别。
 - 🖥️ Rust 播放 TUI 复用音频封面的 FFmpeg 解码和半区块渲染，终端不支持真彩色时自动降级。
 
 ## v3.22.1 修复（历史）
@@ -277,15 +277,16 @@ TXT v3.2 在 v3.0 的**绝对 tick 音符事件**和全局 tempo 表上，保留
 #MUSIC_RUST 3.2
 @INSTRUMENT <1-based SoundFont 1..3> <GM 0..127>
 @SWITCH <nonnegative seconds> <SF number> <GM>
-@IMAGE <MIME> <raw|zstd> <encoded-bytes> <original-bytes>
+@IMAGE <MIME> <raw|zstd|gzip|zlib|deflate|bzip2|xz|lz4> <encoded-bytes> <original-bytes>
 -----BEGIN MUSIC_RUST IMAGE-----
 <encoded image bytes, written directly>
 -----END MUSIC_RUST IMAGE-----
 ```
 
 图片区块必须放在 `@IMAGE` 描述行之后；程序严格按 `encoded-bytes` 读取，随后要求结束分隔线，
-因此图片二进制可以包含换行、零字节和任意其它字节。`raw` 保存原始图片文件，`zstd` 保存压缩后的
-图片文件，压缩级别由转换器指定（1–22）。播放器解压后交给 FFmpeg，并像 MP3 封面一样在 Rust TUI
+因此图片二进制可以包含换行、零字节和任意其它字节。`raw` 保存原始图片文件；`zstd`（1–22）、
+`gzip`/`zlib`/`deflate`/`xz`（0–9）、`bzip2`（1–9）和 `lz4`（1–12）保存压缩后的图片文件，
+压缩级别由转换器指定。播放器解压后交给 FFmpeg，并像 MP3 封面一样在 Rust TUI
 中以半区块字符显示；图片解码失败不会影响乐曲播放。
 
 `@INSTRUMENT` 选择初始 SoundFont 和 GM 音色。`@SWITCH` 在指定的非负时间同时切换
@@ -467,12 +468,12 @@ music-convert 歌曲.mid --embed-image cover.jpg --image-compression zstd --imag
 | `--switch <秒:音色>` | 在初始 SoundFont 上定时切换音色；可重复，最多 24 条 |
 | `--switch <秒:SF:音色>` | 定时切换 SoundFont/音色；两种写法可混用，合计最多 24 条 |
 | `--embed-image <图片>` | 将图片二进制内嵌到 TXT v3.2；不填写则不内嵌 |
-| `--image-compression <raw\|zstd>` | 图片保存为原始或 zstd 二进制（默认 raw） |
-| `--image-level <1..22>` | zstd 压缩级别（默认 3；级别越高通常越省空间但越慢） |
+| `--image-compression <编码>` | 图片保存为 raw/zstd/gzip/zlib/deflate/bzip2/xz/lz4 二进制（默认 raw） |
+| `--image-level <n>` | 压缩级别（默认 3；范围因算法而异） |
 | `--v2` | 输出旧版可读多音轨 T 格式；仅接受默认音色配置 |
 | `--legacy` | 输出旧版 v1/v2 格式；仅接受默认音色配置 |
 
-> 转换器 MIDI 解析使用 Python 标准库；启用 zstd 图片压缩时需要系统 `zstd` 命令。支持标准 MIDI (SMF type 0/1/2)。
+> 转换器 MIDI 解析使用 Python 标准库；gzip/zlib/deflate/bzip2/xz 压缩使用 Python 标准库，启用 zstd 或 lz4 图片压缩时分别需要系统 `zstd`、`lz4` 命令。支持标准 MIDI (SMF type 0/1/2)。
 > 在交互终端运行且未指定 `--velocity-scale` 时，转换器会询问力度倍率；可输入任意正数，输出会钳制到 MIDI 的 1–127。TXT v3.1 会保存力度，v2/legacy 简谱格式没有力度字段。`--v2` 和 `--legacy` 会拒绝任何非默认音色配置，因为这两种格式无法表示它。
 > 对 type-0 等“单物理轨、多 MIDI 通道”的文件，v3.1 会按通道拆成独立 `@TRACK`，避免所有音符被折叠到首通道；未指定 `--drum` 时会逐事件排除打击乐通道 10（内部 ch9）。
 > 转换器会明确拒绝 SMPTE time-division MIDI；请先转为 PPQ MIDI，以免绝对 tick 时间被错误解释。
