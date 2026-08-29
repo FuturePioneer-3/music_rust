@@ -38,7 +38,7 @@ selector; run it with a file to start playing immediately.
 
 - 🖼️ **TXT v3.2 embedded images**: raw, zstd, gzip, zlib, deflate, bzip2, xz, or lz4-compressed image bytes can follow delimiter lines; declared lengths make arbitrary binary data, including newlines, safe.
 - 🎛️ The Python converter and curses TUI can choose whether to embed an image, any of the eight encodings, and a per-algorithm compression level.
-- 🔍 The launcher lets you pick a 1×–2× display zoom (0.25 steps) for TXT embedded images and audio covers.
+- 🔍 The launcher lets you pick a 1×–1.25× display zoom (0.25 steps) for TXT embedded images and audio covers.
 - 🖥️ The Rust playback TUI reuses the FFmpeg decoder and half-block renderer used for audio covers, with a real-tty fallback.
 
 ## What's New in v3.22.1 (historical)

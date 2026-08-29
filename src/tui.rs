@@ -64,9 +64,9 @@ pub fn github_avatar() -> ArtImage {
     }
 }
 
-/// 封面/图片显示倍率范围：1.0×–2.0×，0.25 步进。
+/// 封面/图片显示倍率范围：1.0×–1.25×，0.25 步进。
 pub const ART_ZOOM_MIN: f32 = 1.0;
-pub const ART_ZOOM_MAX: f32 = 2.0;
+pub const ART_ZOOM_MAX: f32 = 1.25;
 
 pub fn clamp_art_zoom(zoom: f32) -> f32 {
     zoom.clamp(ART_ZOOM_MIN, ART_ZOOM_MAX)
@@ -370,7 +370,7 @@ impl Tui {
         Self::start_full(title, mode, enabled, art, MetaInfo::default())
     }
 
-    /// 设置封面/图片显示倍率（1.0×–2.0×）。只放大终端里的渲染尺寸，
+    /// 设置封面/图片显示倍率（1.0×–1.25×）。只放大终端里的渲染尺寸，
     /// 不改变解码分辨率；超出范围时自动钳制。
     pub fn with_art_zoom(mut self, zoom: f32) -> Self {
         self.art_zoom = clamp_art_zoom(zoom);
@@ -489,7 +489,7 @@ impl Tui {
         let meta_w = if !meta.is_empty() { (inner / 3).clamp(14, 30) } else { 0 };
 
         // 封面区：基础上限为宽 46 列、高 16 行、剩余空间的 45%，再按用户
-        // 选择的 ×1–×2 倍率放大；最终仍受屏幕余量约束。元数据并排或下置。
+        // 选择的 ×1–×1.25 倍率放大；最终仍受屏幕余量约束。元数据并排或下置。
         let mut art_disp: Option<(usize, usize)> = None; // (显示宽, 显示行)
         let mut art_side = false;
         let mut section_rows = 0usize;
@@ -1182,12 +1182,12 @@ mod tests {
     }
 
     #[test]
-    fn art_zoom_is_clamped_to_one_to_two_times() {
+    fn art_zoom_is_clamped_to_supported_range() {
         assert_eq!(clamp_art_zoom(1.0), 1.0);
         assert_eq!(clamp_art_zoom(1.25), 1.25);
-        assert_eq!(clamp_art_zoom(2.0), 2.0);
+        assert_eq!(clamp_art_zoom(2.0), 1.25);
         assert_eq!(clamp_art_zoom(0.5), 1.0);
-        assert_eq!(clamp_art_zoom(3.0), 2.0);
+        assert_eq!(clamp_art_zoom(3.0), 1.25);
     }
 
     /// 进度条点击映射必须与渲染布局严格一致（回归测试：修复 +3 列系统性偏移）。

@@ -27,12 +27,12 @@ pub struct LaunchConfig {
     pub soundfonts: Vec<String>,
     pub instrument: u8,
     pub program_switches: Vec<ProgramSwitch>,
-    /// 封面/内嵌图片显示倍率（1.0×–2.0×，0.25 步进）。
+    /// 封面/内嵌图片显示倍率（1.0×–1.25×，0.25 步进）。
     pub image_zoom: f32,
 }
 
-/// 图片放大档位：×1、×1.25、×1.5、×1.75、×2。
-pub const ART_ZOOMS: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
+/// 图片放大档位：×1、×1.25（更大倍率会挤占 EQ 区域）。
+pub const ART_ZOOMS: [f32; 2] = [1.0, 1.25];
 
 fn zoom_next(current: f32) -> f32 {
     ART_ZOOMS
@@ -1400,12 +1400,11 @@ mod tests {
     #[test]
     fn art_zoom_steps_cycle_within_supported_range() {
         assert_eq!(zoom_next(1.0), 1.25);
-        assert_eq!(zoom_next(2.0), 2.0);
+        assert_eq!(zoom_next(1.25), 1.25);
         assert_eq!(zoom_previous(1.0), 1.0);
-        assert_eq!(zoom_previous(2.0), 1.75);
+        assert_eq!(zoom_previous(1.25), 1.0);
         assert_eq!(art_zoom_label(1.0), "×1");
         assert_eq!(art_zoom_label(1.25), "×1.25");
-        assert_eq!(art_zoom_label(2.0), "×2");
     }
 
     #[test]
